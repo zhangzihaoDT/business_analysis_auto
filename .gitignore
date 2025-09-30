@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Configuration files with sensitive information
+config.py
+secrets.py
+.env
+.env.local
+.env.production
+
+# Scripts containing sensitive information
+automated_data_pipeline.py
+WORKFLOW_SUMMARY.md
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+hyperd.log
+tabcmd.log
+tableau_export.log
+
+# Large data files
+*.hyper
+*.tdsx
+*.twb
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Excel files (optional - uncomment if you want to exclude)
+# *.xlsx
+# *.xls
+
+# Large CSV files (optional - uncomment if you want to exclude large data files)
+# *.csv
+
+# Parquet files (optional - uncomment if you want to exclude processed data)
+# *.parquet
+
+# Reports (optional - uncomment if you want to exclude generated reports)
+# reports/
