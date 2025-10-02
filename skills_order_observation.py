@@ -443,12 +443,13 @@ def calculate_daily_invoice_price(df, target_date):
 def calculate_cm2_active_orders(df, target_date=None):
     """
     计算CM2存量小订数
-    计算方式：总订单数 - 退订数
-    
+    计算方式：总订单数 - 退订数 - 已转化小订数
+    已转化判定：订单同时具有有效的锁单时间（Lock_Time）与意向支付时间（Intention_Payment_Time），且两者均不晚于目标日期
+
     Args:
         df: 数据DataFrame
         target_date: 目标日期，默认为昨天
-        
+
     Returns:
         int: CM2存量小订数
     """
@@ -456,43 +457,65 @@ def calculate_cm2_active_orders(df, target_date=None):
         target_date = datetime.now().date() - timedelta(days=1)
     else:
         target_date = pd.to_datetime(target_date).date()
-    
+
     # 获取CM2时间范围
     cm2_start = pd.to_datetime(TIME_PERIODS["CM2"]["start"]).date()
     cm2_end = pd.to_datetime(TIME_PERIODS["CM2"]["end"]).date()
-    
-    print(f"计算CM2存量小订数 (时间范围: {cm2_start} 到 {cm2_end})")
-    
-    # 确保日期列为日期类型
-    if 'Intention_Payment_Time' in df.columns:
-        df['Intention_Payment_Time'] = pd.to_datetime(df['Intention_Payment_Time']).dt.date
-        
-        # 筛选CM2时间范围内的订单
-        cm2_orders = df[(df['Intention_Payment_Time'] >= cm2_start) & (df['Intention_Payment_Time'] <= cm2_end)]
-        
-        # 计算总订单数
-        if 'Order Number' in cm2_orders.columns:
-            total_orders = cm2_orders['Order Number'].nunique()
+
+    print(f"计算CM2存量小订数 (时间范围: {cm2_start} 到 {cm2_end}, 观察日: {target_date})")
+
+    # 辅助函数：获取唯一订单ID集合
+    def _unique_ids(df_slice):
+        if 'Order Number' in df_slice.columns:
+            return set(df_slice['Order Number'].dropna().astype(str).unique())
         else:
-            print("警告: 未找到'Order Number'列，使用行数作为总订单数")
-            total_orders = len(cm2_orders)
-        
-        # 计算退订订单数
-        refund_count = 0
+            return set(df_slice.index.tolist())
+
+    # 确保必要日期列存在并转为日期类型
+    if 'Intention_Payment_Time' in df.columns:
+        df_copy = df.copy()
+        df_copy['Intention_Payment_Time'] = pd.to_datetime(df_copy['Intention_Payment_Time'], errors='coerce').dt.date
+        if 'intention_refund_time' in df_copy.columns:
+            df_copy['intention_refund_time'] = pd.to_datetime(df_copy['intention_refund_time'], errors='coerce').dt.date
+        if 'Lock_Time' in df_copy.columns:
+            df_copy['Lock_Time'] = pd.to_datetime(df_copy['Lock_Time'], errors='coerce').dt.date
+
+        # 筛选CM2时间范围内的小订订单
+        cm2_orders = df_copy[(df_copy['Intention_Payment_Time'] >= cm2_start) & (df_copy['Intention_Payment_Time'] <= cm2_end)]
+
+        # 总订单集合与数量
+        total_ids = _unique_ids(cm2_orders)
+        total_orders = len(total_ids)
+
+        # 退订订单集合（截至目标日期）
+        refunded_ids = set()
         if 'intention_refund_time' in cm2_orders.columns:
-            refund_orders = cm2_orders[cm2_orders['intention_refund_time'].notna()]
-            if 'Order Number' in refund_orders.columns:
-                refund_count = refund_orders['Order Number'].nunique()
-            else:
-                print("警告: 未找到'Order Number'列，使用行数作为退订订单数")
-                refund_count = len(refund_orders)
+            refund_mask = cm2_orders['intention_refund_time'].notna() & (cm2_orders['intention_refund_time'] <= target_date)
+            refunded_ids = _unique_ids(cm2_orders[refund_mask])
         else:
             print("警告: 未找到'intention_refund_time'列，退订订单数计为0")
-        
-        # 计算存量订单数 = 总订单数 - 退订订单数
-        active_count = total_orders - refund_count
-            
-        print(f"CM2存量小订数: {active_count} (总订单数: {total_orders}, 退订订单数: {refund_count})")
+
+        # 已转化订单集合（截至目标日期，需同时满足 Lock_Time 与 Intention_Payment_Time）
+        converted_ids = set()
+        if 'Lock_Time' in cm2_orders.columns:
+            lock_mask = cm2_orders['Lock_Time'].notna() & (cm2_orders['Lock_Time'] <= target_date)
+            pay_mask = cm2_orders['Intention_Payment_Time'].notna() & (cm2_orders['Intention_Payment_Time'] <= target_date)
+            converted_mask = lock_mask & pay_mask
+            converted_ids = _unique_ids(cm2_orders[converted_mask])
+        else:
+            print("警告: 未找到'Lock_Time'列，已转化订单数计为0")
+
+        # 去重合并的非存量集合（退订 ∪ 已转化）
+        non_active_ids = refunded_ids | converted_ids
+
+        # 计算存量订单集合与数量
+        active_ids = total_ids - non_active_ids
+        active_count = len(active_ids)
+
+        print(
+            f"CM2存量小订数: {active_count} "
+            f"(总订单数: {total_orders}, 退订订单数: {len(refunded_ids)}, 已转化订单数: {len(converted_ids)})"
+        )
         return active_count
     else:
         print("错误: 未找到'Intention_Payment_Time'列")
