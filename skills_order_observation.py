@@ -353,7 +353,7 @@ def calculate_rolling_average(df, target_date, days=7, value_type='delivery'):
         df: 数据DataFrame
         target_date: 目标日期
         days: 滚动天数，默认7天
-        value_type: 计算类型，'delivery'表示交付数，'invoice_price'表示开票价格
+        value_type: 计算类型，'delivery'表示交付数，'invoice_price'表示开票价格（基于交付时间）
         
     Returns:
         float: 滚动平均值
@@ -363,7 +363,7 @@ def calculate_rolling_average(df, target_date, days=7, value_type='delivery'):
     # 计算开始日期（包含目标日期在内的前N天）
     start_date = target_date - timedelta(days=days-1)
     
-    print(f"计算从 {start_date} 到 {target_date} 的{days}日滚动平均")
+    print(f"计算从 {start_date} 到 {target_date} 的{days}日滚动平均（{value_type}）")
     
     # 初始化值列表
     values = []
@@ -373,27 +373,27 @@ def calculate_rolling_average(df, target_date, days=7, value_type='delivery'):
         current_date = start_date + timedelta(days=i)
         
         if value_type == 'delivery':
-            # 计算交付数
+            # 计算交付数（基于Invoice_Upload_Time）
             daily_value = calculate_cm2_delivery_count(df, current_date)
             values.append(daily_value)
         elif value_type == 'invoice_price':
-            # 计算开票价格平均值
+            # 计算开票价格平均值（基于Invoice_Upload_Time交付时间）
             daily_value = calculate_daily_invoice_price(df, current_date)
             values.append(daily_value)
     
     # 计算平均值
     if values:
         avg_value = sum(values) / len(values)
-        print(f"{days}日滚动平均值: {avg_value:.2f}")
+        print(f"{days}日滚动平均值（{value_type}）: {avg_value:.2f}")
         return avg_value
     else:
-        print(f"警告: 无法计算{days}日滚动平均值，返回0")
+        print(f"警告: 无法计算{days}日滚动平均值（{value_type}），返回0")
         return 0
 
 
 def calculate_daily_invoice_price(df, target_date):
     """
-    计算指定日期的CM2开票价格平均值
+    计算指定日期的CM2开票价格平均值（基于交付时间）
     
     Args:
         df: 数据DataFrame
@@ -404,14 +404,14 @@ def calculate_daily_invoice_price(df, target_date):
     """
     target_date = pd.to_datetime(target_date).date()
     
-    print(f"计算 {target_date} 的CM2开票价格平均值")
+    print(f"计算 {target_date} 的CM2开票价格平均值（基于交付时间）")
     
-    # 确保Lock_Time列为日期类型
-    if 'Lock_Time' in df.columns:
-        df['Lock_Time'] = pd.to_datetime(df['Lock_Time']).dt.date
+    # 确保Invoice_Upload_Time列为日期类型
+    if 'Invoice_Upload_Time' in df.columns:
+        df['Invoice_Upload_Time'] = pd.to_datetime(df['Invoice_Upload_Time']).dt.date
         
-        # 筛选目标日期的数据
-        daily_df = df[df['Lock_Time'] == target_date]
+        # 筛选目标日期的数据（基于交付时间）
+        daily_df = df[df['Invoice_Upload_Time'] == target_date]
         
         # 筛选CM2车型
         if '车型分组' in daily_df.columns:
@@ -419,15 +419,18 @@ def calculate_daily_invoice_price(df, target_date):
             
             # 计算开票价格平均值
             if '开票价格' in cm2_df.columns:
-                # 排除空值
-                valid_prices = cm2_df[cm2_df['开票价格'].notna()]['开票价格']
+                # 排除空值和0值
+                valid_prices = cm2_df[
+                    (cm2_df['开票价格'].notna()) & 
+                    (cm2_df['开票价格'] > 0)
+                ]['开票价格']
                 
                 if len(valid_prices) > 0:
                     avg_price = valid_prices.mean()
-                    print(f"{target_date} 的CM2开票价格平均值: {avg_price:.2f}")
+                    print(f"{target_date} 的CM2开票价格平均值（交付日期）: {avg_price:.2f}")
                     return avg_price
                 else:
-                    print(f"警告: {target_date} 没有有效的开票价格数据")
+                    print(f"警告: {target_date} 没有有效的开票价格数据（交付日期）")
                     return 0
             else:
                 print("警告: 未找到'开票价格'列")
@@ -436,7 +439,7 @@ def calculate_daily_invoice_price(df, target_date):
             print("错误: 未找到'车型分组'列")
             return 0
     else:
-        print("错误: 未找到'Lock_Time'列")
+        print("错误: 未找到'Invoice_Upload_Time'列")
         return 0
 
 
