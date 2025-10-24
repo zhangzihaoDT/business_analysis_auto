@@ -467,7 +467,7 @@ def process_intention_order_analysis_to_parquet():
                      else:
                          print("✅ 未发现新订单")
                 
-                     # 处理可能的更新记录：基于时间戳的智能更新策略（向量化优化）
+                     # 处理可能的更新记录：基于时间戳和关键字段的智能更新策略（向量化优化）
                      if len(updated_orders) > 0:
                          print(f"🔄 检查 {len(updated_orders)} 个订单的更新...")
                          
@@ -475,19 +475,24 @@ def process_intention_order_analysis_to_parquet():
                          time_columns = ['Order_Create_Time', 'Intention_Payment_Time', 'intention_refund_time', 'Lock_Time', 'Invoice_Upload_Time','store_create_date']
                          available_time_cols = [col for col in time_columns if col in df_new.columns and col in df_existing.columns]
                          
+                         # 定义关键业务字段（非时间字段）
+                         business_columns = ['Product Name', '车型分组', '开票价格', 'buyer_age', 'order_gender', 'License Province', 'License City']
+                         available_business_cols = [col for col in business_columns if col in df_new.columns and col in df_existing.columns]
+                         
+                         # 获取需要更新的订单数据（向量化操作）
+                         df_updated_records = df_new[df_new['Order Number'].isin(updated_orders)].copy()
+                         df_existing_updated = df_existing[df_existing['Order Number'].isin(updated_orders)].copy()
+                         
+                         # 设置索引以便快速合并比较
+                         df_updated_records = df_updated_records.set_index('Order Number')
+                         df_existing_updated = df_existing_updated.set_index('Order Number')
+                         
+                         # 向量化比较字段
+                         orders_to_update = set()
+                         update_stats = {}
+                         
+                         # 检查时间字段更新
                          if available_time_cols:
-                             # 获取需要更新的订单数据（向量化操作）
-                             df_updated_records = df_new[df_new['Order Number'].isin(updated_orders)].copy()
-                             df_existing_updated = df_existing[df_existing['Order Number'].isin(updated_orders)].copy()
-                             
-                             # 设置索引以便快速合并比较
-                             df_updated_records = df_updated_records.set_index('Order Number')
-                             df_existing_updated = df_existing_updated.set_index('Order Number')
-                             
-                             # 向量化比较时间字段
-                             orders_to_update = set()
-                             update_stats = {}
-                             
                              for time_col in available_time_cols:
                                  # 向量化比较：找出有更新的订单
                                  # 确保两个Series有相同的索引
@@ -507,24 +512,45 @@ def process_intention_order_analysis_to_parquet():
                                      if updated_orders_for_col:
                                          orders_to_update.update(updated_orders_for_col)
                                          update_stats[time_col] = len(updated_orders_for_col)
+                         
+                         # 检查业务字段更新
+                         if available_business_cols:
+                             for business_col in available_business_cols:
+                                 # 向量化比较：找出有更新的订单
+                                 common_orders = df_updated_records.index.intersection(df_existing_updated.index)
+                                 
+                                 if len(common_orders) > 0:
+                                     new_values = df_updated_records.loc[common_orders, business_col].astype(str)
+                                     existing_values = df_existing_updated.loc[common_orders, business_col].astype(str)
+                                     
+                                     # 找出值不同的订单（包括从空值到有值的情况）
+                                     is_different = (new_values != existing_values)
+                                     
+                                     # 排除两边都是NaN的情况
+                                     both_nan = (new_values == 'nan') & (existing_values == 'nan')
+                                     needs_update = is_different & ~both_nan
+                                     
+                                     updated_orders_for_col = needs_update[needs_update].index.tolist()
+                                     
+                                     if updated_orders_for_col:
+                                         orders_to_update.update(updated_orders_for_col)
+                                         update_stats[business_col] = len(updated_orders_for_col)
+                         
+                         if orders_to_update:
+                             # 汇总显示更新统计
+                             update_summary = ", ".join([f"{col}:{count}个" for col, count in update_stats.items()])
+                             print(f"📈 发现 {len(orders_to_update)} 个订单需要更新 ({update_summary})")
                              
-                             if orders_to_update:
-                                 # 汇总显示更新统计
-                                 update_summary = ", ".join([f"{col}:{count}个" for col, count in update_stats.items()])
-                                 print(f"📈 发现 {len(orders_to_update)} 个订单需要更新 ({update_summary})")
-                                 
-                                 # 移除旧记录
-                                 df_final = df_final[~df_final['Order Number'].isin(orders_to_update)]
-                                 
-                                 # 添加更新后的记录
-                                 df_updated_final = df_new[df_new['Order Number'].isin(orders_to_update)]
-                                 df_final = pd.concat([df_final, df_updated_final], ignore_index=True)
-                                 
-                                 print(f"✅ 已更新 {len(orders_to_update)} 个订单的记录")
-                             else:
-                                 print(f"✅ 重复订单无时间字段更新，保持现有数据")
+                             # 移除旧记录
+                             df_final = df_final[~df_final['Order Number'].isin(orders_to_update)]
+                             
+                             # 添加更新后的记录
+                             df_updated_final = df_new[df_new['Order Number'].isin(orders_to_update)]
+                             df_final = pd.concat([df_final, df_updated_final], ignore_index=True)
+                             
+                             print(f"✅ 已更新 {len(orders_to_update)} 个订单的记录")
                          else:
-                             print(f"⚠️  未找到可比较的时间字段，跳过更新检查")
+                             print(f"✅ 重复订单无字段更新，保持现有数据")
                          
                          print(f"最终数据: {df_final.shape[0]} 行")
             else:
