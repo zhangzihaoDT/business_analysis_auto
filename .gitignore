@@ -29,6 +29,7 @@ secrets.py
 .env.production
 
 # Scripts containing sensitive information
+export_cm2_configuration_data.py
 automated_data_pipeline.py
 WORKFLOW_SUMMARY.md
 
