@@ -204,36 +204,20 @@ def transpose_data(df):
     """
     对数据进行转置处理
     将Attribute Name转置为列，Value Display Name作为值
+    
+    修复版本：使用order_number作为主键，避免因多字段组合导致的数据丢失
     """
     logging.info("开始数据转置处理...")
     
-    # 保留其他重要列 (适应新旧格式)
-    base_columns = []
+    # 首先，只使用order_number作为主键进行转置，避免数据丢失
+    logging.info(f"准备转置的数据形状: {df.shape}")
+    logging.info(f"唯一订单数量: {df['order_number'].nunique()}")
     
-    # 添加日期字段
-    if 'lock_time' in df.columns:
-        base_columns.append('lock_time')
-    elif 'DATE([Order Lock Time])' in df.columns:
-        base_columns.append('DATE([Order Lock Time])')
-    
-    if 'invoice_time' in df.columns:
-        base_columns.append('invoice_time')
-    elif 'DATE([invoice_upload_time])' in df.columns:
-        base_columns.append('DATE([invoice_upload_time])')
-    
-    # 添加其他基础列
-    for col in ['order_number', 'Product Name', 'Product_Types', '开票价格']:
-        if col in df.columns:
-            base_columns.append(col)
-    
-    # 创建透视表
+    # 创建透视表，只使用order_number作为索引
     try:
-        logging.info(f"基础列: {base_columns}")
-        logging.info(f"准备转置的数据形状: {df.shape}")
-        
         # 使用pivot_table处理可能的重复值，添加observed=True以避免FutureWarning
         pivot_df = df.pivot_table(
-            index=base_columns,
+            index='order_number',
             columns='Attribute Name',
             values='Value Display Name',
             aggfunc='first',  # 如果有重复值，取第一个
@@ -241,7 +225,7 @@ def transpose_data(df):
             observed=True  # 修复FutureWarning
         )
         
-        # 重置索引，将多级索引转为普通列
+        # 重置索引，将order_number转为普通列
         pivot_df = pivot_df.reset_index()
         
         # 清理列名（移除多级列名的层级）
@@ -249,6 +233,37 @@ def transpose_data(df):
         
         logging.info(f"转置完成，新数据形状: {pivot_df.shape}")
         logging.info(f"转置后的列名: {list(pivot_df.columns)}")
+        
+        # 现在单独处理其他字段的合并
+        # 获取每个订单的其他信息（取第一个非空值）
+        other_info_columns = []
+        
+        # 添加日期字段
+        if 'lock_time' in df.columns:
+            other_info_columns.append('lock_time')
+        elif 'DATE([Order Lock Time])' in df.columns:
+            other_info_columns.append('DATE([Order Lock Time])')
+        
+        if 'invoice_time' in df.columns:
+            other_info_columns.append('invoice_time')
+        elif 'DATE([invoice_upload_time])' in df.columns:
+            other_info_columns.append('DATE([invoice_upload_time])')
+        
+        # 添加其他基础列
+        for col in ['Product Name', 'Product_Types', '开票价格']:
+            if col in df.columns:
+                other_info_columns.append(col)
+        
+        if other_info_columns:
+            logging.info(f"合并其他信息列: {other_info_columns}")
+            
+            # 为每个订单获取其他信息（去重并取第一个值）
+            other_info = df[['order_number'] + other_info_columns].drop_duplicates(subset=['order_number']).groupby('order_number').first().reset_index()
+            
+            # 合并到转置后的数据
+            pivot_df = pivot_df.merge(other_info, on='order_number', how='left')
+            
+            logging.info(f"合并后数据形状: {pivot_df.shape}")
         
         return pivot_df
         
