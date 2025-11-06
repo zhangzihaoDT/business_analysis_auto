@@ -237,8 +237,7 @@ def clean_and_convert_data(df):
     
     # 3. 处理分类变量（使用重命名后的列名）
     category_columns = [
-        '车型分组', 'Order Number', 'order_gender', 'first_big_channel_name', 
-        'first_middle_channel_name', 'first_small_channel_name',
+        '车型分组', 'Order Number', 'order_gender', 'first_main_channel_group',
         'Parent Region Name', 'License Province', 'license_city_level', 
         'License City', 'Has_Intention_Payment'
     ]

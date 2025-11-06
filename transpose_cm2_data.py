@@ -209,6 +209,19 @@ def transpose_data(df):
     """
     logging.info("开始数据转置处理...")
     
+    # 兜底重命名（即使用户使用 --skip-cleaning，也确保日期字段统一）
+    try:
+        # 将发票上传日期重命名为 invoice_time（如果存在且尚未统一）
+        if 'DATE([invoice_upload_time])' in df.columns and 'invoice_time' not in df.columns:
+            df = df.rename(columns={'DATE([invoice_upload_time])': 'invoice_time'})
+            logging.info("已将 'DATE([invoice_upload_time])' 重命名为 'invoice_time'（兜底处理）")
+        # 将锁单日期重命名为 lock_time（如果存在且尚未统一）
+        if 'DATE([Order Lock Time])' in df.columns and 'lock_time' not in df.columns:
+            df = df.rename(columns={'DATE([Order Lock Time])': 'lock_time'})
+            logging.info("已将 'DATE([Order Lock Time])' 重命名为 'lock_time'（兜底处理）")
+    except Exception as e:
+        logging.warning(f"日期字段兜底重命名时发生警告: {e}")
+    
     # 首先，只使用order_number作为主键进行转置，避免数据丢失
     logging.info(f"准备转置的数据形状: {df.shape}")
     logging.info(f"唯一订单数量: {df['order_number'].nunique()}")
