@@ -200,7 +200,24 @@ def clean_and_convert_data(df):
     logging.info("数据清洗和类型转换完成")
     return df_cleaned
 
-def transpose_data(df):
+def select_order_level_columns(df, candidate_columns):
+    """自动检测订单级恒定列（每个order_number只有一个唯一值的列）。
+
+    仅保留在同一订单内不随属性行变化的元数据列，避免将属性行级字段错误并入订单级表。
+    """
+    try:
+        # 计算每个订单、每列的唯一值数量
+        nunique_per_order = df.groupby('order_number')[candidate_columns].nunique(dropna=True)
+        # 选择在所有订单中最大唯一值<=1的列（即每个订单至多一个值）
+        const_cols_mask = (nunique_per_order.max(axis=0) <= 1)
+        const_cols = [col for col, is_const in const_cols_mask.items() if bool(is_const)]
+        return const_cols
+    except Exception:
+        # 兜底：若检测失败，返回候选列原样
+        return candidate_columns
+
+
+def transpose_data(df, include_all_meta=False):
     """
     对数据进行转置处理
     将Attribute Name转置为列，Value Display Name作为值
@@ -247,37 +264,35 @@ def transpose_data(df):
         logging.info(f"转置完成，新数据形状: {pivot_df.shape}")
         logging.info(f"转置后的列名: {list(pivot_df.columns)}")
         
-        # 现在单独处理其他字段的合并
-        # 获取每个订单的其他信息（取第一个非空值）
-        other_info_columns = []
-        
-        # 添加日期字段
-        if 'lock_time' in df.columns:
-            other_info_columns.append('lock_time')
-        elif 'DATE([Order Lock Time])' in df.columns:
-            other_info_columns.append('DATE([Order Lock Time])')
-        
-        if 'invoice_time' in df.columns:
-            other_info_columns.append('invoice_time')
-        elif 'DATE([invoice_upload_time])' in df.columns:
-            other_info_columns.append('DATE([invoice_upload_time])')
-        
-        # 添加其他基础列
-        for col in ['Product Name', 'Product_Types', '开票价格']:
-            if col in df.columns:
-                other_info_columns.append(col)
-        
+        # 现在单独处理其他字段的合并（尽可能保留原始数据集的订单级元数据）
+        base_exclude = {'order_number', 'Attribute Name', 'Value Display Name'}
+        # 若原始数据尚有未统一的字段名，也排除（以免与属性行级内容混淆）
+        if 'Attribute Code' in df.columns:
+            base_exclude.add('Attribute Code')
+
+        candidate_cols = [c for c in df.columns if c not in base_exclude]
+        if include_all_meta:
+            other_info_columns = candidate_cols
+            logging.info("使用include_all_meta: 合并所有非属性列到订单级数据")
+        else:
+            other_info_columns = select_order_level_columns(df, candidate_cols)
+            excluded = sorted(set(candidate_cols) - set(other_info_columns))
+            logging.info(f"自动检测订单级恒定列，共 {len(other_info_columns)} 个；排除变化列 {len(excluded)} 个")
+            if excluded:
+                logging.debug(f"被排除的变化列: {excluded}")
+
         if other_info_columns:
             logging.info(f"合并其他信息列: {other_info_columns}")
-            
-            # 为每个订单获取其他信息（去重并取第一个值）
-            other_info = df[['order_number'] + other_info_columns].drop_duplicates(subset=['order_number']).groupby('order_number').first().reset_index()
-            
+            # 为每个订单获取其他信息（按订单聚合取第一个值）
+            other_info = (
+                df[['order_number'] + other_info_columns]
+                .groupby('order_number', as_index=False)
+                .first()
+            )
             # 合并到转置后的数据
             pivot_df = pivot_df.merge(other_info, on='order_number', how='left')
-            
             logging.info(f"合并后数据形状: {pivot_df.shape}")
-        
+
         return pivot_df
         
     except Exception as e:
@@ -406,6 +421,12 @@ def main():
         action='store_true',
         help='跳过数据清洗和类型转换，直接进行转置'
     )
+
+    parser.add_argument(
+        '--include-all-meta',
+        action='store_true',
+        help='包含所有非属性列作为订单级元数据（默认自动检测仅合并订单级恒定列）'
+    )
     
     args = parser.parse_args()
     
@@ -434,7 +455,7 @@ def main():
             processed_df = clean_and_convert_data(df)
         
         # 进行数据转置
-        transposed_df = transpose_data(processed_df)
+        transposed_df = transpose_data(processed_df, include_all_meta=args.include_all_meta)
         
         # 转置后数据清洗（处理OP-LuxGift等字段）
         if not args.skip_cleaning:
