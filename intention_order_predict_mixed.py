@@ -8,6 +8,7 @@
 - 部分1：按车型分组与意向支付时间范围筛选，输出每天（Intention Payment Time）的订单数
 - 部分2：使用 CM1 与 CM2 两段样本做训练，构建「BSTS + Boosting」混合模型，预测新车型在累计 X 天周期内第4～X日每日订单数
 - 部分3：使用 Plotly 可视化历史曲线与预测曲线，输出 HTML 文件
+- 增强：自动读取 processed/ 下最新的 leads_daily_*.csv，提取“线索识别数”并按 date 合并到每日表，生成线索滞后与滚动特征（leads_lag_1/2/3，leads_cum_7），用于提升预测能力。
 
 示例：
 python intention_order_daily_counts.py -m CM2 --start-date 2025-08-15 --end-date 2025-09-10 \
@@ -20,6 +21,7 @@ import os
 import sys
 import argparse
 from datetime import datetime
+from pathlib import Path
 from typing import List, Dict, Optional
 
 import pandas as pd
@@ -65,6 +67,76 @@ def load_data(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(f"数据文件不存在: {path}")
     return pd.read_parquet(path)
+
+
+# === Leads 日级数据加载与合并 ===
+
+def find_latest_leads_daily(processed_dir: Optional[str] = None, pattern: str = 'leads_daily_*.csv') -> Optional[str]:
+    """查找 processed 目录下最新的 leads_daily_*.csv 文件。"""
+    base = Path(processed_dir) if processed_dir is not None else (Path(__file__).resolve().parents[1] / 'processed')
+    candidates = sorted(base.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        return None
+    return str(candidates[0])
+
+
+def load_leads_daily(path: str) -> pd.DataFrame:
+    """读取 leads_daily CSV，并解析 date 与线索识别数列，输出两列：date, leads_recognition_count。"""
+    df = pd.read_csv(path)
+    # 解析日期列
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    else:
+        # 兜底：尝试从可能的日期列名解析
+        for cand in ['日期', 'day', 'dt']:
+            if cand in df.columns:
+                df['date'] = pd.to_datetime(df[cand], errors='coerce')
+                break
+        if 'date' not in df.columns:
+            raise KeyError('leads_daily 文件缺少日期列')
+
+    # 识别“线索识别数”列名候选
+    lead_candidates = [
+        '线索识别数', '识别数', 'leads_count', '线索数', 'lead_count', 'leads', 'count', '日识别数'
+    ]
+    leads_col = None
+    for c in lead_candidates:
+        if c in df.columns:
+            leads_col = c
+            break
+    if leads_col is None:
+        # 若没有明确列名，选择第一个数值列作为近似（除 date）
+        num_cols = [c for c in df.columns if c != 'date']
+        # 尝试转数值
+        num_cols_numeric = []
+        for c in num_cols:
+            try:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+                num_cols_numeric.append(c)
+            except Exception:
+                pass
+        leads_col = num_cols_numeric[0] if num_cols_numeric else None
+
+    if leads_col is None:
+        df['leads_recognition_count'] = 0.0
+    else:
+        df['leads_recognition_count'] = pd.to_numeric(df[leads_col], errors='coerce').fillna(0.0)
+
+    return df[['date', 'leads_recognition_count']].dropna(subset=['date'])
+
+
+def merge_leads_features(daily_df: pd.DataFrame, leads_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """按日期合并线索识别数到每日数据，缺失填 0。"""
+    df = daily_df.copy()
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    if leads_df is not None and not leads_df.empty:
+        ldf = leads_df.copy()
+        ldf['date'] = pd.to_datetime(ldf['date'], errors='coerce')
+        df = df.merge(ldf, on='date', how='left')
+    if 'leads_recognition_count' not in df.columns:
+        df['leads_recognition_count'] = 0.0
+    df['leads_recognition_count'] = df['leads_recognition_count'].fillna(0.0)
+    return df
 
 
 def filter_data(
@@ -116,15 +188,18 @@ def compute_daily_counts(df: pd.DataFrame, col_time: str) -> pd.DataFrame:
 
 
 def compute_daily_counts_for_group(
-    df: pd.DataFrame, group: str, start_date: str, end_date: str
+    df: pd.DataFrame, group: str, start_date: str, end_date: str,
+    leads_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """给定车型分组与日期范围，返回每日订单数，并带上 cycle_day 与 model_group 标识。"""
+    """给定车型分组与日期范围，返回每日订单数，并按日期合并线索识别数，生成 cycle_day 与 model_group 标识。"""
     df_filt, col_time = filter_data(df, group, start_date, end_date)
     daily = compute_daily_counts(df_filt, col_time)
     daily = daily.rename(columns={"day": "date", "orders": "count"})
     daily = daily.sort_values("date").reset_index(drop=True)
     daily["cycle_day"] = np.arange(1, len(daily) + 1)
     daily["model_group"] = group
+    # 合并线索识别数
+    daily = merge_leads_features(daily, leads_df)
     # 数值编码用于混合（CM1->0, CM2->1）
     code = 1 if group.strip().upper() == "CM2" else 0
     daily["model_group_code"] = float(code)
@@ -142,6 +217,13 @@ def add_time_features(daily: pd.DataFrame) -> pd.DataFrame:
     df["lag_3"] = df["count"].shift(3)
     # 7日累计（含当日）
     df["cum_7"] = df["count"].rolling(window=7, min_periods=1).sum()
+    # 线索识别数特征（滞后与滚动）
+    if "leads_recognition_count" not in df.columns:
+        df["leads_recognition_count"] = 0.0
+    df["leads_lag_1"] = df["leads_recognition_count"].shift(1)
+    df["leads_lag_2"] = df["leads_recognition_count"].shift(2)
+    df["leads_lag_3"] = df["leads_recognition_count"].shift(3)
+    df["leads_cum_7"] = df["leads_recognition_count"].rolling(window=7, min_periods=1).sum()
     # 归一化相位与截止天特征（用于刻画双峰尾部上扬）
     seg_len = int(df["cycle_day"].max()) if len(df) else 1
     if seg_len <= 1:
@@ -233,7 +315,9 @@ def orchestrate_training(segments: List[pd.DataFrame]):
     # 选择特征列（增加相位与截止天归一化，帮助尾部上扬）
     feat_cols = [
         "lag_1", "lag_2", "lag_3", "cum_7", "day_of_week", "is_weekend",
-        "model_group_code", "phase", "days_to_deadline_norm"
+        "model_group_code", "phase", "days_to_deadline_norm",
+        # 线索识别数的滞后与滚动特征
+        "leads_lag_1", "leads_lag_2", "leads_lag_3", "leads_cum_7",
     ]
     X = Xy[feat_cols].astype(float).fillna(0.0)
     y = Xy["residual"].astype(float)
@@ -275,12 +359,16 @@ def predict_new_series(
     dates = [start_dt + pd.Timedelta(days=i) for i in range(cycle_days)]
     # 初始已知：根据输入数据获取第1～3日的订单数
     init_map = {pd.to_datetime(r["date"]).date(): float(r["count"]) for _, r in initial_daily.iterrows()}
+    init_leads_map = {pd.to_datetime(r["date"]).date(): float(r.get("leads_recognition_count", 0.0)) for _, r in initial_daily.iterrows()}
     counts = []
+    leads_counts = []
     for i, d in enumerate(dates):
         if i < len(initial_daily):
             counts.append(init_map.get(d.date(), 0.0))
+            leads_counts.append(init_leads_map.get(d.date(), 0.0))
         else:
             counts.append(np.nan)  # 待预测
+            leads_counts.append(np.nan)
 
     # 递归预测从第4日开始
     for i in range(cycle_days):
@@ -308,6 +396,20 @@ def predict_new_series(
             phase = i / float(cycle_days - 1)
             dtd_norm = 1.0 - phase
 
+        # 线索识别数特征（使用已知的前几日并前向填充缺失）
+        def lead_val(idx: int) -> float:
+            if idx < 0:
+                return 0.0
+            v = leads_counts[idx]
+            return 0.0 if np.isnan(v) else float(v)
+
+        leads_lag_1 = lead_val(i - 1)
+        leads_lag_2 = lead_val(i - 2)
+        leads_lag_3 = lead_val(i - 3)
+        l_window_start = max(0, i - 6)
+        l_past_vals = [lead_val(k) for k in range(l_window_start, i)]
+        leads_cum_7 = float(np.sum(l_past_vals))
+
         X_row = pd.DataFrame({
             "lag_1": [lag_1],
             "lag_2": [lag_2],
@@ -318,6 +420,10 @@ def predict_new_series(
             "model_group_code": [model_group_code],
             "phase": [phase],
             "days_to_deadline_norm": [dtd_norm],
+            "leads_lag_1": [leads_lag_1],
+            "leads_lag_2": [leads_lag_2],
+            "leads_lag_3": [leads_lag_3],
+            "leads_cum_7": [leads_cum_7],
         })
         X_row = X_row[feat_cols].astype(float)
         residual_pred = float(model.predict(X_row)[0])
@@ -380,16 +486,26 @@ def ensure_reports_dir(root_dir: str) -> str:
     return reports_dir
 
 
-def generate_report(df_daily: pd.DataFrame, model_group: str, start_date: str, end_date: str) -> str:
+def generate_report(
+    df_daily: pd.DataFrame, model_group: str, start_date: str, end_date: str,
+    leads_df: Optional[pd.DataFrame] = None,
+) -> str:
     lines: List[str] = []
     lines.append(f"意向订单每日计数（车型分组={model_group}，时间范围={start_date} 至 {end_date}）")
     total = int(df_daily["orders"].sum()) if len(df_daily) else 0
     lines.append(f"总订单数：{total}")
     lines.append("")
     lines.append("【每日订单数（按意向支付时间）】")
-    for _, row in df_daily.iterrows():
-        day_str = pd.to_datetime(row["day"]).strftime("%Y-%m-%d")
-        lines.append(f"- {day_str}: {int(row['orders'])}")
+
+    # 合并线索识别数，并在每日列表中追加显示
+    daily_for_merge = df_daily.rename(columns={"day": "date", "orders": "count"}).copy()
+    daily_for_merge = merge_leads_features(daily_for_merge, leads_df)
+
+    for _, row in daily_for_merge.iterrows():
+        day_str = pd.to_datetime(row["date"]).strftime("%Y-%m-%d")
+        orders_val = int(row.get("count", row.get("orders", 0)))
+        leads_val = int(row.get("leads_recognition_count", 0))
+        lines.append(f"- {day_str}: {orders_val}（线索识别数={leads_val}）")
     return "\n".join(lines)
 
 
@@ -419,19 +535,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 读取数据
     df = load_data(args.data_path)
 
+    # 自动读取最新 leads_daily 并构造线索识别数表（先于报告生成）
+    leads_daily_path = find_latest_leads_daily()
+    leads_df = None
+    if leads_daily_path and os.path.exists(leads_daily_path):
+        try:
+            leads_df = load_leads_daily(leads_daily_path)
+            print(f"已加载最新线索日级文件：{leads_daily_path}")
+        except Exception as e:
+            print(f"读取线索日级文件失败，继续不使用线索特征：{e}")
+
     # 部分1：每日计数（用于快速查看）
     df_filtered, col_time = filter_data(df, args.model_group, args.start_date, args.end_date)
     daily_df = compute_daily_counts(df_filtered, col_time)
-    report_text = generate_report(daily_df, args.model_group, args.start_date, args.end_date)
-
+    report_text = generate_report(daily_df, args.model_group, args.start_date, args.end_date, leads_df=leads_df)
     # 部分2：训练段准备（CM1/CM2）
-    seg_cm1 = compute_daily_counts_for_group(df, "CM1", args.train_cm1_start, args.train_cm1_end)
-    seg_cm2 = compute_daily_counts_for_group(df, "CM2", args.train_cm2_start, args.train_cm2_end)
+    seg_cm1 = compute_daily_counts_for_group(df, "CM1", args.train_cm1_start, args.train_cm1_end, leads_df=leads_df)
+    seg_cm2 = compute_daily_counts_for_group(df, "CM2", args.train_cm2_start, args.train_cm2_end, leads_df=leads_df)
     segments = [seg_cm1, seg_cm2]
     norm_curve, model, feat_cols = orchestrate_training(segments)
 
     # 部分3：新车型（LS9）输入与预测
-    seg_new_init = compute_daily_counts_for_group(df, args.new_model, args.new_start_date, args.new_end_date)
+    seg_new_init = compute_daily_counts_for_group(df, args.new_model, args.new_start_date, args.new_end_date, leads_df=leads_df)
     # 只保留前3日作为已知（若不到3日，则按实际保留）
     seg_new_init = seg_new_init.iloc[:3].copy()
     # 基线按目标周期重采样（确保尾部峰值贴近周期末端）
@@ -439,7 +564,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     pred_df = predict_new_series(
         model, feat_cols, baseline,
         args.new_start_date, args.new_end_date, args.cycle_days,
-        seg_new_init[["date", "count"]]
+        seg_new_init[["date", "count", "leads_recognition_count"]]
     )
 
     # 扩展文本：先写入前1～3日“已知值”，再附上预测第4～X日
@@ -449,7 +574,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 已知值（前1～3日）
     report_text += "\n【已知值（前1～3日）】"
     for i, r in seg_new_init.iterrows():
-        report_text += f"\n- 第{i+1}日({pd.to_datetime(r['date']).strftime('%Y-%m-%d')}): {int(r['count'])}"
+        report_text += f"\n- 第{i+1}日({pd.to_datetime(r['date']).strftime('%Y-%m-%d')}): {int(r['count'])}（线索识别数={int(r.get('leads_recognition_count', 0))}）"
 
     # 预测值（第4～X日）
     report_text += "\n【预测（第4～X日）】"

@@ -8,6 +8,8 @@ CM2配置项影响分析建模脚本
 3. 分析配置项对销量的影响
 4. 生成详细的分析报告和可视化结果
 
+5. 未指定输入文件时，自动使用 processed/ 目录下最新的转置CSV
+
 作者：AI Assistant
 创建时间：2025-10-23
 """
@@ -35,6 +37,28 @@ import xgboost as xgb
 # 设置Plotly默认主题和中文支持
 pio.templates.default = "plotly_white"
 warnings.filterwarnings('ignore')
+
+def find_latest_transposed_file(processed_dir=None, pattern='CM2_Configuration_Details_transposed_*.csv'):
+    """
+    在 processed 目录自动查找最新的转置文件（按修改时间选择）。
+
+    Args:
+        processed_dir (str|Path|None): 指定 processed 目录，默认推断为项目根目录下的 processed。
+        pattern (str): 文件匹配模式，默认 'CM2_Configuration_Details_transposed_*.csv'。
+
+    Returns:
+        str: 最新匹配文件的绝对路径。
+
+    Raises:
+        FileNotFoundError: 若未找到匹配文件。
+    """
+    base = Path(processed_dir) if processed_dir is not None else (Path(__file__).resolve().parents[1] / 'processed')
+    candidates = sorted(base.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise FileNotFoundError(f"在 {base} 下未找到匹配 {pattern} 的文件")
+    latest = candidates[0]
+    print(f"未指定输入文件，自动使用最新转置文件: {latest}")
+    return str(latest)
 
 class CM2ConfigurationAnalyzer:
     """CM2配置项影响分析器"""
@@ -107,6 +131,27 @@ class CM2ConfigurationAnalyzer:
         
         # 创建特征数据副本
         feature_data = self.filtered_data[self.feature_columns + [self.target_column]].copy()
+
+        # 目标列缺失值处理：丢弃无开票价格的样本
+        before_rows = len(feature_data)
+        feature_data = feature_data.dropna(subset=[self.target_column])
+        after_rows = len(feature_data)
+        if before_rows != after_rows:
+            print(f"已删除目标列缺失样本: {before_rows - after_rows} 行")
+
+        # 特征缺失值处理
+        print("开始特征缺失值处理：对象列填充'缺失'，数值列填充中位数/0")
+        for col in self.feature_columns:
+            na_count = feature_data[col].isna().sum()
+            if na_count > 0:
+                if feature_data[col].dtype == 'object':
+                    feature_data[col] = feature_data[col].fillna('缺失')
+                else:
+                    median_val = feature_data[col].median()
+                    if pd.isna(median_val):
+                        median_val = 0
+                    feature_data[col] = feature_data[col].fillna(median_val)
+                print(f"- {col}: 缺失值 {na_count} 已填充")
         
         # 处理分类特征
         label_encoders = {}
@@ -841,18 +886,26 @@ class CM2ConfigurationAnalyzer:
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='CM2配置项影响分析')
-    parser.add_argument('-i', '--input', required=True, help='输入CSV文件路径')
+    parser.add_argument('-i', '--input', required=False, help='输入CSV文件路径（未指定则自动使用 processed/ 下最新转置文件）')
     parser.add_argument('-o', '--output', help='输出目录路径')
     
     args = parser.parse_args()
     
-    # 检查输入文件
-    if not os.path.exists(args.input):
-        print(f"错误: 输入文件不存在 - {args.input}")
-        sys.exit(1)
+    # 解析输入文件：未指定时自动选择 processed/ 下最新的转置文件
+    if args.input:
+        input_path = args.input
+        if not os.path.exists(input_path):
+            print(f"错误: 输入文件不存在 - {input_path}")
+            sys.exit(1)
+    else:
+        try:
+            input_path = find_latest_transposed_file()
+        except FileNotFoundError as e:
+            print(f"错误: {e}")
+            sys.exit(1)
     
     # 创建分析器
-    analyzer = CM2ConfigurationAnalyzer(args.input, args.output)
+    analyzer = CM2ConfigurationAnalyzer(input_path, args.output)
     
     # 运行分析
     success = analyzer.run_full_analysis()
