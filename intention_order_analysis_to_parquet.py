@@ -178,7 +178,9 @@ def clean_and_convert_data(df):
     column_rename_mapping = {
         'DATE(DATETRUNC(\'day\', [Order Create Time]))': 'Order_Create_Time',
         'DATE(DATETRUNC(\'day\', [Intention Payment Time]))': 'Intention_Payment_Time',
+        'DATE(DATETRUNC(\'day\', [Deposit Payment Time]))': 'Deposit_Payment_Time',
         'DATE(DATETRUNC(\'day\', [intention_refund_time]))': 'intention_refund_time',
+        'DATE(DATETRUNC(\'day\', [deposit_refund_time]))': 'deposit_refund_time',
         'DATE(DATETRUNC(\'day\', [Lock Time]))': 'Lock_Time',
         'DATE(DATETRUNC(\'day\', [first_touch_time]))': 'first_touch_time',
         'DATE([first_assign_time])': 'first_assign_time',
@@ -198,7 +200,9 @@ def clean_and_convert_data(df):
     date_columns = [
         'Order_Create_Time',
         'Intention_Payment_Time',
+        'Deposit_Payment_Time',
         'intention_refund_time',
+        'deposit_refund_time',
         'Lock_Time', 
         'first_touch_time',
         'first_assign_time',
@@ -214,6 +218,10 @@ def clean_and_convert_data(df):
                 print(f"✅ 成功将 {col} 转换为日期类型")
             except Exception as e:
                 print(f"❌ 转换 {col} 时出错: {e}")
+
+    # 保留原始四个日期列，不进行合并或删除：
+    # Intention_Payment_Time、Deposit_Payment_Time、intention_refund_time、deposit_refund_time
+    # 以上列已在日期转换阶段进行类型转换，无需进一步处理
     
     # 2. 处理数值列（Order Number是字符串ID，不应转换为数值）
     numeric_columns = ['buyer_age', 'Order Number 不同计数']
@@ -426,13 +434,13 @@ def process_intention_order_analysis_to_parquet():
                 size_reduction_ratio = len(new_orders) / total_existing if total_existing > 0 else 1
                 
                 # 更保守的完整快照判断：只有在极端情况下才认为是完整快照
-                # 1. 移除比例超过90%（非常高的移除比例）
+                # 1. 移除比例超过98%（非常高的移除比例）
                 # 2. 新增订单比例低于1%（几乎没有新订单）
                 # 3. 新文件大小相比历史数据显著减少（小于20%）
                 # 4. 新文件订单数量超过5000（确保是大规模数据）
                 # 5. 移除的订单数量超过新增订单数量的100倍（避免正常的数据更新被误判）
                 is_full_snapshot = (
-                    removal_ratio > 0.9 and 
+                    removal_ratio > 0.98 and 
                     new_ratio < 0.01 and 
                     size_reduction_ratio < 0.2 and 
                     len(new_orders) > 5000 and

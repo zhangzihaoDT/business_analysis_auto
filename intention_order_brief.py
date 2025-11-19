@@ -108,10 +108,11 @@ def compute_channel_share(df: pd.DataFrame) -> pd.DataFrame:
     return res
 
 
-def compute_channel_conversion(df: pd.DataFrame, window_days: int) -> pd.DataFrame:
+def compute_channel_conversion(df: pd.DataFrame, window_days: int, end_date: str) -> pd.DataFrame:
     """Compute N-day conversion rate per channel.
 
-    Converted if order has Lock_Time and (Lock_Time - Intention Payment Time) in [0, window_days] days.
+    Window starts at end day: converted if order has Lock_Time ∈ [end_day, end_day + window_days].
+    Additionally, all converted orders MUST have Lock_Time >= end_day.
     Denominator is total intention orders per channel in the filtered dataset.
     """
     # Resolve columns
@@ -126,13 +127,6 @@ def compute_channel_conversion(df: pd.DataFrame, window_days: int) -> pd.DataFra
         ]
     }
     time_candidates = {
-        "intention_payment_time": [
-            "Intention Payment Time",
-            "意向支付时间",
-            "intention_payment_time",
-            "intent_payment_time",
-            "intentpaytime",
-        ],
         "lock_time": [
             "Lock_Time",
             "Lock Time",
@@ -143,16 +137,13 @@ def compute_channel_conversion(df: pd.DataFrame, window_days: int) -> pd.DataFra
     }
 
     col_channel = resolve_column(df, "channel", channel_candidates)
-    col_intent = resolve_column(df, "intention_payment_time", time_candidates)
     col_lock = resolve_column(df, "lock_time", time_candidates)
 
     # Prepare series
     s_channel = safe_fillna_text(df[col_channel], "未知")
-    s_intent = pd.to_datetime(df[col_intent], errors="coerce")
     s_lock = pd.to_datetime(df[col_lock], errors="coerce")
-
-    delta_days = (s_lock - s_intent).dt.days
-    converted = (s_lock.notna()) & (delta_days >= 0) & (delta_days <= window_days)
+    end_day = pd.to_datetime(end_date)
+    converted = (s_lock.notna()) & (s_lock >= end_day) & (s_lock <= end_day + pd.Timedelta(days=window_days))
 
     grp = pd.DataFrame({
         "channel": s_channel,
@@ -166,19 +157,12 @@ def compute_channel_conversion(df: pd.DataFrame, window_days: int) -> pd.DataFra
     return grp.reset_index().sort_values(["total", "conversion_pct"], ascending=[False, False])
 
 
-def compute_gender_conversion(df: pd.DataFrame, window_days: int) -> pd.DataFrame:
+def compute_gender_conversion(df: pd.DataFrame, window_days: int, end_date: str) -> pd.DataFrame:
     """Compute N-day conversion rate per gender."""
     candidates = {
         "gender": ["order_gender", "buyer_gender", "性别", "gender"],
     }
     time_candidates = {
-        "intention_payment_time": [
-            "Intention Payment Time",
-            "意向支付时间",
-            "intention_payment_time",
-            "intent_payment_time",
-            "intentpaytime",
-        ],
         "lock_time": [
             "Lock_Time",
             "Lock Time",
@@ -189,15 +173,12 @@ def compute_gender_conversion(df: pd.DataFrame, window_days: int) -> pd.DataFram
     }
 
     col_gender = resolve_column(df, "gender", candidates)
-    col_intent = resolve_column(df, "intention_payment_time", time_candidates)
     col_lock = resolve_column(df, "lock_time", time_candidates)
 
     s_gender = safe_fillna_text(df[col_gender], "未知")
-    s_intent = pd.to_datetime(df[col_intent], errors="coerce")
     s_lock = pd.to_datetime(df[col_lock], errors="coerce")
-
-    delta_days = (s_lock - s_intent).dt.days
-    converted = (s_lock.notna()) & (delta_days >= 0) & (delta_days <= window_days)
+    end_day = pd.to_datetime(end_date)
+    converted = (s_lock.notna()) & (s_lock >= end_day) & (s_lock <= end_day + pd.Timedelta(days=window_days))
 
     grp = pd.DataFrame({
         "gender": s_gender,
@@ -211,19 +192,12 @@ def compute_gender_conversion(df: pd.DataFrame, window_days: int) -> pd.DataFram
     return grp.reset_index().sort_values(["total", "conversion_pct"], ascending=[False, False])
 
 
-def compute_age_bucket_conversion(df: pd.DataFrame, window_days: int) -> pd.DataFrame:
+def compute_age_bucket_conversion(df: pd.DataFrame, window_days: int, end_date: str) -> pd.DataFrame:
     """Compute N-day conversion rate per age bucket using the same binning as profile."""
     candidates = {
         "age": ["buyer_age", "年龄", "age", "order_buyer_age"],
     }
     time_candidates = {
-        "intention_payment_time": [
-            "Intention Payment Time",
-            "意向支付时间",
-            "intention_payment_time",
-            "intent_payment_time",
-            "intentpaytime",
-        ],
         "lock_time": [
             "Lock_Time",
             "Lock Time",
@@ -234,7 +208,6 @@ def compute_age_bucket_conversion(df: pd.DataFrame, window_days: int) -> pd.Data
     }
 
     col_age = resolve_column(df, "age", candidates)
-    col_intent = resolve_column(df, "intention_payment_time", time_candidates)
     col_lock = resolve_column(df, "lock_time", time_candidates)
 
     age_series = pd.to_numeric(df[col_age], errors="coerce")
@@ -243,10 +216,9 @@ def compute_age_bucket_conversion(df: pd.DataFrame, window_days: int) -> pd.Data
     age_binned = pd.cut(age_series, bins=bins, labels=labels, right=True)
     age_binned = safe_fillna_text(age_binned, "未知")
 
-    s_intent = pd.to_datetime(df[col_intent], errors="coerce")
     s_lock = pd.to_datetime(df[col_lock], errors="coerce")
-    delta_days = (s_lock - s_intent).dt.days
-    converted = (s_lock.notna()) & (delta_days >= 0) & (delta_days <= window_days)
+    end_day = pd.to_datetime(end_date)
+    converted = (s_lock.notna()) & (s_lock >= end_day) & (s_lock <= end_day + pd.Timedelta(days=window_days))
 
     grp = pd.DataFrame({
         "age_bucket": age_binned,
@@ -263,7 +235,7 @@ def compute_age_bucket_conversion(df: pd.DataFrame, window_days: int) -> pd.Data
     return grp.reset_index().sort_values(["total", "conversion_pct"], ascending=[False, False])
 
 
-def compute_parent_region_conversion(df: pd.DataFrame, window_days: int) -> pd.DataFrame:
+def compute_parent_region_conversion(df: pd.DataFrame, window_days: int, end_date: str) -> pd.DataFrame:
     """Compute N-day conversion rate per parent region."""
     candidates = {
         "parent_region": [
@@ -275,13 +247,6 @@ def compute_parent_region_conversion(df: pd.DataFrame, window_days: int) -> pd.D
         ],
     }
     time_candidates = {
-        "intention_payment_time": [
-            "Intention Payment Time",
-            "意向支付时间",
-            "intention_payment_time",
-            "intent_payment_time",
-            "intentpaytime",
-        ],
         "lock_time": [
             "Lock_Time",
             "Lock Time",
@@ -292,14 +257,12 @@ def compute_parent_region_conversion(df: pd.DataFrame, window_days: int) -> pd.D
     }
 
     col_region = resolve_column(df, "parent_region", candidates)
-    col_intent = resolve_column(df, "intention_payment_time", time_candidates)
     col_lock = resolve_column(df, "lock_time", time_candidates)
 
     s_region = safe_fillna_text(df[col_region], "未知")
-    s_intent = pd.to_datetime(df[col_intent], errors="coerce")
     s_lock = pd.to_datetime(df[col_lock], errors="coerce")
-    delta_days = (s_lock - s_intent).dt.days
-    converted = (s_lock.notna()) & (delta_days >= 0) & (delta_days <= window_days)
+    end_day = pd.to_datetime(end_date)
+    converted = (s_lock.notna()) & (s_lock >= end_day) & (s_lock <= end_day + pd.Timedelta(days=window_days))
 
     grp = pd.DataFrame({
         "parent_region": s_region,
@@ -337,15 +300,31 @@ def compute_profiles(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         .sort_values("count", ascending=False)
     )
 
-    # 年龄分布（分箱 + 简单统计）
+    # 年龄分布（按 1 岁/bin 的频数分布 + 简单统计）
     col_age = resolve_column(df, "age", candidates)
     age_series = pd.to_numeric(df[col_age], errors="coerce")
-    bins = [0, 24, 34, 44, 54, 150]
-    labels = ["<25", "25-34", "35-44", "45-54", "55+"]
-    age_binned = pd.cut(age_series, bins=bins, labels=labels, right=True)
-    age_counts = age_binned.value_counts().reindex(labels).fillna(0).astype(int)
-    age_share = (age_counts / max(len(df), 1) * 100).round(2)
-    age_df = pd.DataFrame({"age_bucket": labels, "count": age_counts.values, "share_pct": age_share.values})
+    # 将年龄转换为整数岁，便于构建连续的频数分布（钟形曲线）
+    ages_valid = age_series.dropna()
+    # 合理范围约束，过滤明显异常值
+    ages_valid = ages_valid[(ages_valid >= 0) & (ages_valid <= 120)]
+    ages_int = np.floor(ages_valid).astype(int)
+
+    if len(ages_int) > 0:
+        min_age = int(ages_int.min())
+        max_age = int(ages_int.max())
+        full_range = list(range(min_age, max_age + 1))
+        counts_by_age = pd.Series(ages_int).value_counts().sort_index()
+        # 重新索引到完整的连续年龄段，以包含为 0 的年龄桶
+        counts_full = counts_by_age.reindex(full_range, fill_value=0).astype(int)
+        share_full = (counts_full / max(len(df), 1) * 100).round(2)
+        age_df = pd.DataFrame({
+            "age_bucket": [str(a) for a in full_range],
+            "count": counts_full.values,
+            "share_pct": share_full.values,
+        })
+    else:
+        age_df = pd.DataFrame({"age_bucket": [], "count": [], "share_pct": []})
+
     age_stats = {
         "mean": float(np.nanmean(age_series)) if len(age_series) else np.nan,
         "median": float(np.nanmedian(age_series)) if len(age_series) else np.nan,
@@ -401,8 +380,8 @@ def generate_report(
 
     # 分渠道的N日小订转化率
     try:
-        conv_df = compute_channel_conversion(df_filtered, window_days)
-        lines.append(format_section(f"分渠道的{window_days}日小订转化率（Lock_Time 与 Intention Payment ≤ {window_days} 天）"))
+        conv_df = compute_channel_conversion(df_filtered, window_days, end_date)
+        lines.append(format_section(f"分渠道的{window_days}日小订转化率（以结束日为起点，Lock_Time ∈ [end day, end day + {window_days} 天]）"))
         for _, row in conv_df.iterrows():
             channel = str(row["channel"])
             total = int(row["total"]) if not pd.isna(row["total"]) else 0
@@ -427,8 +406,8 @@ def generate_report(
 
         # 性别的N日小订转化率
         try:
-            gender_conv_df = compute_gender_conversion(df_filtered, window_days)
-            lines.append(f"性别的{window_days}日小订转化率：")
+            gender_conv_df = compute_gender_conversion(df_filtered, window_days, end_date)
+            lines.append(f"性别的{window_days}日小订转化率（以结束日为起点）：")
             for _, row in gender_conv_df.iterrows():
                 g = str(row["gender"]) 
                 total = int(row["total"]) if not pd.isna(row["total"]) else 0
@@ -453,8 +432,8 @@ def generate_report(
 
         # 年龄（分箱）的N日小订转化率
         try:
-            age_conv_df = compute_age_bucket_conversion(df_filtered, window_days)
-            lines.append(f"年龄（分箱）的{window_days}日小订转化率：")
+            age_conv_df = compute_age_bucket_conversion(df_filtered, window_days, end_date)
+            lines.append(f"年龄（分箱）的{window_days}日小订转化率（以结束日为起点）：")
             for _, row in age_conv_df.iterrows():
                 bucket = str(row["age_bucket"]) 
                 total = int(row["total"]) if not pd.isna(row["total"]) else 0
@@ -475,8 +454,8 @@ def generate_report(
 
         # 父区域的N日小订转化率
         try:
-            region_conv_df = compute_parent_region_conversion(df_filtered, window_days)
-            lines.append(f"父区域的{window_days}日小订转化率（Top 15）：")
+            region_conv_df = compute_parent_region_conversion(df_filtered, window_days, end_date)
+            lines.append(f"父区域的{window_days}日小订转化率（以结束日为起点，Top 15）：")
             for _, row in region_conv_df.head(15).iterrows():
                 region = str(row["parent_region"]) 
                 total = int(row["total"]) if not pd.isna(row["total"]) else 0
