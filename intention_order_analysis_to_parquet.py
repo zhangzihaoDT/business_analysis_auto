@@ -263,6 +263,17 @@ def clean_and_convert_data(df):
             except Exception as e:
                 print(f"❌ 转换 {col} 时出错: {e}")
     
+    # 4. 强制文本类型的列（避免保存Parquet时被错误推断为数值）
+    text_like_patterns = ['Phone', '电话', '手机号', '手机', '电话号']
+    explicit_text_columns = ['Store Agent Phone', 'Order Number']
+    for col in df_cleaned.columns:
+        if col in explicit_text_columns or any(pat in str(col) for pat in text_like_patterns):
+            try:
+                df_cleaned[col] = df_cleaned[col].astype('string')
+                print(f"✅ 已将 {col} 设置为string类型")
+            except Exception as e:
+                print(f"❌ 设置 {col} 为string类型时出错: {e}")
+
     return df_cleaned
 
 def optimize_data_types(df):
@@ -568,6 +579,20 @@ def process_intention_order_analysis_to_parquet():
             print(f"📝 全量模式: 直接使用新数据")
             df_final = df_new
         
+        # 7. 数据质量检查前的类型统一（避免Parquet保存时的混合类型问题）
+        safe_string_cols = [
+            'Order Number', 'Store Agent Phone', 'Buyer Cell Phone',
+            'Store Agent Id', 'Buyer Identity No', 'Store Code'
+        ]
+        for col in safe_string_cols:
+            if col in df_final.columns:
+                try:
+                    df_final[col] = df_final[col].astype('string')
+                    # 打印一次即可，避免刷屏
+                    print(f"🔒 已统一 {col} 为string类型以确保写入安全")
+                except Exception as e:
+                    print(f"⚠️  将 {col} 统一为string类型失败: {e}")
+
         # 7. 数据质量检查
         print("\n" + "="*60)
         print(" 最终数据质量报告 ")

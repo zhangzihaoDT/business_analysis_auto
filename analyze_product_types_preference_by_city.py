@@ -2,19 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-按 License City 计算 Product_Types 偏好度（基于 intention_order_analysis.parquet）
+按 Store City 计算 Product_Types 偏好度（基于 intention_order_analysis.parquet）
 
 功能：
 - 读取数据（默认路径：../formatted/intention_order_analysis.parquet）
-- 筛选：车型分组 = CM2；Lock_Time ∈ [2025-09-10, 2025-11-09]
-- 统计：分 License City 与 Product_Types 的订单数
+- 筛选：车型分组 = CM2；Lock_Time ∈ [2025-09-10, 2025-10-15]
+- 统计：分 Store City 与 Product_Types 的订单数
 - 偏好度系数：同一城市内，每个 Product_Types 的订单数 / 该城市订单数最多的 Product_Types 的订单数
   示例：上海：A=100, B=200 => A 的偏好系数 = 100/200 = 0.5
 
 使用：
 python scripts/product_types_preference_by_city.py \
   --data-path ../formatted/intention_order_analysis.parquet \
-  --group CM2 --start-date 2025-09-10 --end-date 2025-11-09 \
+  --group CM2 --start-date 2025-09-10 --end-date 2025-10-15 \
   --output ../processed/analysis_results/product_types_preference_by_city.csv
 """
 
@@ -157,13 +157,14 @@ def filter_by_group_and_intention_time(
 
 
 def compute_preference_by_city(df: pd.DataFrame) -> pd.DataFrame:
-    """分 License City 统计 Product_Types 订单数与偏好度系数。"""
+    """分 Store City 统计 Product_Types 订单数与偏好度系数。"""
     candidates = {
-        "license_city": [
-            "License City",
-            "license_city",
-            "上牌城市",
-            "上牌市",
+        "store_city": [
+            "Store City",
+            "Store_City",
+            "门店城市",
+            "城市",
+            "City",
         ],
         "product_types": [
             "Product_Types",
@@ -176,7 +177,7 @@ def compute_preference_by_city(df: pd.DataFrame) -> pd.DataFrame:
         ],
     }
 
-    col_city = resolve_column(df, "license_city", candidates)
+    col_city = resolve_column(df, "store_city", candidates)
     # 先尝试解析产品类型列；若解析得到的是“Product Name”，则根据名称派生为“增程/纯电”类别
     col_pt = resolve_column(df, "product_types", candidates)
 
@@ -222,7 +223,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--data-path", default=DEFAULT_DATA_PATH, help="数据文件路径（Parquet）")
     parser.add_argument("--group", default="CM2", help="车型分组，默认 CM2")
     parser.add_argument("--start-date", default="2025-09-10", help="Lock_Time 开始日期（默认 2025-09-10）")
-    parser.add_argument("--end-date", default="2025-11-09", help="Lock_Time 结束日期（默认 2025-11-09）")
+    parser.add_argument("--end-date", default="2025-10-15", help="Lock_Time 结束日期（默认 2025-10-15）")
     parser.add_argument("--output", default=None, help="结果输出 CSV 路径（可选）")
     parser.add_argument(
         "--ratio-output",
@@ -262,7 +263,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 若存在“增程/纯电”类别，额外输出每个城市的“增程/纯电”比值
     type_col_candidates = [c for c in res.columns if normalize_col(c) in {normalize_col("Product_Type"), normalize_col("Product_Types"), normalize_col("产品类型")}]
-    city_col_candidates = [c for c in res.columns if normalize_col(c) in {normalize_col("License City"), normalize_col("license_city"), normalize_col("上牌城市"), normalize_col("上牌市")}]
+    city_col_candidates = [c for c in res.columns if normalize_col(c) in {normalize_col("Store City"), normalize_col("store_city"), normalize_col("门店城市"), normalize_col("城市"), normalize_col("City")}]
     if type_col_candidates and city_col_candidates:
         tcol = type_col_candidates[0]
         ccol = city_col_candidates[0]
@@ -290,8 +291,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if out_ratio:
                     ratio_to_save = ratio_df.copy()
                     # 统一城市列名
-                    if ccol != "License City":
-                        ratio_to_save = ratio_to_save.rename(columns={ccol: "License City"})
+                    if ccol != "Store City":
+                        ratio_to_save = ratio_to_save.rename(columns={ccol: "Store City"})
                     ratio_to_save.to_csv(out_ratio, index=False)
                     print(f"✅ 已保存增程/纯电数量与比值到: {out_ratio}")
 
@@ -301,7 +302,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         res.to_csv(out_path, index=False)
         print(f"✅ 已保存结果到: {out_path}")
 
-    # 生成新数据集：筛选车型分组=LS9，意向支付时间范围，分 License City 的订单数，并合并增程/纯电比值
+    # 生成新数据集：筛选车型分组=LS9，意向支付时间范围，分 Store City 的订单数，并合并增程/纯电比值
     target_group = os.environ.get("TARGET_GROUP", "LS9")  # 允许通过环境变量覆盖，默认 LS9
     target_start = os.environ.get("INTENTION_START_DATE", "2025-11-04")
     target_end = os.environ.get("INTENTION_END_DATE", "2025-11-09")
@@ -310,14 +311,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 统计目标数据集的城市订单数
     city_candidates = {
-        "license_city": [
-            "License City",
-            "license_city",
-            "上牌城市",
-            "上牌市",
+        "store_city": [
+            "Store City",
+            "Store_City",
+            "门店城市",
+            "城市",
+            "City",
         ],
     }
-    city_col = resolve_column(df_target, "license_city", city_candidates)
+    city_col = resolve_column(df_target, "store_city", city_candidates)
     s_city_t = safe_fillna_text(df_target[city_col], "未知")
     city_counts = (
         pd.DataFrame({city_col: s_city_t})
@@ -335,7 +337,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # 重新计算比值，沿用当前脚本的筛选（group/start/end）
         ratio_source = compute_preference_by_city(df_filt)
         tcol = [c for c in ratio_source.columns if normalize_col(c) in {normalize_col("Product_Type"), normalize_col("Product_Types"), normalize_col("产品类型")}][0]
-        ccol = [c for c in ratio_source.columns if normalize_col(c) in {normalize_col("License City"), normalize_col("license_city"), normalize_col("上牌城市"), normalize_col("上牌市")}][0]
+        ccol = [c for c in ratio_source.columns if normalize_col(c) in {normalize_col("Store City"), normalize_col("store_city"), normalize_col("门店城市"), normalize_col("城市"), normalize_col("City")}][0]
         pivot = ratio_source.pivot_table(index=ccol, columns=tcol, values="order_count", aggfunc="sum", fill_value=0)
         range_counts = pivot["增程"] if "增程" in pivot.columns else pd.Series(0, index=pivot.index)
         ev_counts = pivot["纯电"] if "纯电" in pivot.columns else pd.Series(0, index=pivot.index)
@@ -355,7 +357,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("\n=== 新数据集：LS9意向支付范围内城市订单数 + 比值 ===")
     print(merged.head(50).to_string(index=False))
 
-    out_new = ensure_output_dir(os.environ.get("OUTPUT_NEW", "./processed/analysis_results/city_ls9_intent_counts_with_ratio.csv"))
+    out_new = ensure_output_dir(os.environ.get("OUTPUT_NEW", "./processed/analysis_results/store_city_ls9_intent_counts_with_ratio.csv"))
     if out_new:
         merged.to_csv(out_new, index=False)
         print(f"✅ 已保存新数据集到: {out_new}")
@@ -366,16 +368,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         # 统一列名与选择需要的列
         cm2_df = ratio_df.copy()
         cm2_df = cm2_df.rename(columns={
-            cm2_df.columns[0]: "License City",
+            cm2_df.columns[0]: "Store City",
             "增程订单数": "CM2增程订单数",
             "纯电订单数": "CM2纯电订单数",
         })
         ls9_counts = city_counts.copy()
-        ls9_counts = ls9_counts.rename(columns={city_col: "License City", "orders_count": "LS9 小订数"})
+        ls9_counts = ls9_counts.rename(columns={city_col: "Store City", "orders_count": "LS9 小订数"})
 
-        combined = cm2_df.merge(ls9_counts, on="License City", how="inner")
+        combined = cm2_df.merge(ls9_counts, on="Store City", how="inner")
         # 列顺序
-        combined = combined[["License City", "CM2增程订单数", "CM2纯电订单数", "增程/纯电比值", "LS9 小订数"]]
+        combined = combined[["Store City", "CM2增程订单数", "CM2纯电订单数", "增程/纯电比值", "LS9 小订数"]]
 
         print("\n=== 城市 CM2增程/纯电数量与比值 + LS9小订数 ===")
         print(combined.head(30).to_string(index=False))
@@ -390,7 +392,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 生成大盘城市线性残差榜（统一字段）
     try:
         # 构建统一字段的全量城市数据
-        full_df = cm2_df.merge(ls9_counts, on="License City", how="inner").copy()
+        full_df = cm2_df.merge(ls9_counts, on="Store City", how="inner").copy()
         full_df = full_df.rename(columns={
             "CM2增程订单数": "cm2_range",
             "CM2纯电订单数": "cm2_ev",
@@ -418,7 +420,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # 大盘筛选：cm2_range>=100，按残差升序（不足优先）
         big = full_df[full_df["cm2_range"] >= 100].copy().sort_values("resid")
         out_cols = [
-            "License City", "cm2_range", "cm2_ev", "ratio",
+            "Store City", "cm2_range", "cm2_ev", "ratio",
             "ls9_orders", "ls9_to_range", "pred_ls9", "resid", "resid_pct",
         ]
 

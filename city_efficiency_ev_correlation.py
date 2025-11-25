@@ -79,13 +79,30 @@ def parse_md_orders(md_path: str) -> Dict[str, Optional[int]]:
 def parse_ev_csv(ev_csv_path: str) -> Dict[str, Optional[float]]:
     """
     解析 cm2_city_range_ev_counts.csv，返回 {城市: 增程/纯电比值}
+    兼容城市列为 "License City" 或 "Store City"。
     """
     res: Dict[str, Optional[float]] = {}
     with open(ev_csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        # 预期字段：License City,增程订单数,纯电订单数,增程/纯电比值
+        fieldnames = reader.fieldnames or []
+        # 动态识别城市列
+        city_col = None
+        if "Store City" in fieldnames:
+            city_col = "Store City"
+        elif "License City" in fieldnames:
+            city_col = "License City"
+        else:
+            # 尝试其他可能的变体
+            for cand in ["store_city", "license_city", "城市", "City"]:
+                if cand in fieldnames:
+                    city_col = cand
+                    break
+        # 若无法识别，返回空结果
+        if not city_col:
+            return res
+
         for row in reader:
-            city = (row.get("License City") or "").strip()
+            city = (row.get(city_col) or "").strip()
             ev_ratio = safe_float(row.get("增程/纯电比值") or "")
             if city:
                 res[city] = ev_ratio
@@ -199,6 +216,20 @@ def main():
     ev = parse_ev_csv(args.ev_csv)
     nov_orders = parse_md_orders(args.nov_md)
 
+    exclude_cities = {"拉萨市"}
+    for c in list(nov.keys()):
+        if c in exclude_cities:
+            nov.pop(c, None)
+    for c in list(sep.keys()):
+        if c in exclude_cities:
+            sep.pop(c, None)
+    for c in list(ev.keys()):
+        if c in exclude_cities:
+            ev.pop(c, None)
+    for c in list(nov_orders.keys()):
+        if c in exclude_cities:
+            nov_orders.pop(c, None)
+
     # 计算比值差异（nov - sep）
     diff_rows: List[Tuple[str, Optional[float], Optional[float], Optional[float], Optional[int]]] = []
     for city, (nov_ratio, nov_leads) in nov.items():
@@ -242,7 +273,7 @@ def main():
         os.makedirs(os.path.dirname(os.path.abspath(args.pairs_output)), exist_ok=True)
         with open(args.pairs_output, "w", encoding="utf-8", newline="") as fcsv:
             writer = csv.writer(fcsv)
-            writer.writerow(["License City", "后期比值", "EV比值", "比值差异(后-前)"])
+            writer.writerow(["城市", "后期比值", "EV比值", "比值差异(后-前)"])
             for c in common_cities:
                 nov_ratio = nov.get(c, (None, None))[0]
                 ev_ratio = ev.get(c)
