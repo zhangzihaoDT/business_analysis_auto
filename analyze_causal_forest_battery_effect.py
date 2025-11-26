@@ -41,8 +41,8 @@ def load_and_filter(df):
     col_group = resolve_col(df, ["车型分组", "model_group", "车型", "Model Group"])
     col_product = resolve_col(df, ["Product Name", "产品名称", "product_name"])
     col_order = resolve_col(df, ["Order Number", "order_number", "订单编号"])
-    col_age = resolve_col(df, ["buyer_age", "年龄", "age"])
-    col_gender = resolve_col(df, ["order_gender", "性别", "gender"])
+    col_age = resolve_col(df, ["owner_age", "buyer_age", "年龄", "age"])
+    col_gender = resolve_col(df, ["owner_gender", "order_gender", "性别", "gender"])
     col_region = resolve_col(df, ["Parent Region Name", "License Province", "省份", "province"])
     for c in [col_lock, col_group, col_product]:
         if c is None:

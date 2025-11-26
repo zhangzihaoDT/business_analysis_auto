@@ -82,8 +82,10 @@ def filter_and_select_ls9(df: pd.DataFrame) -> pd.DataFrame:
         "Lock_Time",
         "first_touch_time",
         "Parent Region Name",
-        "buyer_age",
-        "order_gender",
+        "owner_age",
+        "owner_gender",
+        "Owner Identity No",
+        "Owner Cell Phone",
     ]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
@@ -92,16 +94,22 @@ def filter_and_select_ls9(df: pd.DataFrame) -> pd.DataFrame:
     df = df[required_cols].copy()
 
     # 规范字段名以便后续合并
-    df = df.rename(columns={"Order Number": "order_number"})
+    df = df.rename(
+        columns={
+            "Order Number": "order_number",
+            "Owner Identity No": "owner_identity_no",
+            "Owner Cell Phone": "owner_cell_phone",
+        }
+    )
 
     # 时间列转为日期
     df["Lock_Time"] = _to_datetime_safe(df["Lock_Time"])  # 锁单时间
     df["first_touch_time"] = _to_datetime_safe(df["first_touch_time"])  # 首次触达时间
 
     # 剔除 gender=默认未知 与 age=未知 的记录（避免在分类类型列上直接 fillna）
-    gender_str = df["order_gender"].astype(str).str.strip()
+    gender_str = df["owner_gender"].astype(str).str.strip()
     df = df[(gender_str != "默认未知") & (gender_str != "")].copy()
-    df = df[df["buyer_age"].apply(_is_age_known)].copy()
+    df = df[df["owner_age"].apply(_is_age_known)].copy()
 
     return df
 
@@ -118,16 +126,20 @@ def load_ls9_exclude_orders(exclude_path: Path) -> Set[str]:
 
 
 def load_config(config_path: Path) -> pd.DataFrame:
-    # 读取配置 CSV
     dfc = pd.read_csv(config_path, dtype=str)
-    # 标准化主键字段名
     if "order_number" not in dfc.columns:
-        # 尝试可能的变体
         if "Order Number" in dfc.columns:
             dfc = dfc.rename(columns={"Order Number": "order_number"})
         else:
             raise KeyError("配置数据缺少列: order_number")
     return dfc
+
+def find_latest_config_csv(base_dir: Path) -> Path:
+    candidates = list(base_dir.glob("LS9_Configuration_Details_transposed_*.csv"))
+    if not candidates:
+        raise FileNotFoundError("未找到最新的 LS9 配置CSV")
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
 
 
 def join_orders_config(df_orders: pd.DataFrame, df_cfg: pd.DataFrame) -> pd.DataFrame:
@@ -143,7 +155,7 @@ def build_transactions(df: pd.DataFrame) -> List[List[str]]:
     # 用户画像字段（前缀 U:）
     user_cols = {
         "Parent Region Name": "region",
-        "order_gender": "gender",
+        "owner_gender": "gender",
     }
 
     # 配置字段（前缀 C:）
@@ -166,8 +178,8 @@ def build_transactions(df: pd.DataFrame) -> List[List[str]]:
             if pd.notna(val) and str(val).strip() != "":
                 items.append(f"U:{tag}={str(val).strip()}")
 
-        # 年龄分箱（变量：buyer_age）
-        items.append(f"U:{_age_to_bin(row.get('buyer_age', np.nan))}")
+        # 年龄分箱（变量：owner_age）
+        items.append(f"U:{_age_to_bin(row.get('owner_age', np.nan))}")
 
         # datediff分箱（变量：Lock_Time 与 first_touch_time 的差值）
         items.append(f"U:{_datediff_to_bin(row.get('Lock_Time', pd.NaT), row.get('first_touch_time', pd.NaT))}")
@@ -238,8 +250,8 @@ def main():
     parser.add_argument(
         "--config-path",
         type=Path,
-        default=Path("/Users/zihao_/Documents/coding/dataset/processed/LS9_Configuration_Details_transposed_20251119_092014.csv"),
-        help="LS9 配置详情 CSV 文件路径",
+        default=None,
+        help="LS9 配置详情 CSV 文件路径（不填则自动选取 processed 目录下最新）",
     )
     parser.add_argument(
         "--exclude-orders-path",
@@ -277,8 +289,13 @@ def main():
     else:
         print("提示：未找到排除订单文件，跳过该过滤。")
 
-    print("[3/6] 读取 LS9 配置数据…", args.config_path)
-    df_cfg = load_config(args.config_path)
+    cfg_path = None
+    if args.config_path and args.config_path.exists():
+        cfg_path = args.config_path
+    else:
+        cfg_path = find_latest_config_csv(Path("/Users/zihao_/Documents/coding/dataset/processed"))
+    print("[3/6] 读取 LS9 配置数据…", cfg_path)
+    df_cfg = load_config(cfg_path)
 
     print("[4/6] 按订单号合并…")
     df_merged = join_orders_config(df_orders, df_cfg)
