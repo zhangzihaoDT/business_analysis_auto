@@ -137,10 +137,148 @@ def main() -> None:
 
     df[lock_col] = pd.to_datetime(df[lock_col], errors="coerce")
 
+    df["车型分类"] = df[model_group_col].astype(str)
+    _cm2_all = df[model_group_col].astype(str).str.upper() == "CM2"
+    _is_range_ext_all = df[product_name_col].astype(str).str.contains(r"52|66", case=False, na=False)
+    df.loc[_cm2_all & _is_range_ext_all, "车型分类"] = "CM2 增程"
+    df.loc[_cm2_all & ~_is_range_ext_all, "车型分类"] = "CM2"
+
     mask = df[lock_col].notna() & (
         (df[lock_col].dt.date >= start_date) & (df[lock_col].dt.date <= end_date)
     )
-    df_period = df.loc[mask, [lock_col, region_col, model_group_col, product_name_col, order_no_col]].copy()
+    wanted_models = [m.strip() for m in str(args.models).split(",") if m.strip()] if args.models else []
+    model_filter = df["车型分类"].isin(wanted_models) if wanted_models else pd.Series(True, index=df.index)
+    lock_total = int(df.loc[mask & model_filter, order_no_col].nunique())
+
+    # 2) 大定相关统计（周期内、含大定支付时间）
+    summary_df = None
+    summary_missing_msg = None
+    retained_by_date_total_df = None
+    retained_by_date_pivot_df = None
+    per_model_df = None
+    per_model_pivot_df = None
+    try:
+        deposit_col = resolve_column(
+            df,
+            [
+                "Deposit_Payment_Time",
+                "Deposit Payment Time",
+                "deposit_payment_time",
+                "大定支付时间",
+                "大定时间",
+                "下定时间",
+            ],
+        )
+        df[deposit_col] = pd.to_datetime(df[deposit_col], errors="coerce")
+        dmask = df[deposit_col].notna() & (
+            (df[deposit_col].dt.date >= start_date) & (df[deposit_col].dt.date <= end_date)
+        )
+        deposit_total = int(df.loc[dmask & model_filter, order_no_col].nunique())
+
+        try:
+            refund_col = resolve_column(
+                df,
+                [
+                    "Deposit_Refund_Time",
+                    "Deposit Refund Time",
+                    "deposit_refund_time",
+                    "大定退订时间",
+                    "退订时间",
+                    "退款时间",
+                ],
+            )
+            df[refund_col] = pd.to_datetime(df[refund_col], errors="coerce")
+            deposit_refund_total = int(
+                df.loc[dmask & model_filter & df[refund_col].notna(), order_no_col].nunique()
+            )
+            deposit_retained_total = int(
+                df.loc[dmask & model_filter & df[refund_col].isna() & df[lock_col].isna(), order_no_col].nunique()
+            )
+            _retained_mask = dmask & model_filter & df[refund_col].isna() & df[lock_col].isna()
+            _retained_df = df.loc[_retained_mask, [deposit_col, order_no_col, "车型分类"]].copy()
+            _retained_df["deposit_date"] = _retained_df[deposit_col].dt.date
+            _retained_grp = (
+                _retained_df.groupby(["deposit_date", "车型分类"]).agg(retained_orders=(order_no_col, pd.Series.nunique)).reset_index()
+            )
+            retained_by_date_pivot_df = (
+                _retained_grp.pivot_table(index="deposit_date", columns="车型分类", values="retained_orders", fill_value=0, aggfunc="sum").sort_index()
+            )
+            if wanted_models:
+                cols = [m for m in wanted_models if m in retained_by_date_pivot_df.columns]
+                if cols:
+                    retained_by_date_pivot_df = retained_by_date_pivot_df[cols]
+            retained_by_date_total_df = (
+                _retained_df.groupby(["deposit_date"]).agg(retained_orders=(order_no_col, pd.Series.nunique)).reset_index().sort_values("deposit_date")
+            )
+
+            # 分车型概览统计（仅在指定多个车型时输出）
+            if wanted_models and len(wanted_models) >= 2:
+                rows = []
+                for m in wanted_models:
+                    m_filter = df["车型分类"] == m
+                    rows.append(
+                        {
+                            "车型分类": m,
+                            "锁单总数": int(df.loc[mask & m_filter, order_no_col].nunique()),
+                            "大定总数": int(df.loc[dmask & m_filter, order_no_col].nunique()),
+                            "大定留存总数": int(df.loc[dmask & m_filter & df[refund_col].isna() & df[lock_col].isna(), order_no_col].nunique()),
+                            "大定退订数": int(df.loc[dmask & m_filter & df[refund_col].notna(), order_no_col].nunique()),
+                        }
+                    )
+                per_model_df = pd.DataFrame(rows)
+        except KeyError as e:
+            deposit_refund_total = 0
+            deposit_retained_total = int(
+                df.loc[dmask & model_filter & df[lock_col].isna(), order_no_col].nunique()
+            )
+            summary_missing_msg = f"字段缺失：{e}"
+            _retained_mask = dmask & model_filter & df[lock_col].isna()
+            _retained_df = df.loc[_retained_mask, [deposit_col, order_no_col, "车型分类"]].copy()
+            _retained_df["deposit_date"] = _retained_df[deposit_col].dt.date
+            _retained_grp = (
+                _retained_df.groupby(["deposit_date", "车型分类"]).agg(retained_orders=(order_no_col, pd.Series.nunique)).reset_index()
+            )
+            retained_by_date_pivot_df = (
+                _retained_grp.pivot_table(index="deposit_date", columns="车型分类", values="retained_orders", fill_value=0, aggfunc="sum").sort_index()
+            )
+            if wanted_models:
+                cols = [m for m in wanted_models if m in retained_by_date_pivot_df.columns]
+                if cols:
+                    retained_by_date_pivot_df = retained_by_date_pivot_df[cols]
+            retained_by_date_total_df = (
+                _retained_df.groupby(["deposit_date"]).agg(retained_orders=(order_no_col, pd.Series.nunique)).reset_index().sort_values("deposit_date")
+            )
+
+            if wanted_models and len(wanted_models) >= 2:
+                rows = []
+                for m in wanted_models:
+                    m_filter = df["车型分类"] == m
+                    rows.append(
+                        {
+                            "车型分类": m,
+                            "锁单总数": int(df.loc[mask & m_filter, order_no_col].nunique()),
+                            "大定总数": int(df.loc[dmask & m_filter, order_no_col].nunique()),
+                            "大定留存总数": int(df.loc[dmask & m_filter & df[lock_col].isna(), order_no_col].nunique()),
+                            "大定退订数": 0,
+                        }
+                    )
+                per_model_df = pd.DataFrame(rows)
+
+        summary_df = pd.DataFrame(
+            {
+                "指标": ["锁单总数", "大定总数", "大定留存总数", "大定退订数"],
+                "数量": [lock_total, deposit_total, deposit_retained_total, deposit_refund_total],
+            }
+        )
+        if per_model_df is not None and not per_model_df.empty:
+            _pivot = per_model_df.set_index("车型分类").T
+            _pivot.index.name = "指标"
+            per_model_pivot_df = _pivot.reset_index()
+    except KeyError as e:
+        # 无大定支付时间字段，仅输出锁单总数并提示缺失字段
+        summary_missing_msg = f"字段缺失：{e}"
+        summary_df = pd.DataFrame({"指标": ["锁单总数"], "数量": [lock_total]})
+    df_period = df.loc[mask & model_filter, [lock_col, region_col, model_group_col, product_name_col, order_no_col]].copy()
     df_period["车型分类"] = df_period[model_group_col].astype(str)
     cm2_mask = df_period[model_group_col].astype(str).str.upper() == "CM2"
     is_range_ext = df_period[product_name_col].astype(str).str.contains(r"52|66", case=False, na=False)
@@ -175,6 +313,30 @@ def main() -> None:
     md_lines.append(f"- 源文件: `{input_path}`")
     md_lines.append(f"- 时间区间: `{args.start}` ~ `{args.end}`")
     md_lines.append("")
+    if per_model_pivot_df is not None:
+        md_lines.append("## 概览统计（分车型）")
+        md_lines.append(df_to_md(per_model_pivot_df))
+        md_lines.append("")
+    else:
+        md_lines.append("## 概览统计")
+        md_lines.append(df_to_md(summary_df))
+        if summary_missing_msg:
+            md_lines.append("")
+            md_lines.append(f"缺失字段提示：{summary_missing_msg}")
+        md_lines.append("")
+    if wanted_models and len(wanted_models) >= 2:
+        md_lines.append("## 大定留存的 Deposit_Payment_Time 分布（按日，分车型）")
+        if retained_by_date_pivot_df is not None and not retained_by_date_pivot_df.empty:
+            md_lines.append(df_to_md(retained_by_date_pivot_df.reset_index()))
+        else:
+            md_lines.append("(空表，无数据)")
+    else:
+        md_lines.append("## 大定留存的 Deposit_Payment_Time 分布（按日）")
+        if retained_by_date_total_df is not None and not retained_by_date_total_df.empty:
+            md_lines.append(df_to_md(retained_by_date_total_df))
+        else:
+            md_lines.append("(空表，无数据)")
+    md_lines.append("")
     md_lines.append("## 区域 x 车型矩阵")
     md_lines.append(df_to_md(pivot_df.reset_index()))
     md_lines.append("")
@@ -196,7 +358,7 @@ def main() -> None:
                 "上牌城市等级",
             ],
         )
-        level_series = df.loc[mask, level_col].astype(str).fillna("未知")
+        level_series = df.loc[mask & model_filter, level_col].astype(str).fillna("未知")
         level_counts = level_series.value_counts()
         total_orders = int(level_series.size)
         level_share = (level_counts / max(total_orders, 1) * 100).round(2)
@@ -227,7 +389,7 @@ def main() -> None:
                 "省份",
             ],
         )
-        prov_series = df.loc[mask, prov_col].astype(str).fillna("未知")
+        prov_series = df.loc[mask & model_filter, prov_col].astype(str).fillna("未知")
         prov_counts = prov_series.value_counts()
         total_orders_p = int(prov_series.size)
         prov_share = (prov_counts / max(total_orders_p, 1) * 100).round(2)
@@ -259,7 +421,7 @@ def main() -> None:
                 "上牌市",
             ],
         )
-        city_series = df.loc[mask, city_col].astype(str).fillna("未知")
+        city_series = df.loc[mask & model_filter, city_col].astype(str).fillna("未知")
         city_counts = city_series.value_counts()
         total_orders_c = int(city_series.size)
         city_share = (city_counts / max(total_orders_c, 1) * 100).round(2)
