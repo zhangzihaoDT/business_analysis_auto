@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import datetime
 
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -61,7 +62,7 @@ def compute_ma(df: pd.DataFrame, window: int) -> pd.DataFrame:
 
 def make_two_panel_chart(df: pd.DataFrame, window: int) -> go.Figure:
     fig = make_subplots(
-        rows=12,
+        rows=20,
         cols=1,
         shared_xaxes=True,
         subplot_titles=(
@@ -77,8 +78,16 @@ def make_two_panel_chart(df: pd.DataFrame, window: int) -> go.Figure:
             "",
             "下发线索效率（日级）",
             "",
+            "",
+            "集中度分布（两个窗口）",
+            "集中度（日级，Top10%门店占比，MA7）",
+            "车型锁单（日级）",
+            "车型上市/平销期指标",
+            "上市期天数对比（两个窗口）",
+            "年龄分布（锁单期分车型，bin=1）",
+            "年龄统计对比（均值/中位数/标准差）",
         ),
-        vertical_spacing=0.045,
+        vertical_spacing=0.02,
         specs=[
             [{"type": "xy"}],
             [{"type": "xy"}],
@@ -92,8 +101,16 @@ def make_two_panel_chart(df: pd.DataFrame, window: int) -> go.Figure:
             [{"type": "table"}],
             [{"type": "xy"}],
             [{"type": "table"}],
+            [{"type": "table"}],
+            [{"type": "xy"}],
+            [{"type": "xy"}],
+            [{"type": "xy"}],
+            [{"type": "table"}],
+            [{"type": "table"}],
+            [{"type": "xy"}],
+            [{"type": "table"}],
         ],
-        row_heights=[0.17, 0.17, 0.16, 0.17, 0.17, 0.16, 0.15, 0.16, 0.15, 0.16, 0.15, 0.16],
+        row_heights=[0.19, 0.19, 0.14, 0.19, 0.19, 0.14, 0.18, 0.15, 0.18, 0.15, 0.18, 0.15, 0.14, 0.14, 0.14, 0.14, 0.20, 0.20, 0.18, 0.30],
     )
 
     fig.add_trace(
@@ -154,7 +171,7 @@ def make_two_panel_chart(df: pd.DataFrame, window: int) -> go.Figure:
         title="线索锁单转化率与线索量（原始与移动平均） + 在营门店数 + 试驾",
         legend_title="指标",
         margin=dict(l=40, r=40, t=60, b=200),
-        height=3400,
+        height=5000,
     )
     fig.update_yaxes(title_text="转化率（%）", row=1, col=1)
     fig.update_yaxes(title_text="转化率（%）", row=2, col=1)
@@ -724,6 +741,618 @@ def main():
             header=dict(values=hdr_eff, fill_color="#f6f6f6", align="center", font=dict(color="#333", size=12), height=36),
             cells=dict(values=[r_eff, col_store_w1, col_store_w2, col_store_diff, col_owner_w1, col_owner_w2, col_owner_diff], align="center", height=32),
             row=12,
+            col=1,
+        )
+
+    # 锁单门店与集中度（窗口对比） - 使用 intention_order_analysis.parquet
+    orders_path = Path("/Users/zihao_/Documents/coding/dataset/formatted/intention_order_analysis.parquet")
+    try:
+        df_orders2 = pd.read_parquet(orders_path)
+    except Exception:
+        df_orders2 = pd.DataFrame()
+
+    def resolve2(df: pd.DataFrame, logical: str) -> str:
+        cand = {
+            "lock_time": ["Lock_Time", "Lock Time", "锁单时间"],
+            "store_name": ["Store Name", "门店名称", "store_name"],
+        }
+        for c in cand.get(logical, []):
+            if c in df.columns:
+                return c
+        # 归一化匹配
+        def norm(s: str) -> str:
+            return s.strip().lower().replace("_", " ")
+        need = [norm(x) for x in cand.get(logical, [])]
+        col_map = {norm(x): x for x in df.columns}
+        for t in need:
+            if t in col_map:
+                return col_map[t]
+        return cand.get(logical, [""])[0]
+
+    def window_lock_stats(d0: pd.Timestamp, d1: pd.Timestamp):
+        if df_orders2.empty:
+            return float("nan"), float("nan"), float("nan")
+        col_lock = resolve2(df_orders2, "lock_time")
+        col_store = resolve2(df_orders2, "store_name")
+        s_lock = pd.to_datetime(df_orders2[col_lock], errors="coerce")
+        mask = s_lock.between(d0, d1, inclusive="both")
+        sub = df_orders2.loc[mask, [col_store]].dropna()
+        if sub.empty:
+            return float("nan"), float("nan"), float("nan")
+        counts = sub.groupby(col_store).size()
+        store_cnt = int(counts.index.nunique())
+        total_locks = int(counts.sum())
+        avg_per_store = (total_locks / store_cnt) if store_cnt > 0 else float("nan")
+        if total_locks > 0 and store_cnt > 0:
+            top_k = max(1, int((store_cnt * 0.10) + 0.9999))
+            top_sum = counts.sort_values(ascending=False).head(top_k).sum()
+            conc = float(top_sum) / float(total_locks)
+        else:
+            conc = float("nan")
+        return float(store_cnt), float(avg_per_store), float(conc)
+
+    s1_cnt, s1_avg, s1_hhi = window_lock_stats(w1_start, w1_end)
+    s2_cnt, s2_avg, s2_hhi = window_lock_stats(w2_start, w2_end)
+
+    def fmti(x: float) -> str:
+        return "-" if pd.isna(x) else f"{x:.0f}"
+    def fmtd(x: float) -> str:
+        return "-" if pd.isna(x) else f"{x:.2f}"
+    def fmt_conc(x: float) -> str:
+        return "-" if pd.isna(x) else f"{x:.2f}"
+    def diffp2(a: float, b: float) -> str:
+        if pd.isna(a) or pd.isna(b) or b == 0:
+            return "-"
+        return f"{((a - b) / b) * 100:+.2f}%"
+
+    hdr_lock = [
+        "指标",
+        "锁单门店数 2024-12-01 至 2025-11-30",
+        "锁单门店数 2023-12-01 至 2024-11-30",
+        "锁单门店数 环比(%)",
+        "店均锁单数 2024-12-01 至 2025-11-30",
+        "店均锁单数 2023-12-01 至 2024-11-30",
+        "店均锁单数 环比(%)",
+        "集中度 2024-12-01 至 2025-11-30",
+        "集中度 2023-12-01 至 2024-11-30",
+        "集中度 环比(%)",
+    ]
+    r_lock = ["数值"]
+    col_storecnt_w1 = [fmti(s1_cnt)]
+    col_storecnt_w2 = [fmti(s2_cnt)]
+    col_storecnt_diff = [diffp2(s1_cnt, s2_cnt)]
+    col_avg_w1 = [fmtd(s1_avg)]
+    col_avg_w2 = [fmtd(s2_avg)]
+    col_avg_diff = [diffp2(s1_avg, s2_avg)]
+    col_hhi_w1 = [fmt_conc(s1_hhi)]
+    col_hhi_w2 = [fmt_conc(s2_hhi)]
+    col_hhi_diff = [diffp2(s1_hhi, s2_hhi)]
+
+    fig.add_table(
+        header=dict(values=hdr_lock, fill_color="#f6f6f6", align="center", font=dict(color="#333", size=12), height=36),
+        cells=dict(values=[r_lock, col_storecnt_w1, col_storecnt_w2, col_storecnt_diff, col_avg_w1, col_avg_w2, col_avg_diff, col_hhi_w1, col_hhi_w2, col_hhi_diff], align="center", height=32),
+        row=13,
+        col=1,
+    )
+
+    def decile_distribution(d0: pd.Timestamp, d1: pd.Timestamp):
+        if df_orders2.empty:
+            return [float("nan")] * 10, [float("nan")] * 10
+        col_lock = resolve2(df_orders2, "lock_time")
+        col_store = resolve2(df_orders2, "store_name")
+        s_lock = pd.to_datetime(df_orders2[col_lock], errors="coerce")
+        mask = s_lock.between(d0, d1, inclusive="both")
+        sub = df_orders2.loc[mask, [col_store]].dropna()
+        if sub.empty:
+            return [float("nan")] * 10, [float("nan")] * 10
+        counts = sub.groupby(col_store).size().sort_values(ascending=False)
+        s = int(counts.index.nunique())
+        t = float(counts.sum())
+        if s == 0 or t == 0:
+            return [float("nan")] * 10, [float("nan")] * 10
+        chunk = max(1, int((s * 0.10) + 0.9999))
+        parts = []
+        for k in range(1, 11):
+            start = (k - 1) * chunk
+            end = k * chunk
+            part = float(counts.iloc[start:end].sum())
+            parts.append(part)
+        cum = []
+        acc = 0.0
+        for v in parts:
+            acc += v
+            cum.append(acc / t * 100.0)
+        return cum, parts
+
+    bins = ["0-10%", "10-20%", "20-30%", "30-40%", "40-50%", "50-60%", "60-70%", "70-80%", "80-90%", "90-100%"]
+    d1_vals, d1_counts = decile_distribution(w1_start, w1_end)
+    d2_vals, d2_counts = decile_distribution(w2_start, w2_end)
+
+    fig.add_trace(
+        go.Scatter(
+            name="集中度分布 2024-12-01 至 2025-11-30",
+            x=bins,
+            y=d1_vals,
+            mode="lines+markers",
+            line=dict(color="#1f77b4", width=2),
+            marker=dict(size=6),
+            text=["-" if pd.isna(x) else f"{int(x)}" for x in d1_counts],
+            hovertemplate="分位=%{x}<br>累计占比=%{y:.2f}%<br>锁单数=%{text}<extra></extra>",
+            showlegend=False,
+        ),
+        row=14,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            name="集中度分布 2023-12-01 至 2024-11-30",
+            x=bins,
+            y=d2_vals,
+            mode="lines+markers",
+            line=dict(color="#ff7f0e", width=2),
+            marker=dict(size=6),
+            text=["-" if pd.isna(x) else f"{int(x)}" for x in d2_counts],
+            hovertemplate="分位=%{x}<br>累计占比=%{y:.2f}%<br>锁单数=%{text}<extra></extra>",
+            showlegend=False,
+        ),
+        row=14,
+        col=1,
+    )
+    add_local_legend("yaxis8", [("集中度分布 2024-12-01 至 2025-11-30", "#1f77b4"), ("集中度分布 2023-12-01 至 2024-11-30", "#ff7f0e")])
+
+    def daily_top10_share():
+        if df_orders2.empty:
+            return pd.Series(dtype=float), pd.Series(dtype=float), pd.Series(dtype=float)
+        col_lock = resolve2(df_orders2, "lock_time")
+        col_store = resolve2(df_orders2, "store_name")
+        s_lock = pd.to_datetime(df_orders2[col_lock], errors="coerce")
+        s_day = s_lock.dt.floor("D")
+        s_store = df_orders2[col_store].astype(str)
+        daily = (
+            pd.DataFrame({"store": s_store, "day": s_day})
+            .dropna()
+            .groupby(["store", "day"], dropna=False)
+            .size()
+            .reset_index(name="cnt")
+        )
+        date_start = df["date"].min()
+        date_end = df["date"].max()
+        full_days = pd.date_range(date_start, date_end, freq="D")
+        pivot = daily.pivot(index="day", columns="store", values="cnt").fillna(0)
+        pivot = pivot.reindex(full_days, fill_value=0)
+        shares = []
+        for d in full_days:
+            if pivot.empty:
+                shares.append(float("nan"))
+                continue
+            rs = pivot.loc[d]
+            tot = float(rs.sum())
+            if tot <= 0:
+                shares.append(float("nan"))
+                continue
+            s = int((rs > 0).sum())
+            k = max(1, int((s * 0.10) + 0.9999))
+            top_sum = float(rs.sort_values(ascending=False).head(k).sum())
+            shares.append(top_sum / tot * 100.0)
+        series = pd.Series(shares, index=full_days, name="Top10%门店锁单占比(日级)")
+        s1 = series.loc[(series.index >= w1_start) & (series.index <= w1_end)]
+        s2 = series.loc[(series.index >= w2_start) & (series.index <= w2_end)]
+        return series, s1, s2
+
+    s_all, s_w1, s_w2 = daily_top10_share()
+    s_all_ma = s_all.rolling(window=args.ma_window, min_periods=1).mean()
+    s_w1_ma = s_all_ma.loc[(s_all_ma.index >= w1_start) & (s_all_ma.index <= w1_end)]
+    s_w2_ma = s_all_ma.loc[(s_all_ma.index >= w2_start) & (s_all_ma.index <= w2_end)]
+    if len(s_w1_ma):
+        fig.add_trace(
+            go.Scatter(
+                name=f"Top10%门店占比（日级） MA{args.ma_window} 2024-12-01 至 2025-11-30",
+                x=s_w1_ma.index,
+                y=s_w1_ma.values,
+                mode="lines",
+                line=dict(color="#1f77b4", width=2),
+                hovertemplate="日期=%{x|%Y-%m-%d}<br>占比=%{y:.2f}%<extra></extra>",
+                showlegend=False,
+            ),
+            row=15,
+            col=1,
+        )
+    if len(s_w2_ma):
+        fig.add_trace(
+            go.Scatter(
+                name=f"Top10%门店占比（日级） MA{args.ma_window} 2023-12-01 至 2024-11-30",
+                x=s_w2_ma.index,
+                y=s_w2_ma.values,
+                mode="lines",
+                line=dict(color="#ff7f0e", width=2),
+                hovertemplate="日期=%{x|%Y-%m-%d}<br>占比=%{y:.2f}%<extra></extra>",
+                showlegend=False,
+            ),
+            row=15,
+            col=1,
+        )
+    add_local_legend("yaxis9", [(f"Top10%门店占比（日级） MA{args.ma_window} 2024-12-01 至 2025-11-30", "#1f77b4"), (f"Top10%门店占比（日级） MA{args.ma_window} 2023-12-01 至 2024-11-30", "#ff7f0e")])
+
+    def resolve_model(df: pd.DataFrame) -> str:
+        for c in ["车型分组", "model_group", "car_model_group", "车型"]:
+            if c in df.columns:
+                return c
+        return "model_group"
+
+    if not df_orders2.empty:
+        col_lock = resolve2(df_orders2, "lock_time")
+        col_model = resolve_model(df_orders2)
+        s_lock = pd.to_datetime(df_orders2[col_lock], errors="coerce")
+        s_day = s_lock.dt.floor("D")
+        s_model = df_orders2[col_model].astype(str)
+        def map_model(x: str) -> str:
+            if x in {"CM0", "CM1", "CM2"}:
+                return "LS6"
+            if x in {"DM0", "DM1"}:
+                return "L6"
+            if x == "LS9":
+                return "LS9"
+            return ""
+        m = s_model.map(map_model)
+        daily = (
+            pd.DataFrame({"day": s_day, "model": m})
+            .dropna()
+            .query("model != ''")
+            .groupby(["day", "model"], dropna=False)
+            .size()
+            .reset_index(name="cnt")
+        )
+        date_start = df["date"].min()
+        date_end = df["date"].max()
+        full_days = pd.date_range(date_start, date_end, freq="D")
+        pivot = daily.pivot(index="day", columns="model", values="cnt").fillna(0)
+        pivot = pivot.reindex(full_days, fill_value=0)
+        for name, color in [("LS6", "#2E91E5"), ("L6", "#E15F99"), ("LS9", "#7B848F")]:
+            series = pivot[name] if name in pivot.columns else pd.Series([0]*len(full_days), index=full_days)
+            fig.add_trace(
+                go.Scatter(
+                    name=name,
+                    x=series.index,
+                    y=series.values,
+                    mode="lines",
+                    line=dict(color=color, width=2),
+                    hovertemplate="日期=%{x|%Y-%m-%d}<br>锁单数=%{y:.0f}<extra></extra>",
+                    showlegend=False,
+                ),
+                row=16,
+                col=1,
+            )
+        add_local_legend("yaxis10", [("LS6", "#2E91E5"), ("L6", "#E15F99"), ("LS9", "#7B848F")])
+
+        periods = {
+            "CM0": {"start": "2023-10-12", "end": "2023-11-12"},
+            "DM0": {"start": "2024-05-13", "end": "2024-06-15"},
+            "CM1": {"start": "2024-09-26", "end": "2024-10-20"},
+            "CM2": {"start": "2025-09-10", "end": "2025-10-15"},
+            "DM1": {"start": "2025-05-13", "end": "2025-06-15"},
+            "LS9": {"start": "2025-11-12", "end": "2025-12-04"},
+        }
+        col_lock2 = resolve2(df_orders2, "lock_time")
+        col_model2 = resolve_model(df_orders2)
+        # 参考 lock_summary.py 的 CM2 拆分逻辑：使用产品名称识别增程与否
+        def resolve_product(df: pd.DataFrame) -> str:
+            for c in ["productname", "ProductName", "Product Name", "产品名称", "商品名称"]:
+                if c in df.columns:
+                    return c
+            return "productname"
+        col_product2 = resolve_product(df_orders2)
+        s_lock2 = pd.to_datetime(df_orders2[col_lock2], errors="coerce")
+        s_model2 = df_orders2[col_model2].astype(str)
+        s_product2 = df_orders2[col_product2].astype(str)
+        # 构造分类：非 CM2 保持原值；CM2 根据产品名称包含 52/66 拆分为 “CM2 增程”/“CM2”
+        s_class2 = s_model2.copy()
+        is_cm2 = s_model2.str.upper() == "CM2"
+        is_range_ext = s_product2.str.contains(r"52|66", case=False, na=False)
+        s_class2.loc[is_cm2 & is_range_ext] = "CM2 增程"
+        s_class2.loc[is_cm2 & ~is_range_ext] = "CM2"
+        def _mask_for(model_code: str):
+            if model_code == "CM2":
+                return s_class2.isin(["CM2", "CM2 增程"])
+            if model_code == "CM2 增程":
+                return s_class2 == "CM2 增程"
+            return s_model2 == model_code
+        def count_in_range(model_code: str, d0: pd.Timestamp, d1: pd.Timestamp) -> int:
+            mask = _mask_for(model_code) & s_lock2.between(d0, d1, inclusive="both")
+            return int(mask.sum())
+        def count_in_next_30(model_code: str, d_end: pd.Timestamp) -> int:
+            d0 = d_end
+            d1 = d_end + pd.Timedelta(days=30)
+            mask = _mask_for(model_code) & (s_lock2 >= d0) & (s_lock2 < d1)
+            return int(mask.sum())
+        def count_in_next_60(model_code: str, d_end: pd.Timestamp) -> tuple:
+            d0 = d_end + pd.Timedelta(days=30)
+            max_dt = pd.to_datetime(s_lock2.max()).floor('D')
+            d1_cap = d_end + pd.Timedelta(days=60)
+            # cap end to max_day (exclusive per half-open interval)
+            d1 = min(d1_cap, max_dt)
+            if pd.isna(d0) or pd.isna(d1) or d1 <= d0:
+                return 0, 0
+            days = (d1 - d0).days
+            mask = _mask_for(model_code) & (s_lock2 >= d0) & (s_lock2 < d1)
+            return int(mask.sum()), int(days)
+        models = ["CM0", "DM0", "CM1", "CM2", "CM2 增程", "DM1", "LS9"]
+        row_days = []
+        row_list_sum = []
+        row_list_avg = []
+        row_flat_sum = []
+        row_flat_avg = []
+        row_flat60_sum = []
+        row_flat60_avg = []
+        for mcode in models:
+            pcode = "CM2" if mcode == "CM2 增程" else mcode
+            d0 = pd.to_datetime(periods[pcode]["start"]) if pcode in periods else pd.NaT
+            d1 = pd.to_datetime(periods[pcode]["end"]) if pcode in periods else pd.NaT
+            if pd.isna(d0) or pd.isna(d1) or d1 < d0:
+                row_days.append("-")
+                row_list_sum.append("-")
+                row_list_avg.append("-")
+                row_flat_sum.append("-")
+                row_flat_avg.append("-")
+                continue
+            days = (d1 - d0).days + 1
+            list_sum = count_in_range(mcode, d0, d1)
+            list_avg = (list_sum / days) if days > 0 else float("nan")
+            flat_sum = count_in_next_30(mcode, d1)
+            flat_avg = (flat_sum / 30.0)
+            row_days.append(f"{days:.0f}")
+            row_list_sum.append(f"{list_sum:.0f}")
+            row_list_avg.append("-" if pd.isna(list_avg) else f"{list_avg:.0f}")
+            row_flat_sum.append(f"{flat_sum:.0f}")
+            row_flat_avg.append("-" if pd.isna(flat_avg) else f"{flat_avg:.0f}")
+            flat60_sum, flat60_days = count_in_next_60(mcode, d1)
+            flat60_avg = (flat60_sum / flat60_days) if flat60_days > 0 else float('nan')
+            row_flat60_sum.append(f"{flat60_sum:.0f}")
+            row_flat60_avg.append("-" if pd.isna(flat60_avg) else f"{flat60_avg:.0f}")
+
+        hdr_period = ["指标"] + models
+        r_names = [
+            "上市期天数",
+            "上市期锁单数",
+            "上市期锁单日均",
+            "平销期30 日锁单数",
+            "平销期30 日日均锁单数",
+            "平销期60 日锁单数",
+            "平销期60 日日均锁单数",
+        ]
+        cols = [r_names]
+        for i, _ in enumerate(models):
+            cols.append([
+                row_days[i],
+                row_list_sum[i],
+                row_list_avg[i],
+                row_flat_sum[i],
+                row_flat_avg[i],
+                row_flat60_sum[i] if i < len(row_flat60_sum) else "-",
+                row_flat60_avg[i] if i < len(row_flat60_avg) else "-",
+            ])
+        # column color grouping: CM series, DM series, LS9
+        cm_color = "#EAF2FF"
+        dm_color = "#FFF2E6"
+        ls9_color = "#F2F2F2"
+        hdr_colors = ["#f6f6f6"] + [cm_color if m.startswith("CM") else (dm_color if m.startswith("DM") else ls9_color) for m in models]
+        cell_colors = ["#FFFFFF"] + [cm_color if m.startswith("CM") else (dm_color if m.startswith("DM") else ls9_color) for m in models]
+        fig.add_table(
+            header=dict(values=hdr_period, fill_color=hdr_colors, align="center", font=dict(color="#333", size=12), height=36),
+            cells=dict(values=cols, fill_color=cell_colors, align="center", height=32),
+            row=17,
+            col=1,
+        )
+
+        def days_overlap(d0: pd.Timestamp, d1: pd.Timestamp, w0: pd.Timestamp, w1: pd.Timestamp) -> int:
+            a0 = max(d0, w0)
+            a1 = min(d1, w1)
+            if pd.isna(a0) or pd.isna(a1) or a1 < a0:
+                return 0
+            return int((a1 - a0).days) + 1
+
+        models_period = list(periods.keys())
+        next_map = {"CM0": "CM1", "CM1": "CM2", "DM0": "DM1"}
+        max_dt = pd.to_datetime(s_lock2.max(), errors="coerce")
+        max_dt = pd.to_datetime(max_dt).floor("D") if pd.notna(max_dt) else pd.NaT
+        w1_list_days = []
+        w1_non_list_days = []
+        w2_list_days = []
+        w2_non_list_days = []
+        w1_list_orders = []
+        w1_non_list_orders = []
+        w2_list_orders = []
+        w2_non_list_orders = []
+        for mcode in models_period:
+            d0 = pd.to_datetime(periods[mcode]["start"]) if mcode in periods else pd.NaT
+            d1 = pd.to_datetime(periods[mcode]["end"]) if mcode in periods else pd.NaT
+            ol1 = days_overlap(d0, d1, w1_start, w1_end)
+            ol2 = days_overlap(d0, d1, w2_start, w2_end)
+            # 非上市期：从上市期结束到改款车型的 start-1，与窗口交集；若无改款则为 [end, max_lock_time]
+            nxt = next_map.get(mcode)
+            if nxt and nxt in periods:
+                nxt_start = pd.to_datetime(periods[nxt]["start"]) if periods[nxt].get("start") else pd.NaT
+            else:
+                nxt_start = pd.NaT
+            if pd.notna(d1):
+                if pd.notna(nxt_start) and (nxt_start > d1):
+                    non_list_end = nxt_start - pd.Timedelta(days=1)
+                elif pd.notna(max_dt) and (max_dt >= d1):
+                    non_list_end = max_dt
+                else:
+                    non_list_end = pd.NaT
+            else:
+                non_list_end = pd.NaT
+            if pd.notna(non_list_end):
+                nl1 = days_overlap(d1, non_list_end, w1_start, w1_end)
+                nl2 = days_overlap(d1, non_list_end, w2_start, w2_end)
+            else:
+                nl1 = 0
+                nl2 = 0
+            w1_list_days.append(f"{ol1:.0f}")
+            w1_non_list_days.append(f"{nl1:.0f}")
+            w2_list_days.append(f"{ol2:.0f}")
+            w2_non_list_days.append(f"{nl2:.0f}")
+            if ol1 > 0:
+                ls1_start = max(d0, w1_start)
+                ls1_end = min(d1, w1_end)
+                mask_ls1 = _mask_for(mcode) & s_lock2.between(ls1_start, ls1_end, inclusive="both")
+                w1_list_orders.append(f"{int(mask_ls1.sum()):.0f}")
+            else:
+                w1_list_orders.append("-")
+            if nl1 > 0 and pd.notna(d1) and pd.notna(non_list_end):
+                nls1_start = max(d1, w1_start)
+                nls1_end = min(non_list_end, w1_end)
+                mask_nls1 = _mask_for(mcode) & s_lock2.between(nls1_start, nls1_end, inclusive="both")
+                w1_non_list_orders.append(f"{int(mask_nls1.sum()):.0f}")
+            else:
+                w1_non_list_orders.append("-")
+            if ol2 > 0:
+                ls2_start = max(d0, w2_start)
+                ls2_end = min(d1, w2_end)
+                mask_ls2 = _mask_for(mcode) & s_lock2.between(ls2_start, ls2_end, inclusive="both")
+                w2_list_orders.append(f"{int(mask_ls2.sum()):.0f}")
+            else:
+                w2_list_orders.append("-")
+            if nl2 > 0 and pd.notna(d1) and pd.notna(non_list_end):
+                nls2_start = max(d1, w2_start)
+                nls2_end = min(non_list_end, w2_end)
+                mask_nls2 = _mask_for(mcode) & s_lock2.between(nls2_start, nls2_end, inclusive="both")
+                w2_non_list_orders.append(f"{int(mask_nls2.sum()):.0f}")
+            else:
+                w2_non_list_orders.append("-")
+
+        hdr_days = [
+            "车型",
+            "上市天数 2024-12-01 至 2025-11-30",
+            "上市锁单数 2024-12-01 至 2025-11-30",
+            "非上市天数 2024-12-01 至 2025-11-30",
+            "非上市锁单数 2024-12-01 至 2025-11-30",
+            "上市天数 2023-12-01 至 2024-11-30",
+            "上市锁单数 2023-12-01 至 2024-11-30",
+            "非上市天数 2023-12-01 至 2024-11-30",
+            "非上市锁单数 2023-12-01 至 2024-11-30",
+        ]
+        fig.add_table(
+            header=dict(values=hdr_days, fill_color="#f6f6f6", align="center", font=dict(color="#333", size=12), height=36),
+            cells=dict(values=[models_period, w1_list_days, w1_list_orders, w1_non_list_days, w1_non_list_orders, w2_list_days, w2_list_orders, w2_non_list_days, w2_non_list_orders], align="center", height=32),
+            row=18,
+            col=1,
+        )
+
+        export_dir = Path("/Users/zihao_/Documents/coding/dataset/processed/analysis_results")
+        export_dir.mkdir(parents=True, exist_ok=True)
+        export_path = export_dir / "上市期天数对比_两个窗口.csv"
+        df_export = pd.DataFrame({
+            "车型": models_period,
+            "上市天数 2024-12-01 至 2025-11-30": w1_list_days,
+            "上市锁单数 2024-12-01 至 2025-11-30": w1_list_orders,
+            "非上市天数 2024-12-01 至 2025-11-30": w1_non_list_days,
+            "非上市锁单数 2024-12-01 至 2025-11-30": w1_non_list_orders,
+            "上市天数 2023-12-01 至 2024-11-30": w2_list_days,
+            "上市锁单数 2023-12-01 至 2024-11-30": w2_list_orders,
+            "非上市天数 2023-12-01 至 2024-11-30": w2_non_list_days,
+            "非上市锁单数 2023-12-01 至 2024-11-30": w2_non_list_orders,
+        })
+        df_export.to_csv(export_path, index=False, encoding="utf-8-sig")
+        def resolve_owner_age(df: pd.DataFrame) -> str:
+            cands = ["owner_age", "Owner Age", "Age", "age", "车主年龄", "客户年龄"]
+            for c in cands:
+                if c in df.columns:
+                    return c
+            def norm(s: str) -> str:
+                return s.strip().lower().replace("_", " ")
+            m = {norm(c): c for c in df.columns}
+            for c in cands:
+                cn = norm(c)
+                if cn in m:
+                    return m[cn]
+            return cands[0]
+
+        age_col = resolve_owner_age(df_orders2)
+        ages = pd.to_numeric(df_orders2[age_col], errors="coerce")
+        lock_times = s_lock2
+        model_codes = s_model2.astype(str)
+        def phase_range(model: str) -> tuple:
+            d0 = pd.to_datetime(periods[model]["start"]) if model in periods else pd.NaT
+            nxt = next_map.get(model)
+            if nxt and nxt in periods:
+                nxt_start = pd.to_datetime(periods[nxt]["start"]) if periods[nxt].get("start") else pd.NaT
+                d1 = nxt_start - pd.Timedelta(days=1) if pd.notna(nxt_start) else pd.NaT
+            else:
+                d1 = max_dt
+            return d0, d1
+        bins = list(range(10, 81))
+        x_vals = list(range(10, 80))
+        color_map = {
+            "CM0": "#2E91E5",
+            "CM1": "#4378BF",
+            "CM2": "#6AA2E5",
+            "DM0": "#E15F99",
+            "DM1": "#F3B3C5",
+            "LS9": "#7B848F",
+        }
+        def hex_to_rgba(h: str, a: float) -> str:
+            h = h.lstrip("#")
+            r = int(h[0:2], 16)
+            g = int(h[2:4], 16)
+            b = int(h[4:6], 16)
+            return f"rgba({r},{g},{b},{a})"
+        series_legend = []
+        for m in ["CM0", "CM1", "CM2", "DM0", "DM1", "LS9"]:
+            d0, d1 = phase_range(m)
+            if pd.isna(d0) or pd.isna(d1) or d1 < d0:
+                continue
+            mask = (model_codes == m) & lock_times.between(d0, d1, inclusive="both")
+            ages_m = ages.loc[mask]
+            ages_m = ages_m[(ages_m >= 10) & (ages_m <= 80)]
+            if ages_m.empty:
+                continue
+            counts, _ = np.histogram(ages_m.values, bins=bins)
+            total = counts.sum()
+            perc = (counts / total * 100.0) if total > 0 else counts.astype(float)
+            fig.add_trace(
+                go.Scatter(
+                    name=m,
+                    x=x_vals,
+                    y=perc,
+                    mode="lines",
+                    fill="tozeroy",
+                    line=dict(color=color_map.get(m, "#999999"), width=2),
+                    fillcolor=hex_to_rgba(color_map.get(m, "#999999"), 0.1),
+                    hovertemplate="年龄=%{x}<br>占比=%{y:.2f}%<extra></extra>",
+                    showlegend=False,
+                ),
+                row=19,
+                col=1,
+            )
+            series_legend.append((m, color_map.get(m, "#999999")))
+        add_local_legend("yaxis11", series_legend)
+
+        hdr_age_stats = ["车型", "均值", "中位数", "标准差"]
+        rows_age_stats = []
+        for m in ["CM0", "CM1", "CM2", "DM0", "DM1", "LS9"]:
+            d0, d1 = phase_range(m)
+            if pd.isna(d0) or pd.isna(d1) or d1 < d0:
+                rows_age_stats.append([m, "-", "-", "-"])
+                continue
+            mask = (model_codes == m) & lock_times.between(d0, d1, inclusive="both")
+            ages_m = ages.loc[mask]
+            ages_m = ages_m[(ages_m >= 10) & (ages_m <= 80)]
+            if ages_m.empty:
+                rows_age_stats.append([m, "-", "-", "-"])
+                continue
+            mean_val = ages_m.mean()
+            median_val = ages_m.median()
+            std_val = ages_m.std()
+            rows_age_stats.append([m, f"{mean_val:.2f}", f"{median_val:.2f}", f"{std_val:.2f}"])
+        row_colors = [
+            ("#EAF2FF" if m.startswith("CM") else ("#FFF2E6" if m.startswith("DM") else "#F2F2F2"))
+            for m, _, _, _ in rows_age_stats
+        ]
+        fig.add_table(
+            header=dict(values=hdr_age_stats, fill_color="#f6f6f6", align="center", font=dict(color="#333", size=12), height=36),
+            cells=dict(values=list(zip(*rows_age_stats)), fill_color=[row_colors] * len(hdr_age_stats), align="center", height=32),
+            row=20,
             col=1,
         )
 
