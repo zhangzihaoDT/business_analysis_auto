@@ -358,9 +358,25 @@ def main() -> None:
                 "上牌城市等级",
             ],
         )
-        level_series = df.loc[mask & model_filter, level_col].astype(str).fillna("未知")
-        level_counts = level_series.value_counts()
-        total_orders = int(level_series.size)
+        level_series = df.loc[mask & model_filter, level_col]
+        
+        # 统计剔除前的“未知”情况（NaN 或 "nan"）
+        total_count_l = len(level_series)
+        def is_unknown_level(val):
+            if pd.isna(val):
+                return True
+            s = str(val).strip().lower()
+            return s == "nan" or s == "null" or s == ""
+
+        unknown_level_mask = level_series.apply(is_unknown_level).fillna(True).astype(bool)
+        unknown_l_count = unknown_level_mask.sum()
+        unknown_l_pct = (unknown_l_count / total_count_l * 100) if total_count_l > 0 else 0.0
+
+        # 剔除无效值
+        level_series_valid = level_series[~unknown_level_mask].astype(str).str.strip()
+
+        level_counts = level_series_valid.value_counts()
+        total_orders = len(level_series_valid)
         level_share = (level_counts / max(total_orders, 1) * 100).round(2)
         level_df = (
             pd.DataFrame({"level": level_counts.index, "lock_orders": level_counts.values, "share_pct": level_share.values})
@@ -368,6 +384,7 @@ def main() -> None:
         )
         md_lines.append("")
         md_lines.append("## 分 license_city_level 的锁单量与占比")
+        md_lines.append(f"> 注：已剔除无效/空值样本 {unknown_l_count} 个（占比 {unknown_l_pct:.2f}%），下表基于有效样本 {total_orders} 个统计。")
         md_lines.append(df_to_md(level_df))
     except KeyError as e:
         md_lines.append("")
@@ -436,6 +453,152 @@ def main() -> None:
     except KeyError as e:
         md_lines.append("")
         md_lines.append("## 分 License City 的锁单量与占比（Top 10）")
+        md_lines.append(f"字段缺失：{e}")
+
+    # 追加：分年龄段的锁单量与占比
+    try:
+        age_col = resolve_column(
+            df,
+            [
+                "owner_age",
+                "Owner Age",
+                "Owner_Age",
+                "age",
+                "Age",
+                "车主年龄",
+            ],
+        )
+        # 确保转换为数值
+        age_series = pd.to_numeric(df.loc[mask & model_filter, age_col], errors="coerce")
+        
+        # 计算统计量
+        valid_ages = age_series.dropna()
+        if not valid_ages.empty:
+            age_mean = valid_ages.mean()
+            age_median = valid_ages.median()
+            age_std = valid_ages.std()
+            md_lines.append("")
+            md_lines.append("## 车主年龄统计")
+            md_lines.append(f"- 平均值: {age_mean:.2f}")
+            md_lines.append(f"- 中位数: {age_median:.2f}")
+            md_lines.append(f"- 标准差: {age_std:.2f}")
+        else:
+            md_lines.append("")
+            md_lines.append("## 车主年龄统计")
+            md_lines.append("(无有效年龄数据)")
+
+        current_year = datetime.now().year
+
+        def map_age_group(age):
+            if pd.isna(age):
+                return "未知"
+            birth_year = current_year - age
+            if birth_year >= 2000:
+                return "00后"
+            elif birth_year >= 1995:
+                return "95后"
+            elif birth_year >= 1990:
+                return "90后"
+            elif birth_year >= 1985:
+                return "85后"
+            elif birth_year >= 1980:
+                return "80后"
+            elif birth_year >= 1975:
+                return "75后"
+            elif birth_year >= 1970:
+                return "70后"
+            else:
+                return "70前"
+
+        group_series_all = age_series.apply(map_age_group)
+        
+        # 统计剔除前的“未知”情况
+        total_count_all = len(group_series_all)
+        unknown_count = (group_series_all == "未知").sum()
+        unknown_pct = (unknown_count / total_count_all * 100) if total_count_all > 0 else 0.0
+
+        # 剔除“未知”
+        group_series = group_series_all[group_series_all != "未知"]
+        
+        group_counts = group_series.value_counts()
+        total_orders_age = len(group_series)
+        age_share = (group_counts / max(total_orders_age, 1) * 100).round(2)
+
+        age_df = pd.DataFrame({
+            "age_group": group_counts.index,
+            "lock_orders": group_counts.values,
+            "share_pct": age_share.values
+        })
+
+        sort_order = ["00后", "95后", "90后", "85后", "80后", "75后", "70后", "70前"]
+        age_df["age_group"] = pd.Categorical(age_df["age_group"], categories=sort_order, ordered=True)
+        age_df = age_df.sort_values("age_group")
+
+        md_lines.append("")
+        md_lines.append("## 分年龄段的锁单量与占比")
+        md_lines.append(f"> 注：已剔除年龄未知的样本 {unknown_count} 个（占比 {unknown_pct:.2f}%），下表基于有效样本 {total_orders_age} 个统计。")
+        md_lines.append(df_to_md(age_df))
+
+    except KeyError as e:
+        md_lines.append("")
+        md_lines.append("## 分年龄段的锁单量与占比")
+        md_lines.append(f"字段缺失：{e}")
+
+    # 追加：分性别的锁单量与占比
+    try:
+        gender_col = resolve_column(
+            df,
+            [
+                "owner_gender",
+                "Owner Gender",
+                "Owner_Gender",
+                "gender",
+                "Gender",
+                "车主性别",
+                "性别",
+            ],
+        )
+        raw_gender_series = df.loc[mask & model_filter, gender_col]
+
+        def is_unknown_gender(val):
+            if pd.isna(val):
+                return True
+            s = str(val).strip()
+            if not s:  # empty string
+                return True
+            s_lower = s.lower()
+            if s_lower in ["默认未知", "none", "nan", "null", "未知"]:
+                return True
+            return False
+
+        # 识别未知/无效值
+        unknown_mask = raw_gender_series.apply(is_unknown_gender)
+        
+        # 统计
+        total_count_g = len(raw_gender_series)
+        unknown_g_count = unknown_mask.sum()
+        unknown_g_pct = (unknown_g_count / total_count_g * 100) if total_count_g > 0 else 0.0
+
+        # 提取有效值
+        gender_series_valid = raw_gender_series[~unknown_mask].astype(str).str.strip()
+        
+        gender_counts = gender_series_valid.value_counts()
+        total_orders_gender = len(gender_series_valid)
+        gender_share = (gender_counts / max(total_orders_gender, 1) * 100).round(2)
+
+        gender_df = (
+            pd.DataFrame({"gender": gender_counts.index, "lock_orders": gender_counts.values, "share_pct": gender_share.values})
+            .sort_values(["lock_orders", "share_pct"], ascending=[False, False])
+        )
+
+        md_lines.append("")
+        md_lines.append("## 分性别的锁单量与占比")
+        md_lines.append(f"> 注：已剔除性别为“默认未知/None/空”的样本 {unknown_g_count} 个（占比 {unknown_g_pct:.2f}%），下表基于有效样本 {total_orders_gender} 个统计。")
+        md_lines.append(df_to_md(gender_df))
+
+    except KeyError as e:
+        md_lines.append("")
+        md_lines.append("## 分性别的锁单量与占比")
         md_lines.append(f"字段缺失：{e}")
 
     report_name = f"lock_summary_{args.start}_to_{args.end}.md"
