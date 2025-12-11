@@ -468,8 +468,15 @@ def main() -> None:
                 "车主年龄",
             ],
         )
-        # 确保转换为数值
-        age_series = pd.to_numeric(df.loc[mask & model_filter, age_col], errors="coerce")
+        age_series_raw = pd.to_numeric(df.loc[mask & model_filter, age_col], errors="coerce")
+        total_count_age_raw = len(age_series_raw)
+        out_of_range_mask = age_series_raw.notna() & ~((age_series_raw >= 16) & (age_series_raw <= 85))
+        out_of_range_count = int(out_of_range_mask.sum())
+        out_of_range_pct = (out_of_range_count / total_count_age_raw * 100) if total_count_age_raw > 0 else 0.0
+        age_series = age_series_raw.where((age_series_raw >= 16) & (age_series_raw <= 85), pd.NA)
+        if out_of_range_count > 0:
+            print(f"owner_age 区间外原始列表（模型筛选: {','.join(wanted_models) if wanted_models else '全部'}）:")
+            print(age_series_raw[out_of_range_mask].dropna().tolist())
         
         # 计算统计量
         valid_ages = age_series.dropna()
@@ -482,10 +489,12 @@ def main() -> None:
             md_lines.append(f"- 平均值: {age_mean:.2f}")
             md_lines.append(f"- 中位数: {age_median:.2f}")
             md_lines.append(f"- 标准差: {age_std:.2f}")
+            md_lines.append(f"> 注：已根据区间过滤剔除不在 [16,85] 的样本 {out_of_range_count} 个（占比 {out_of_range_pct:.2f}%）。")
         else:
             md_lines.append("")
             md_lines.append("## 车主年龄统计")
             md_lines.append("(无有效年龄数据)")
+            md_lines.append(f"> 注：已根据区间过滤剔除不在 [16,85] 的样本 {out_of_range_count} 个（占比 {out_of_range_pct:.2f}%）。")
 
         current_year = datetime.now().year
 
@@ -537,6 +546,7 @@ def main() -> None:
         md_lines.append("")
         md_lines.append("## 分年龄段的锁单量与占比")
         md_lines.append(f"> 注：已剔除年龄未知的样本 {unknown_count} 个（占比 {unknown_pct:.2f}%），下表基于有效样本 {total_orders_age} 个统计。")
+        md_lines.append(f"> 另：已根据区间过滤剔除不在 [16,85] 的样本 {out_of_range_count} 个（占比 {out_of_range_pct:.2f}%）。")
         md_lines.append(df_to_md(age_df))
 
     except KeyError as e:
