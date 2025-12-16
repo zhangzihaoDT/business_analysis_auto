@@ -1,7 +1,8 @@
+#!/usr/bin/env python3
 import argparse
 import re
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any, Optional
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -13,14 +14,89 @@ def read_lines(file_path: str, start_line: int, end_line: int) -> List[str]:
     return lines[start_line - 1 : end_line]
 
 
+def get_section_lines(all_lines: List[str], header_title: str) -> List[str]:
+    start_idx = -1
+    end_idx = -1
+    for i, line in enumerate(all_lines):
+        if header_title in line:
+            start_idx = i
+        if start_idx != -1 and i > start_idx and line.startswith("## "):
+            end_idx = i
+            break
+    
+    if start_idx != -1:
+        if end_idx == -1: end_idx = len(all_lines)
+        return all_lines[start_idx:end_idx]
+    return []
+
+
 def infer_group_label(file_path: str) -> str:
+    m = re.search(r"lock_summary_(.+)\.md", Path(file_path).name)
+    if m:
+        return m.group(1)
     m = re.search(r"意向订单简报_([^_]+)_", Path(file_path).name)
     return m.group(1) if m else Path(file_path).stem
 
 
-def parse_region_distribution(lines: List[str]) -> Tuple[List[str], List[int], List[float]]:
+def parse_region_matrix(lines: List[str]) -> Tuple[List[str], List[float], List[float]]:
+    """
+    Parses the '区域 x 车型矩阵' or '分 region 占比' table.
+    Supports both integer counts and float percentages.
+    """
     bins: List[str] = []
-    counts: List[int] = []
+    counts: List[float] = []
+    
+    for ln in lines:
+        ln = ln.strip()
+        if not ln.startswith("|"):
+            continue
+            
+        parts = [p.strip() for p in ln.split("|")]
+        if len(parts) < 3:
+            continue
+            
+        col0 = parts[1]
+        
+        # Skip header and separator
+        if "Region" in col0 or "---" in col0 or "大区" in col0 and "FAC" not in col0 and "虚拟" not in col0: 
+            if "Parent Region Name" in col0:
+                continue
+            if set(col0) <= {':', '-', ' '}:
+                continue
+        
+        region_name = col0
+        
+        # Sum numeric columns
+        row_sum = 0.0
+        valid_row = False
+        for val_str in parts[2:-1]: # Columns after region name
+            val_str = val_str.replace(",", "")
+            if not val_str: continue
+            try:
+                val = float(val_str)
+                row_sum += val
+                valid_row = True
+            except ValueError:
+                pass
+        
+        if valid_row or region_name:
+             bins.append(region_name)
+             counts.append(row_sum)
+
+    # Calculate percentages
+    total = sum(counts)
+    # If the input was already percentages (sum ~ 100), this re-normalization 
+    # keeps them roughly the same (maybe slight rounding diffs).
+    # If input was counts, this calculates percentages.
+    pcts = [(c / total * 100.0) if total > 0 else 0.0 for c in counts]
+    
+    return bins, counts, pcts
+
+
+def parse_region_distribution_bullets(lines: List[str]) -> Tuple[List[str], List[float], List[float]]:
+    # Fallback for bullet points
+    bins: List[str] = []
+    counts: List[float] = []
     pcts: List[float] = []
     bullet_re = re.compile(
         r"^\s*-\s*(?P<name>[^:]+):\s*(?P<count>[\d,]+)\s*[（(]\s*(?P<pct>[\d.]+)%\s*[)）]\s*$",
@@ -34,7 +110,7 @@ def parse_region_distribution(lines: List[str]) -> Tuple[List[str], List[int], L
         if not m:
             continue
         name = m.group("name").strip()
-        count = int(m.group("count").replace(",", ""))
+        count = float(m.group("count").replace(",", ""))
         pct = float(m.group("pct"))
         bins.append(name)
         counts.append(count)
@@ -42,25 +118,38 @@ def parse_region_distribution(lines: List[str]) -> Tuple[List[str], List[int], L
     return bins, counts, pcts
 
 
-def align_bins(
-    bins1: List[str], counts1: List[int], pcts1: List[float],
-    bins2: List[str], counts2: List[int], pcts2: List[float],
-) -> Tuple[List[str], List[int], List[int], List[float], List[float]]:
-    order = list(dict.fromkeys(bins1 + bins2))
-    map1c = {b: c for b, c in zip(bins1, counts1)}
-    map1p = {b: p for b, p in zip(bins1, pcts1)}
-    map2c = {b: c for b, c in zip(bins2, counts2)}
-    map2p = {b: p for b, p in zip(bins2, pcts2)}
-    ac1 = [map1c.get(b, 0) for b in order]
-    ac2 = [map2c.get(b, 0) for b in order]
-    ap1 = [map1p.get(b, 0.0) for b in order]
-    ap2 = [map2p.get(b, 0.0) for b in order]
-    return order, ac1, ac2, ap1, ap2
+def align_bins_multi(series_list: List[Dict]) -> Tuple[List[str], List[List[float]], List[List[float]]]:
+    """Align bins across multiple series."""
+    all_bins = []
+    for s in series_list:
+        all_bins.extend(s['bins'])
+    
+    # Unique bins, preserve order roughly?
+    # Usually regions have a specific order (e.g. by volume or geographic).
+    # We can sort by total volume across all series, or just alphabetic, or keep first appearance.
+    # Let's keep first appearance to respect the source file order (usually sorted by volume).
+    order = list(dict.fromkeys(all_bins))
+    
+    aligned_counts_list = []
+    aligned_pcts_list = []
+    
+    for s in series_list:
+        map_c = {b: c for b, c in zip(s['bins'], s['counts'])}
+        map_p = {b: p for b, p in zip(s['bins'], s['pcts'])}
+        
+        aligned_counts = [map_c.get(b, 0) for b in order]
+        aligned_pcts = [map_p.get(b, 0.0) for b in order]
+        
+        aligned_counts_list.append(aligned_counts)
+        aligned_pcts_list.append(aligned_pcts)
+
+    return order, aligned_counts_list, aligned_pcts_list
 
 
-def make_dashboard(
-    bins: List[str], counts1: List[int], counts2: List[int], pcts1: List[float], pcts2: List[float],
-    group1: str, group2: str, color1: str, color2: str,
+def make_dashboard_multi(
+    bins: List[str],
+    series_data: List[Dict],
+    title: str = "父区域分布对比",
 ) -> go.Figure:
     fig = make_subplots(
         rows=2,
@@ -71,71 +160,81 @@ def make_dashboard(
         subplot_titles=("父区域分布（占比对比）", "父区域分布明细（数量与占比）"),
     )
 
-    # Bar chart of counts
-    fig.add_bar(
-        x=bins,
-        y=pcts1,
-        name=group1,
-        marker_color=color1,
-        hovertemplate="区域=%{x}<br>占比=%{y:.2f}%<br>数量=%{customdata}<extra></extra>",
-        customdata=counts1,
-        row=1,
-        col=1,
-    )
-    fig.add_bar(
-        x=bins,
-        y=pcts2,
-        name=group2,
-        marker_color=color2,
-        hovertemplate="区域=%{x}<br>占比=%{y:.2f}%<br>数量=%{customdata}<extra></extra>",
-        customdata=counts2,
-        row=1,
-        col=1,
-    )
+    colors = ["#27AD00", "#005783", "#E63F00", "#6A00A8", "#CC004C"]
+    
+    # 1. Bar Chart
+    for i, s in enumerate(series_data):
+        color = colors[i % len(colors)]
+        label = s['label']
+        
+        fig.add_bar(
+            x=bins,
+            y=s['aligned_pcts'],
+            name=label,
+            marker_color=color,
+            hovertemplate="区域=%{x}<br>占比=%{y:.2f}%<br>数量=%{customdata}<extra></extra>",
+            customdata=s['aligned_counts'],
+            row=1,
+            col=1,
+        )
+
     fig.update_layout(barmode="group")
+    fig.update_yaxes(title_text="占比%", tickformat=".0f", row=1, col=1)
 
-    # Y轴改为百分比（0-100）
-    fig.update_yaxes(title_text="占比%", range=[0, 20], tickformat=".0f", row=1, col=1)
+    # 2. Table
+    header_vals = ["父区域"]
+    fill_colors = ["#EDEDED"]
+    text_colors = ["#333333"]
+    
+    for i, s in enumerate(series_data):
+        label = s['label']
+        header_vals.append(f"数量<br>({label})")
+        header_vals.append(f"占比%<br>({label})")
+        
+        c = colors[i % len(colors)]
+        fill_colors.extend([c, c])
+        text_colors.extend(["white", "white"])
 
-    # Table
-    total1 = sum(counts1)
-    total2 = sum(counts2)
-    header_vals = [
-        ["父区域"],
-        [f"数量（{group1}）"],
-        [f"占比%（{group1}）"],
-        [f"数量（{group2}）"],
-        [f"占比%（{group2}）"],
-        [f"占比差%（{group2}−{group1}）"],
-    ]
-    cells_bins = bins + ["总计"]
-    cells_counts1 = counts1 + [total1]
-    cells_pcts1 = [f"{p:.2f}" for p in pcts1] + ["100.00"]
-    cells_counts2 = counts2 + [total2]
-    cells_pcts2 = [f"{p:.2f}" for p in pcts2] + ["100.00"]
-    # 差异列：占比差（group2 - group1），保留两位小数并带符号，合计行为 +0.00
-    diff_pcts = [f"{(p2 - p1):+.2f}" for p1, p2 in zip(pcts1, pcts2)] + ["+0.00"]
+    cells_vals = [bins + ["总计"]]
+    
+    for s in series_data:
+        counts = s['aligned_counts']
+        pcts = s['aligned_pcts']
+        total = sum(counts)
+        
+        # Format counts: if all are integers, show as int; otherwise .2f
+        is_all_int = all(isinstance(x, (int, float)) and float(x).is_integer() for x in counts)
+        if is_all_int:
+             formatted_counts = [f"{int(x)}" for x in counts]
+             formatted_total = f"{int(total)}"
+        else:
+             formatted_counts = [f"{x:.2f}" for x in counts]
+             formatted_total = f"{total:.2f}"
+
+        cells_vals.append(formatted_counts + [formatted_total])
+        cells_vals.append([f"{p:.2f}" for p in pcts] + ["100.00"])
 
     fig.add_table(
         header=dict(
-            values=[header_vals[0], header_vals[1], header_vals[2], header_vals[3], header_vals[4], header_vals[5]],
-            fill_color=["#EDEDED", color1, color1, color2, color2, "#EDEDED"],
-            font=dict(color=["#333333", "white", "white", "white", "white", "#333333"], size=12),
-            align=["left", "center", "center", "center", "center", "center"],
+            values=header_vals,
+            fill_color=fill_colors,
+            font=dict(color=text_colors, size=11),
+            align="center",
             height=30,
         ),
         cells=dict(
-            values=[cells_bins, cells_counts1, cells_pcts1, cells_counts2, cells_pcts2, diff_pcts],
-            align=["left", "right", "right", "right", "right", "right"],
+            values=cells_vals,
+            align=["left"] + ["right"] * (len(series_data) * 2),
             height=26,
+            fill=dict(color=["#F9F9F9", "white"]),
         ),
         row=2,
         col=1,
     )
 
     fig.update_layout(
-        title=dict(text=f"父区域分布对比 | {group1} vs {group2}"),
-        margin=dict(l=40, r=20, t=70, b=40),
+        title=dict(text=title),
+        margin=dict(l=40, r=20, t=80, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
 
@@ -143,31 +242,49 @@ def make_dashboard(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="父区域分布对比（分组柱状图+表格）")
-    parser.add_argument("--file1", required=True, help="第一份简报文件路径")
-    parser.add_argument("--file2", required=True, help="第二份简报文件路径")
-    parser.add_argument("--start", type=int, default=58, help="起始行（一基）")
-    parser.add_argument("--end", type=int, default=70, help="结束行（一基，含本行)")
-    parser.add_argument("--group1", type=str, default=None, help="第一组标签（默认从文件名推断）")
-    parser.add_argument("--group2", type=str, default=None, help="第二组标签（默认从文件名推断）")
-    parser.add_argument("--color1", type=str, default="#27AD00", help="第一组颜色")
-    parser.add_argument("--color2", type=str, default="#005783", help="第二组颜色")
-    parser.add_argument("--output", type=str, default="reports/父区域分布对比.html", help="输出 HTML 路径")
+    parser = argparse.ArgumentParser(description="父区域分布对比（分组柱状图+表格，支持多文件）")
+    parser.add_argument("files", nargs="+", help="简报文件路径列表")
+    parser.add_argument("--output", type=str, default="reports/region_comparison_multi.html", help="输出 HTML 路径")
 
     args = parser.parse_args()
 
-    group1 = args.group1 or infer_group_label(args.file1)
-    group2 = args.group2 or infer_group_label(args.file2)
+    series_data = []
+    
+    for fpath in args.files:
+        with open(fpath, "r", encoding="utf-8") as f:
+            all_lines = f.readlines()
+        
+        # Priority 1: User requested section "分 region 占比（%）（按车型列归一化）"
+        target_lines = get_section_lines(all_lines, "## 分 region 占比")
+        if target_lines:
+             bins, counts, pcts = parse_region_matrix(target_lines)
+             print(f"[{Path(fpath).name}] Parsed matrix from '分 region 占比'.")
+        else:
+            # Priority 2: "区域 x 车型矩阵" (Counts)
+            target_lines = get_section_lines(all_lines, "## 区域 x 车型矩阵")
+            if target_lines:
+                 bins, counts, pcts = parse_region_matrix(target_lines)
+                 print(f"[{Path(fpath).name}] Parsed matrix from '区域 x 车型矩阵'.")
+            else:
+                 # Priority 3: Bullet points fallback
+                 print(f"[{Path(fpath).name}] '区域 x 车型矩阵' not found, trying bullets...")
+                 bins, counts, pcts = parse_region_distribution_bullets(all_lines)
 
-    lines1 = read_lines(args.file1, args.start, args.end)
-    lines2 = read_lines(args.file2, args.start, args.end)
+        series_data.append({
+            "label": infer_group_label(fpath),
+            "bins": bins,
+            "counts": counts,
+            "pcts": pcts
+        })
 
-    bins1, counts1, pcts1 = parse_region_distribution(lines1)
-    bins2, counts2, pcts2 = parse_region_distribution(lines2)
+    # Align
+    aligned_bins, aligned_counts_list, aligned_pcts_list = align_bins_multi(series_data)
+    
+    for i, s in enumerate(series_data):
+        s['aligned_counts'] = aligned_counts_list[i]
+        s['aligned_pcts'] = aligned_pcts_list[i]
 
-    bins, ac1, ac2, ap1, ap2 = align_bins(bins1, counts1, pcts1, bins2, counts2, pcts2)
-
-    fig = make_dashboard(bins, ac1, ac2, ap1, ap2, group1, group2, args.color1, args.color2)
+    fig = make_dashboard_multi(aligned_bins, series_data)
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

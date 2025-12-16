@@ -468,35 +468,64 @@ def main() -> None:
                 "车主年龄",
             ],
         )
-        age_series_raw = pd.to_numeric(df.loc[mask & model_filter, age_col], errors="coerce")
+        
+        # 提取包含年龄、车型、订单号的子集
+        age_sub_df = df.loc[mask & model_filter, [age_col, "车型分类", order_no_col, region_col]].copy()
+        age_sub_df["age_raw"] = pd.to_numeric(age_sub_df[age_col], errors="coerce")
+        
+        # 1. 全局统计（均值/中位数等）
+        age_series_raw = age_sub_df["age_raw"]
         total_count_age_raw = len(age_series_raw)
+        
         out_of_range_mask = age_series_raw.notna() & ~((age_series_raw >= 16) & (age_series_raw <= 85))
         out_of_range_count = int(out_of_range_mask.sum())
         out_of_range_pct = (out_of_range_count / total_count_age_raw * 100) if total_count_age_raw > 0 else 0.0
-        age_series = age_series_raw.where((age_series_raw >= 16) & (age_series_raw <= 85), pd.NA)
-        if out_of_range_count > 0:
-            print(f"owner_age 区间外原始列表（模型筛选: {','.join(wanted_models) if wanted_models else '全部'}）:")
-            print(age_series_raw[out_of_range_mask].dropna().tolist())
         
-        # 计算统计量
-        valid_ages = age_series.dropna()
-        if not valid_ages.empty:
-            age_mean = valid_ages.mean()
-            age_median = valid_ages.median()
-            age_std = valid_ages.std()
+        # 仅保留有效区间内的用于统计数值特征
+        valid_ages_stats = age_series_raw.where((age_series_raw >= 16) & (age_series_raw <= 85)).dropna()
+        
+        if not valid_ages_stats.empty:
+            age_mean = valid_ages_stats.mean()
+            age_median = valid_ages_stats.median()
+            age_std = valid_ages_stats.std()
             md_lines.append("")
             md_lines.append("## 车主年龄统计")
             md_lines.append(f"- 平均值: {age_mean:.2f}")
             md_lines.append(f"- 中位数: {age_median:.2f}")
             md_lines.append(f"- 标准差: {age_std:.2f}")
             md_lines.append(f"> 注：已根据区间过滤剔除不在 [16,85] 的样本 {out_of_range_count} 个（占比 {out_of_range_pct:.2f}%）。")
+            if wanted_models and len(wanted_models) >= 2:
+                age_valid_df = age_sub_df[
+                    age_sub_df["age_raw"].notna()
+                    & (age_sub_df["age_raw"] >= 16)
+                    & (age_sub_df["age_raw"] <= 85)
+                ].copy()
+                if not age_valid_df.empty:
+                    per_model_age = (
+                        age_valid_df.groupby("车型分类")["age_raw"]
+                        .agg(["mean", "median", "std"])
+                        .round(2)
+                    )
+                    if args.models:
+                        wanted = [m.strip() for m in str(args.models).split(",") if m.strip()]
+                        cols = [m for m in wanted if m in per_model_age.index]
+                        if cols:
+                            per_model_age = per_model_age.loc[cols]
+                    per_model_age = per_model_age.rename(
+                        columns={"mean": "平均值", "median": "中位数", "std": "标准差"}
+                    ).T
+                    per_model_age.index.name = "指标"
+                    md_lines.append("")
+                    md_lines.append("## 车主年龄统计（分车型）")
+                    md_lines.append(df_to_md(per_model_age.reset_index()))
         else:
             md_lines.append("")
             md_lines.append("## 车主年龄统计")
             md_lines.append("(无有效年龄数据)")
             md_lines.append(f"> 注：已根据区间过滤剔除不在 [16,85] 的样本 {out_of_range_count} 个（占比 {out_of_range_pct:.2f}%）。")
 
-        current_year = datetime.now().year
+        # 修正：使用 start_date 的年份作为基准
+        current_year = start_date.year
 
         def map_age_group(age):
             if pd.isna(age):
@@ -519,18 +548,26 @@ def main() -> None:
             else:
                 return "70前"
 
-        group_series_all = age_series.apply(map_age_group)
+        # 2. 分组分布（分车型）
+        # 先处理区间外的值：设为 NaN，以便 map_age_group 映射为 "未知"
+        # 注意：之前的 valid_ages_stats 已经 dropna 了，这里我们要对 DataFrame 操作
+        age_sub_df["age_clean"] = age_sub_df["age_raw"].where(
+            (age_sub_df["age_raw"] >= 16) & (age_sub_df["age_raw"] <= 85), pd.NA
+        )
+        age_sub_df["age_group"] = age_sub_df["age_clean"].apply(map_age_group)
         
-        # 统计剔除前的“未知”情况
-        total_count_all = len(group_series_all)
-        unknown_count = (group_series_all == "未知").sum()
-        unknown_pct = (unknown_count / total_count_all * 100) if total_count_all > 0 else 0.0
-
-        # 剔除“未知”
-        group_series = group_series_all[group_series_all != "未知"]
+        # 统计剔除前的“未知”情况（包含原始NaN和区间外的）
+        raw_na_count = age_sub_df["age_raw"].isna().sum()
+        total_excluded = raw_na_count + out_of_range_count
+        total_excluded_pct = (total_excluded / total_count_age_raw * 100) if total_count_age_raw > 0 else 0.0
         
-        group_counts = group_series.value_counts()
-        total_orders_age = len(group_series)
+        # 过滤掉 "未知"
+        valid_group_df = age_sub_df[age_sub_df["age_group"] != "未知"].copy()
+        valid_sample_count = len(valid_group_df)
+        
+        # --- A. 总体分布 (Backward Compatibility) ---
+        group_counts = valid_group_df["age_group"].value_counts()
+        total_orders_age = len(valid_group_df)
         age_share = (group_counts / max(total_orders_age, 1) * 100).round(2)
 
         age_df = pd.DataFrame({
@@ -538,16 +575,74 @@ def main() -> None:
             "lock_orders": group_counts.values,
             "share_pct": age_share.values
         })
-
         sort_order = ["00后", "95后", "90后", "85后", "80后", "75后", "70后", "70前"]
         age_df["age_group"] = pd.Categorical(age_df["age_group"], categories=sort_order, ordered=True)
         age_df = age_df.sort_values("age_group")
 
         md_lines.append("")
         md_lines.append("## 分年龄段的锁单量与占比")
-        md_lines.append(f"> 注：已剔除年龄未知的样本 {unknown_count} 个（占比 {unknown_pct:.2f}%），下表基于有效样本 {total_orders_age} 个统计。")
-        md_lines.append(f"> 另：已根据区间过滤剔除不在 [16,85] 的样本 {out_of_range_count} 个（占比 {out_of_range_pct:.2f}%）。")
+        md_lines.append(f"> 注：已剔除年龄未知或不在[16,85]区间的样本共 {total_excluded} 个（占比 {total_excluded_pct:.2f}%），下表基于有效样本 {valid_sample_count} 个统计。")
         md_lines.append(df_to_md(age_df))
+
+        # --- B. 分车型分布 (New Feature) ---
+        # 聚合：车型 x 年龄段
+        age_pivot = valid_group_df.pivot_table(
+            index="age_group",
+            columns="车型分类",
+            values=order_no_col,
+            aggfunc="nunique",
+            fill_value=0
+        )
+        
+        # 排序
+        age_pivot = age_pivot.reindex(sort_order)
+        
+        # 过滤车型列
+        if args.models:
+            wanted = [m.strip() for m in str(args.models).split(",") if m.strip()]
+            cols = [c for c in wanted if c in age_pivot.columns]
+            if cols:
+                age_pivot = age_pivot[cols]
+
+        # 计算占比（列归一化）
+        age_pct_df = age_pivot.div(age_pivot.sum(axis=0).replace(0, pd.NA), axis=1).fillna(0) * 100
+        age_pct_df = age_pct_df.round(2)
+
+        md_lines.append("")
+        md_lines.append("## 分年龄段的锁单量与占比（分车型占比%）")
+        md_lines.append(df_to_md(age_pct_df.reset_index()))
+
+        age_region_df = valid_group_df[[ "age_group", "车型分类", region_col, order_no_col ]].copy()
+        age_region_df = age_region_df[age_region_df[region_col].notna()]
+        if not age_region_df.empty:
+            age_region_counts = (
+                age_region_df.groupby(["age_group", region_col, "车型分类"])
+                .agg(订单数=(order_no_col, pd.Series.nunique))
+                .reset_index()
+            )
+            models_for_cross = []
+            if wanted_models:
+                models_for_cross = [m for m in wanted_models if m in age_region_counts["车型分类"].unique()]
+            else:
+                models_for_cross = list(age_region_counts["车型分类"].unique())
+            for m in models_for_cross:
+                sub = age_region_counts[age_region_counts["车型分类"] == m]
+                if sub.empty:
+                    continue
+                pivot_counts = sub.pivot_table(
+                    index="age_group",
+                    columns=region_col,
+                    values="订单数",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                pivot_counts = pivot_counts.reindex(sort_order)
+                row_sum = pivot_counts.sum(axis=1).replace(0, pd.NA)
+                pivot_pct = pivot_counts.div(row_sum, axis=0).fillna(0) * 100
+                pivot_pct = pivot_pct.round(2)
+                md_lines.append("")
+                md_lines.append(f"## 分年龄段的锁单在不同区域的占比（{m}，按年龄段行归一化）")
+                md_lines.append(df_to_md(pivot_pct.reset_index()))
 
     except KeyError as e:
         md_lines.append("")

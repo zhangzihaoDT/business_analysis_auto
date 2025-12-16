@@ -45,7 +45,12 @@ def compute_conversion_rates(df: pd.DataFrame) -> pd.DataFrame:
 
 def align_series_by_day(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, series: pd.Series, ma_window: int = 7) -> pd.Series:
     mask = (df["date"] >= start) & (df["date"] <= end)
-    sub = pd.DataFrame({"date": df.loc[mask, "date"], "val": series.loc[mask].astype(float)})
+    sub = pd.DataFrame(
+        {
+            "date": df.loc[mask, "date"],
+            "val": pd.to_numeric(series.loc[mask], errors="coerce"),
+        }
+    )
     sub = sub.dropna(subset=["date"]).copy()
     sub["val_ma"] = sub["val"].rolling(window=ma_window, min_periods=1).mean()
     sub["day_n"] = (sub["date"] - start).dt.days
@@ -60,6 +65,8 @@ def resolve(df: pd.DataFrame, logical: str) -> str:
         "order_time": ["Order_Create_Time", "订单创建时间", "order_create_time", "下单时间", "Lock_Time", "锁单时间"],
         "store_create": ["store_create_date", "门店开业时间", "Store_Create_Date"],
         "store_name": ["Store Name", "门店名称", "store_name"],
+        "age": ["owner_age", "Owner Age", "Owner_Age", "age", "Age", "车主年龄"],
+        "model_group": ["车型分组", "Model Group", "Vehicle Group", "Car Group", "车型"],
     }
     for c in cand.get(logical, []):
         if c in df.columns:
@@ -198,6 +205,56 @@ def load_conversion_duration_series(start_date: pd.Timestamp, end_date: pd.Times
     return daily_avg
 
 
+def load_daily_mean_age_series(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.Series:
+    orders_path = Path("/Users/zihao_/Documents/coding/dataset/formatted/intention_order_analysis.parquet")
+    try:
+        df = pd.read_parquet(orders_path)
+    except Exception:
+        print(f"Warning: Could not read {orders_path}")
+        return pd.Series(dtype=float)
+
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    try:
+        col_lock = resolve(df, "order_time")
+        col_model = resolve(df, "model_group")
+        col_age = resolve(df, "age")
+    except KeyError:
+        return pd.Series(dtype=float)
+
+    df[col_lock] = pd.to_datetime(df[col_lock], errors="coerce")
+    df_sub = df[[col_lock, col_model, col_age]].copy()
+    df_sub = df_sub[df_sub[col_lock].notna()]
+    df_sub["day"] = pd.to_datetime(df_sub[col_lock], errors="coerce").dt.floor("D")
+    df_sub = df_sub[(df_sub["day"] >= start_date) & (df_sub["day"] <= end_date)]
+    df_sub["model_group"] = df_sub[col_model].astype(str)
+    df_sub = df_sub[df_sub["model_group"].isin(["CM0", "CM1", "CM2"])]
+
+    df_sub["age_raw"] = pd.to_numeric(df_sub[col_age], errors="coerce")
+    df_sub["age_clean"] = df_sub["age_raw"].where(
+        (df_sub["age_raw"] >= 16) & (df_sub["age_raw"] <= 85)
+    )
+    df_sub = df_sub.dropna(subset=["age_clean"])
+    if df_sub.empty:
+        return pd.DataFrame()
+
+    grouped = df_sub.groupby("day")["age_clean"]
+    daily_mean = grouped.mean()
+    daily_cnt = grouped.count()
+    full_days = pd.date_range(start_date, end_date, freq="D")
+    daily_mean = daily_mean.reindex(full_days)
+    daily_cnt = daily_cnt.reindex(full_days).fillna(0)
+    out = pd.DataFrame(
+        {
+            "车主平均年龄": daily_mean,
+            "车主平均年龄样本数": daily_cnt,
+        },
+        index=full_days,
+    )
+    return out
+
+
 def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
     # Merge Active Store Count
     if not df.empty:
@@ -220,10 +277,20 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
             df = df.merge(temp, on="date", how="left")
             # Do not fillna(0) for duration, keep as NaN
 
+    if not df.empty:
+        d_min, d_max = df["date"].min(), df["date"].max()
+        age_df = load_daily_mean_age_series(d_min, d_max)
+        if not age_df.empty:
+            temp = age_df.copy()
+            temp.index.name = "date"
+            df = df.merge(temp, on="date", how="left")
+
+    w3_start = pd.to_datetime("2023-01-01")
+    w3_end = pd.to_datetime("2023-12-15")
     w2_start = pd.to_datetime("2024-01-01")
-    w2_end = pd.to_datetime("2024-12-14")
+    w2_end = pd.to_datetime("2024-12-15")
     w1_start = pd.to_datetime("2025-01-01")
-    w1_end = pd.to_datetime("2025-12-14")
+    w1_end = pd.to_datetime("2025-12-15")
 
     m_lock = "锁单数"
     m_eff = "有效线索数"
@@ -234,13 +301,17 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
     m_active = "在营门店数"
     m_dur = "线索-锁单转化时长"
 
-    store_avg = df[m_dis].astype(float) / df[m_store].replace(0, pd.NA).astype(float)
-    owner_avg = df[m_dis].astype(float) / df[m_owner].replace(0, pd.NA).astype(float)
+    dis_num = pd.to_numeric(df[m_dis], errors="coerce")
+    store_den = pd.to_numeric(df[m_store], errors="coerce").replace(0, pd.NA)
+    owner_den = pd.to_numeric(df[m_owner], errors="coerce").replace(0, pd.NA)
+    store_avg = dis_num / store_den
+    owner_avg = dis_num / owner_den
     
     # Check if m_active exists
     active_col = df[m_active].astype(float) if m_active in df.columns else pd.Series([0]*len(df))
     # Check if m_dur exists
     dur_col = df[m_dur].astype(float) if m_dur in df.columns else pd.Series([pd.NA]*len(df))
+    age_col = pd.to_numeric(df["车主平均年龄"], errors="coerce") if "车主平均年龄" in df.columns else pd.Series([pd.NA]*len(df))
 
     metrics = [
         ("锁单数", df[m_lock].astype(float), "数", ":.0f"),
@@ -252,6 +323,7 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
         ("主理人均下发线索数", owner_avg, "数", ":.2f"),
         ("在营门店数", active_col, "数", ":.0f"),
         ("线索-锁单转化时长", dur_col, "天", ":.2f"),
+        ("车主平均年龄", age_col, "岁", ":.2f"),
     ]
 
     titles = [
@@ -264,6 +336,7 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
         "主理人均下发线索数（按第N天对齐，MA7）",
         "在营门店数（按第N天对齐，MA7）",
         "线索-锁单转化时长（按第N天对齐，MA7）",
+        "车主平均年龄（按第N天对齐，MA7，车型分组=CM0,CM1,CM2）",
         "锁单数 vs 线索-锁单转化时长 (散点图)",
     ]
     
@@ -277,8 +350,8 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
     row_heights = []
     # Assign relative heights: Plot gets more space than Table
     for _ in range(len(metrics) + 1):
-        row_heights.append(0.28)  # Plot
-        row_heights.append(0.12)  # Table
+        row_heights.append(0.25)  # Plot
+        row_heights.append(0.15)  # Table
     
     # Normalize heights
     total_h = sum(row_heights)
@@ -322,11 +395,24 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
             yanchor="top",
         )
     
+    summary_metrics = {
+        "有效线索数",
+        "有效试驾数",
+        "7日线索转化率",
+        "30日线索转化率",
+        "锁单数",
+        "在营门店数",
+        "主理人均下发线索数",
+    }
+    summary_rate_metrics = {"7日线索转化率", "30日线索转化率"}
+    summary_rows = []
+
     # Comparison ranges
     comp_ranges = [
-        ("2024-12-01～2024-12-14", pd.to_datetime("2024-12-01"), pd.to_datetime("2024-12-14")),
-        ("2025-11-01～2025-11-14", pd.to_datetime("2025-11-01"), pd.to_datetime("2025-11-14")),
-        ("2025-12-01～2025-12-14", pd.to_datetime("2025-12-01"), pd.to_datetime("2025-12-14")),
+        ("2023-12-01～2023-12-15", pd.to_datetime("2023-12-01"), pd.to_datetime("2023-12-15")),
+        ("2024-12-01～2024-12-15", pd.to_datetime("2024-12-01"), pd.to_datetime("2024-12-15")),
+        ("2025-11-01～2025-11-15", pd.to_datetime("2025-11-01"), pd.to_datetime("2025-11-15")),
+        ("2025-12-01～2025-12-15", pd.to_datetime("2025-12-01"), pd.to_datetime("2025-12-15")),
     ]
 
     x_vals = list(range(0, 366))
@@ -336,9 +422,11 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
         
         s_w1 = align_series_by_day(df, w1_start, w1_end, series, ma_window=7)
         s_w2 = align_series_by_day(df, w2_start, w2_end, series, ma_window=7)
+        s_w3 = align_series_by_day(df, w3_start, w3_end, series, ma_window=7)
+
         fig.add_trace(
             go.Scatter(
-                name=f"{name} 2025-01-01 至 2025-12-14 (MA7)",
+                name=f"{name} 2025-01-01 至 2025-12-15 (MA7)",
                 x=x_vals,
                 y=s_w1.values,
                 mode="lines",
@@ -351,7 +439,7 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
         )
         fig.add_trace(
             go.Scatter(
-                name=f"{name} 2024-01-01 至 2024-12-14 (MA7)",
+                name=f"{name} 2024-01-01 至 2024-12-15 (MA7)",
                 x=x_vals,
                 y=s_w2.values,
                 mode="lines",
@@ -362,17 +450,34 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
             row=plot_row,
             col=1,
         )
+        fig.add_trace(
+            go.Scatter(
+                name=f"{name} 2023-01-01 至 2023-12-15 (MA7)",
+                x=x_vals,
+                y=s_w3.values,
+                mode="lines",
+                line=dict(color="#A0A0A0", width=2),
+                hovertemplate=f"第N天=%{{x}}<br>{name}(MA7)=%{{y{fmt}}}<extra></extra>",
+                showlegend=False,
+            ),
+            row=plot_row,
+            col=1,
+        )
         fig.update_yaxes(title_text=name, row=plot_row, col=1)
 
-        yaxis_name = "yaxis" + ("" if plot_row == 1 else str(plot_row))
-        add_local_legend(yaxis_name, [("2025-01-01 至 2025-12-14 (MA7)", "#27AD00"), ("2024-01-01 至 2024-12-14 (MA7)", "#005783")])
+        yaxis_name = "yaxis" + ("" if i == 1 else str(i))
+        add_local_legend(yaxis_name, [
+            ("2025-01-01 至 2025-12-15 (MA7)", "#27AD00"), 
+            ("2024-01-01 至 2024-12-15 (MA7)", "#005783"),
+            ("2023-01-01 至 2023-12-15 (MA7)", "#A0A0A0")
+        ])
         
         # Calculate comparison means
         comp_vals = []
         raw_means = []
         for _, start, end in comp_ranges:
             mask = (df["date"] >= start) & (df["date"] <= end)
-            mean_val = series[mask].astype(float).mean()
+            mean_val = pd.to_numeric(series[mask], errors="coerce").mean()
             raw_means.append(mean_val)
             if pd.isna(mean_val):
                 comp_vals.append("-")
@@ -387,34 +492,102 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
                 except ValueError:
                      comp_vals.append(f"{mean_val}")
         
-        # Calculate MoM and YoY
-        # raw_means indices: 0 -> 2024-12 (YoY base), 1 -> 2025-11 (MoM base), 2 -> 2025-12 (Current)
+        if name in summary_metrics:
+            row = {"指标": name}
+            for label, start, end in comp_ranges:
+                mask = (df["date"] >= start) & (df["date"] <= end)
+                if name in {"锁单数", "有效线索数", "有效试驾数", "在营门店数"}:
+                    window_vals = pd.to_numeric(series[mask], errors="coerce")
+                    total = window_vals.sum()
+                    row[label] = f"{total:.0f}" if pd.notna(total) else "-"
+                elif name == "7日线索转化率":
+                    num = pd.to_numeric(
+                        df.loc[mask, "7 日内锁单线索数"], errors="coerce"
+                    ).sum()
+                    den = pd.to_numeric(
+                        df.loc[mask, "有效线索数"], errors="coerce"
+                    ).sum()
+                    if pd.notna(num) and den and den != 0:
+                        val = num / den * 100.0
+                        row[label] = f"{val:.2f}%"
+                    else:
+                        row[label] = "-"
+                elif name == "30日线索转化率":
+                    num = pd.to_numeric(
+                        df.loc[mask, "30 日锁单线索数"], errors="coerce"
+                    ).sum()
+                    den = pd.to_numeric(
+                        df.loc[mask, "有效线索数"], errors="coerce"
+                    ).sum()
+                    if pd.notna(num) and den and den != 0:
+                        val = num / den * 100.0
+                        row[label] = f"{val:.2f}%"
+                    else:
+                        row[label] = "-"
+                elif name == "主理人均下发线索数":
+                    num = pd.to_numeric(df.loc[mask, m_dis], errors="coerce").sum()
+                    den = pd.to_numeric(df.loc[mask, m_owner], errors="coerce").sum()
+                    if pd.notna(num) and den and den != 0:
+                        val = num / den
+                        row[label] = f"{val:.2f}"
+                    else:
+                        row[label] = "-"
+                else:
+                    row[label] = "-"
+            summary_rows.append(row)
+
+        # Calculate YoY
+        # raw_means indices: 0 -> 2023-12, 1 -> 2024-12, 2 -> 2025-11, 3 -> 2025-12
+        val_23_12 = raw_means[0]
+        val_24_12 = raw_means[1]
+        val_25_11 = raw_means[2]
+        val_25_12 = raw_means[3]
+        
+        # YoY 24 vs 23
+        yoy1_val = "-"
+        if pd.notna(val_24_12) and pd.notna(val_23_12) and val_23_12 != 0:
+            diff = (val_24_12 - val_23_12) / val_23_12
+            sign = "+" if diff > 0 else ""
+            yoy1_val = f"{sign}{diff:.2%}"
+
+        # MoM 25-12 vs 25-11
         mom_val = "-"
-        yoy_val = "-"
-        
-        val_24_12 = raw_means[0]
-        val_25_11 = raw_means[1]
-        val_25_12 = raw_means[2]
-        
-        # MoM: (25_12 - 25_11) / 25_11
         if pd.notna(val_25_12) and pd.notna(val_25_11) and val_25_11 != 0:
             diff = (val_25_12 - val_25_11) / val_25_11
             sign = "+" if diff > 0 else ""
             mom_val = f"{sign}{diff:.2%}"
             
-        # YoY: (25_12 - 24_12) / 24_12
+        # YoY 25 vs 24
+        yoy2_val = "-"
         if pd.notna(val_25_12) and pd.notna(val_24_12) and val_24_12 != 0:
             diff = (val_25_12 - val_24_12) / val_24_12
             sign = "+" if diff > 0 else ""
-            yoy_val = f"{sign}{diff:.2%}"
+            yoy2_val = f"{sign}{diff:.2%}"
             
+        comp_vals.append(yoy1_val)
         comp_vals.append(mom_val)
-        comp_vals.append(yoy_val)
+        comp_vals.append(yoy2_val)
 
         # Add Table
-        header_vals = ["指标"] + [r[0] for r in comp_ranges] + ["环比 (vs 11月)", "同比 (vs 24年)"]
-        cell_vals = ["日均值 (原始数据)"] + comp_vals
-        
+        header_vals = ["指标"] + [r[0] for r in comp_ranges] + ["同比 (24 vs 23)", "环比 (vs 11月)", "同比 (25 vs 24)"]
+        rows = []
+        rows.append(["日均值 (原始数据)"] + comp_vals)
+
+        if name == "车主平均年龄" and "车主平均年龄样本数" in df.columns:
+            count_vals = []
+            for _, start, end in comp_ranges:
+                mask = (df["date"] >= start) & (df["date"] <= end)
+                cnt = pd.to_numeric(df.loc[mask, "车主平均年龄样本数"], errors="coerce").sum()
+                if pd.notna(cnt) and cnt != 0:
+                    count_vals.append(f"{int(cnt)}")
+                else:
+                    count_vals.append("-")
+            count_row = ["统计所用的锁单数"] + count_vals + ["-", "-", "-"]
+            rows.append(count_row)
+
+        cols = list(zip(*rows))
+        cell_values = [list(col) for col in cols]
+
         fig.add_trace(
             go.Table(
                 header=dict(
@@ -425,7 +598,7 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
                     height=24
                 ),
                 cells=dict(
-                    values=[[v] for v in cell_vals], # Transpose for column-oriented
+                    values=cell_values,
                     font=dict(size=11),
                     align="center",
                     fill_color="#F5F5F5",
@@ -459,7 +632,7 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
                 x=df_25_filtered[m_lock],
                 y=df_25_filtered["线索-锁单转化时长"],
                 mode="markers",
-                name="2025 (2025-01-01~2025-12-14)",
+                name="2025 (2025-01-01~2025-12-15)",
                 marker=dict(color="#27AD00", size=6, opacity=0.6),
                 hovertemplate="锁单数: %{x}<br>转化时长: %{y:.2f}天<extra>2025</extra>"
             ),
@@ -470,7 +643,7 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
                 x=df_24_filtered[m_lock],
                 y=df_24_filtered["线索-锁单转化时长"],
                 mode="markers",
-                name="2024 (2024-01-01~2024-12-14)",
+                name="2024 (2024-01-01~2024-12-15)",
                 marker=dict(color="#005783", size=6, opacity=0.6),
                 hovertemplate="锁单数: %{x}<br>转化时长: %{y:.2f}天<extra>2024</extra>"
             ),
@@ -499,6 +672,13 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
         
         fig.update_xaxes(title_text="锁单数", row=row_scat, col=1)
         fig.update_yaxes(title_text="转化时长(天)", row=row_scat, col=1)
+
+        yaxis_name_scat = "yaxis" + str(idx_extra)
+        add_local_legend(yaxis_name_scat, [
+            ("2025 (2025-01-01~2025-12-15)", "#27AD00"),
+            ("2024 (2024-01-01~2024-12-15)", "#005783"),
+            ("整体趋势 (LOWESS)", "red")
+        ])
         
         # Correlation Calculation (Already filtered above)
         p_25 = df_25_filtered[m_lock].corr(df_25_filtered["线索-锁单转化时长"], method="pearson") if not df_25_filtered.empty else pd.NA
@@ -511,7 +691,7 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
 
         header = ["窗口", "Pearson系数 (剔除>1000锁单 & >100天时长)", "Spearman系数 (剔除>1000锁单 & >100天时长)"]
         cells = [
-            ["2025 (2025-01-01 ~ 2025-12-14)", "2024 (2024-01-01 ~ 2024-12-14)"],
+            ["2025 (2025-01-01 ~ 2025-12-15)", "2024 (2024-01-01 ~ 2024-12-15)"],
             [fmt_corr(p_25), fmt_corr(p_24)],
             [fmt_corr(s_25), fmt_corr(s_24)]
         ]
@@ -524,10 +704,16 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
             row=row_tbl, col=1
         )
 
+    if summary_rows:
+        summary_df = pd.DataFrame(summary_rows)
+        csv_path = Path("processed/analysis_results/core_metrics_alignment_summary_2023_2025.csv")
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
     fig.update_layout(
         title="两个窗口按第N天对齐的指标对比",
         legend_title="窗口",
-        height=6000,
+        height=5600,
         margin=dict(l=40, r=40, t=60, b=80),
         showlegend=False,
         paper_bgcolor="#FFFFFF",
