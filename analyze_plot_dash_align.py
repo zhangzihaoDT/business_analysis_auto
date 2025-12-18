@@ -286,11 +286,12 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
             df = df.merge(temp, on="date", how="left")
 
     w3_start = pd.to_datetime("2023-01-01")
-    w3_end = pd.to_datetime("2023-12-15")
+    w3_end = pd.to_datetime("2023-12-31")
     w2_start = pd.to_datetime("2024-01-01")
-    w2_end = pd.to_datetime("2024-12-15")
+    w2_end = pd.to_datetime("2024-12-31")
     w1_start = pd.to_datetime("2025-01-01")
-    w1_end = pd.to_datetime("2025-12-15")
+    w1_end = pd.Timestamp.now().normalize() - pd.Timedelta(days=1)
+    w1_end_str = w1_end.strftime("%Y-%m-%d")
 
     m_lock = "锁单数"
     m_eff = "有效线索数"
@@ -426,7 +427,7 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
 
         fig.add_trace(
             go.Scatter(
-                name=f"{name} 2025-01-01 至 2025-12-15 (MA7)",
+                name=f"{name} 2025-01-01 至 {w1_end_str} (MA7)",
                 x=x_vals,
                 y=s_w1.values,
                 mode="lines",
@@ -439,7 +440,7 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
         )
         fig.add_trace(
             go.Scatter(
-                name=f"{name} 2024-01-01 至 2024-12-15 (MA7)",
+                name=f"{name} 2024-01-01 至 2024-12-31 (MA7)",
                 x=x_vals,
                 y=s_w2.values,
                 mode="lines",
@@ -452,7 +453,7 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
         )
         fig.add_trace(
             go.Scatter(
-                name=f"{name} 2023-01-01 至 2023-12-15 (MA7)",
+                name=f"{name} 2023-01-01 至 2023-12-31 (MA7)",
                 x=x_vals,
                 y=s_w3.values,
                 mode="lines",
@@ -467,9 +468,9 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
 
         yaxis_name = "yaxis" + ("" if i == 1 else str(i))
         add_local_legend(yaxis_name, [
-            ("2025-01-01 至 2025-12-15 (MA7)", "#27AD00"), 
-            ("2024-01-01 至 2024-12-15 (MA7)", "#005783"),
-            ("2023-01-01 至 2023-12-15 (MA7)", "#A0A0A0")
+            (f"2025-01-01 至 {w1_end_str} (MA7)", "#27AD00"), 
+            ("2024-01-01 至 2024-12-31 (MA7)", "#005783"),
+            ("2023-01-01 至 2023-12-31 (MA7)", "#A0A0A0")
         ])
         
         # Calculate comparison means
@@ -632,7 +633,7 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
                 x=df_25_filtered[m_lock],
                 y=df_25_filtered["线索-锁单转化时长"],
                 mode="markers",
-                name="2025 (2025-01-01~2025-12-15)",
+                name=f"2025 (2025-01-01~{w1_end_str})",
                 marker=dict(color="#27AD00", size=6, opacity=0.6),
                 hovertemplate="锁单数: %{x}<br>转化时长: %{y:.2f}天<extra>2025</extra>"
             ),
@@ -643,7 +644,7 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
                 x=df_24_filtered[m_lock],
                 y=df_24_filtered["线索-锁单转化时长"],
                 mode="markers",
-                name="2024 (2024-01-01~2024-12-15)",
+                name="2024 (2024-01-01~2024-12-31)",
                 marker=dict(color="#005783", size=6, opacity=0.6),
                 hovertemplate="锁单数: %{x}<br>转化时长: %{y:.2f}天<extra>2024</extra>"
             ),
@@ -675,8 +676,8 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
 
         yaxis_name_scat = "yaxis" + str(idx_extra)
         add_local_legend(yaxis_name_scat, [
-            ("2025 (2025-01-01~2025-12-15)", "#27AD00"),
-            ("2024 (2024-01-01~2024-12-15)", "#005783"),
+            (f"2025 (2025-01-01~{w1_end_str})", "#27AD00"),
+            ("2024 (2024-01-01~2024-12-31)", "#005783"),
             ("整体趋势 (LOWESS)", "red")
         ])
         
@@ -691,7 +692,7 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
 
         header = ["窗口", "Pearson系数 (剔除>1000锁单 & >100天时长)", "Spearman系数 (剔除>1000锁单 & >100天时长)"]
         cells = [
-            ["2025 (2025-01-01 ~ 2025-12-15)", "2024 (2024-01-01 ~ 2024-12-15)"],
+            [f"2025 (2025-01-01 ~ {w1_end_str})", "2024 (2024-01-01 ~ 2024-12-31)"],
             [fmt_corr(p_25), fmt_corr(p_24)],
             [fmt_corr(s_25), fmt_corr(s_24)]
         ]
