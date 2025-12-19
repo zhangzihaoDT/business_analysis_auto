@@ -31,6 +31,7 @@ secrets.py
 # Scripts containing sensitive information
 export_cm2_configuration_data.py
 export_core_metrics_data.py
+export_analyze_lc2td.py
 automated_data_pipeline.py
 WORKFLOW_SUMMARY.md
 configuration_workflow.py
