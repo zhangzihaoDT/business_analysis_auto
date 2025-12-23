@@ -220,6 +220,7 @@ def export_view(view_path, output_file, format="csv", timeout=600, show_progress
             print(f"将尝试以下路径: {', '.join(paths_to_try)}")
         
         # 默认使用第一种格式
+        # 注意：不再自动去除查询参数，允许用户传递带参数的视图路径（如 view/sheet?param=value）
         tableau_path = paths_to_try[0]
     
     # 首先尝试原始路径
@@ -278,7 +279,7 @@ def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="Tableau数据导出工具")
     
-    parser.add_argument("--server", default="http://tableau.immotors.com", 
+    parser.add_argument("--server", default="https://tableau-hs.immotors.com", 
                         help="Tableau服务器URL")
     parser.add_argument("--username", default="analysis", 
                         help="Tableau用户名")
