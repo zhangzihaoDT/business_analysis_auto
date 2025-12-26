@@ -215,32 +215,63 @@ def main():
             "fields": overview_fields
         })
 
+    # --- 2.1 配置数据完整度 ---
+    completeness_elems = format_table_section(content, "配置数据完整度", "配置数据完整度", "✅")
+    if completeness_elems:
+        card_elements.append({"tag": "hr"})
+        card_elements.extend(completeness_elems)
+
     # --- 3. 激光雷达整体分布 ---
     laser_elems = format_table_section(content, "激光雷达 (OP-LASER) 整体分布", "激光雷达整体分布", "🎯")
     if laser_elems:
         card_elements.append({"tag": "hr"})
         card_elements.extend(laser_elems)
 
-    # --- 4. 分员工单分布 ---
-    staff_elems = format_table_section(content, "分员工单 (Is Staff) 激光雷达分布", "员工单分布", "👥")
+    # --- 4. 分员工单分布 (激光雷达) ---
+    staff_elems = format_table_section(content, "分员工单 (Is Staff) 激光雷达分布", "员工单激光雷达分布", "👥")
     if staff_elems:
         card_elements.append({"tag": "hr"})
         card_elements.extend(staff_elems)
         
-    # --- 5. 分车型分布 ---
+    # --- 5. 分车型分布 (激光雷达) ---
     # 标题可能是 "分车型 (Product Name) 高阶+Thor 分布"
-    # 我们需要找到包含 "分车型" 的标题
-    model_header = None
+    # 我们需要找到包含 "分车型" 且包含 "Thor" 的标题 (为了区分轮毂)
+    laser_model_header = None
     for line in lines:
-        if line.startswith("## 分车型"):
-            model_header = line.replace("## ", "").strip()
+        if line.startswith("## 分车型") and "Thor" in line:
+            laser_model_header = line.replace("## ", "").strip()
             break
             
-    if model_header:
-        model_elems = format_table_section(content, model_header, model_header, "🚗")
+    if laser_model_header:
+        model_elems = format_table_section(content, laser_model_header, laser_model_header, "🚗")
         if model_elems:
             card_elements.append({"tag": "hr"})
             card_elements.extend(model_elems)
+
+    # --- 6. 轮毂 (WHEEL) 整体分布 ---
+    wheel_elems = format_table_section(content, "轮毂 (WHEEL) 整体分布", "轮毂整体分布", "🛞")
+    if wheel_elems:
+        card_elements.append({"tag": "hr"})
+        card_elements.extend(wheel_elems)
+
+    # --- 7. 分员工单分布 (轮毂) ---
+    wheel_staff_elems = format_table_section(content, "分员工单 (Is Staff) 轮毂分布", "员工单轮毂分布", "👥")
+    if wheel_staff_elems:
+        card_elements.append({"tag": "hr"})
+        card_elements.extend(wheel_staff_elems)
+
+    # --- 8. 分车型分布 (轮毂) ---
+    wheel_model_header = None
+    for line in lines:
+        if line.startswith("## 分车型") and "轮毂" in line:
+            wheel_model_header = line.replace("## ", "").strip()
+            break
+    
+    if wheel_model_header:
+        wheel_model_elems = format_table_section(content, wheel_model_header, wheel_model_header, "🚗")
+        if wheel_model_elems:
+            card_elements.append({"tag": "hr"})
+            card_elements.extend(wheel_model_elems)
 
     # 底部
     card_elements.append({"tag": "hr"})

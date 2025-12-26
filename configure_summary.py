@@ -148,6 +148,45 @@ def analyze_configuration(model):
         print(f"   - 员工单: {staff_locked}")
         print(f"   - 非员工: {non_staff_locked}")
     print(f"🚚 交付总数: {total_delivered}")
+
+    # ---------------------------------------------------------
+    # 数据完整度检查
+    # ---------------------------------------------------------
+    print("\n--- 配置数据完整度检查 (基于锁单) ---")
+    
+    # 定义关注的配置列
+    # 排除非配置列和系统列
+    exclude_cols = ['order_number', 'lock_time', 'invoice_time', 'Is Staff', 'lock_time_dt', '开票价格', 'Product Name', 'Product_Types']
+    # 动态获取潜在配置列
+    potential_config_cols = [c for c in locked_df.columns if c not in exclude_cols]
+    
+    # 优先展示常见配置
+    priority_cols = ['EXCOLOR', 'INCOLOR', 'WHEEL', 'OP-LASER']
+    # 剩余的列
+    other_cols = [c for c in potential_config_cols if c not in priority_cols]
+    # 合并列表
+    target_cols = [c for c in priority_cols if c in locked_df.columns] + sorted(other_cols)
+
+    completeness_data = []
+    for col in target_cols:
+        non_null_count = locked_df[col].count()
+        completeness_rate = (non_null_count / total_locked) * 100 if total_locked > 0 else 0
+        completeness_data.append({
+            '配置项': col,
+            '有效数据量': non_null_count,
+            '完整度': f"{completeness_rate:.1f}%"
+        })
+    
+    df_completeness = pd.DataFrame(completeness_data)
+    if not df_completeness.empty:
+        print(df_completeness.to_string(index=False))
+        
+        report_lines.append("### 配置数据完整度")
+        report_lines.append(df_completeness.to_markdown(index=False))
+        report_lines.append("")
+    else:
+        print("未检测到配置列。")
+
     
     # ---------------------------------------------------------
     # 模块二：激光雷达 (OP-LASER) 配置情况
@@ -240,6 +279,85 @@ def analyze_configuration(model):
     else:
         print("⚠️ 数据中缺少 'OP-LASER' 列，无法分析激光雷达配置。")
         report_lines.append("⚠️ 数据中缺少 'OP-LASER' 列，无法分析激光雷达配置。")
+
+    # ---------------------------------------------------------
+    # 模块三：轮毂 (WHEEL) 配置情况
+    # ---------------------------------------------------------
+    print("\n" + "="*50)
+    print(f"模块三：{model} 轮毂 (WHEEL) 配置情况")
+    print("="*50)
+
+    if 'WHEEL' in df.columns:
+        # 1. 整体分布
+        print(f"\n--- {model} 整体 WHEEL 分布 (基于锁单) ---")
+        wheel_counts = locked_df['WHEEL'].value_counts(dropna=False)
+        wheel_percentages = locked_df['WHEEL'].value_counts(normalize=True, dropna=False) * 100
+        
+        df_wheel_summary = pd.DataFrame({
+            'WHEEL': wheel_counts.index,
+            'Count': wheel_counts.values,
+            'Percentage': wheel_percentages.values
+        })
+        # 格式化百分比
+        df_wheel_summary['Percentage'] = df_wheel_summary['Percentage'].apply(lambda x: f"{x:.1f}%")
+        
+        print(df_wheel_summary.to_string(index=False))
+        
+        # 添加到报告
+        report_lines.append("## 轮毂 (WHEEL) 整体分布")
+        report_lines.append(df_wheel_summary.to_markdown(index=False))
+        report_lines.append("")
+
+        # 2. 分 Is Staff 的 WHEEL 分布
+        if has_staff_info:
+            print(f"\n--- 分 [Is Staff] 的 WHEEL 分布 ---")
+            
+            # 使用 pivot table 展示
+            wheel_staff_pivot = pd.pivot_table(
+                locked_df, 
+                index=['WHEEL'], 
+                columns='Is Staff', 
+                values='order_number', 
+                aggfunc='count', 
+                fill_value=0,
+                margins=True,
+                margins_name='Total'
+            )
+            print(wheel_staff_pivot)
+            
+            # 添加到报告
+            report_lines.append("## 分员工单 (Is Staff) 轮毂分布")
+            # 重置索引以便在 markdown 中显示 WHEEL 列
+            wheel_staff_pivot_md = wheel_staff_pivot.reset_index()
+            report_lines.append(wheel_staff_pivot_md.to_markdown(index=False))
+            report_lines.append("")
+
+        # 3. 分 Product Name 的 WHEEL 分布
+        if 'Product Name' in df.columns:
+            print(f"\n--- 分 [Product Name] 的 WHEEL 分布 ---")
+            
+            wheel_product_pivot = pd.pivot_table(
+                locked_df,
+                index=['WHEEL'],
+                columns='Product Name',
+                values='order_number',
+                aggfunc='count',
+                fill_value=0,
+                margins=True,
+                margins_name='Total'
+            )
+            # 计算百分比显示可能比较复杂，这里先只展示数量，或者计算行百分比
+            print(wheel_product_pivot)
+
+            # 添加到报告
+            report_lines.append("## 分车型 (Product Name) 轮毂分布")
+            wheel_product_pivot_md = wheel_product_pivot.reset_index()
+            report_lines.append(wheel_product_pivot_md.to_markdown(index=False))
+            report_lines.append("")
+
+    else:
+        print("⚠️ 数据中缺少 'WHEEL' 列，无法分析轮毂配置。")
+        report_lines.append("⚠️ 数据中缺少 'WHEEL' 列，无法分析轮毂配置。")
 
     # ---------------------------------------------------------
     # 保存报告

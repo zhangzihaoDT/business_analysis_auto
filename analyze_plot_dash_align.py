@@ -408,12 +408,28 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
     summary_rate_metrics = {"7日线索转化率", "30日线索转化率"}
     summary_rows = []
 
-    # Comparison ranges
+    # Dynamic comparison ranges based on w1_end
+    # Range 4: Current Month MTD
+    curr_m_start = w1_end.replace(day=1)
+    curr_m_end = w1_end
+    
+    # Range 3: Previous Month Same Days
+    prev_m_end = w1_end - pd.DateOffset(months=1)
+    prev_m_start = prev_m_end.replace(day=1)
+    
+    # Range 2: Last Year Same Month MTD
+    last_y_end = w1_end - pd.DateOffset(years=1)
+    last_y_start = last_y_end.replace(day=1)
+    
+    # Range 1: Two Years Ago Same Month MTD
+    two_y_end = w1_end - pd.DateOffset(years=2)
+    two_y_start = two_y_end.replace(day=1)
+    
     comp_ranges = [
-        ("2023-12-01～2023-12-15", pd.to_datetime("2023-12-01"), pd.to_datetime("2023-12-15")),
-        ("2024-12-01～2024-12-15", pd.to_datetime("2024-12-01"), pd.to_datetime("2024-12-15")),
-        ("2025-11-01～2025-11-15", pd.to_datetime("2025-11-01"), pd.to_datetime("2025-11-15")),
-        ("2025-12-01～2025-12-15", pd.to_datetime("2025-12-01"), pd.to_datetime("2025-12-15")),
+        (f"{two_y_start.strftime('%Y-%m-%d')}～{two_y_end.strftime('%Y-%m-%d')}", two_y_start, two_y_end),
+        (f"{last_y_start.strftime('%Y-%m-%d')}～{last_y_end.strftime('%Y-%m-%d')}", last_y_start, last_y_end),
+        (f"{prev_m_start.strftime('%Y-%m-%d')}～{prev_m_end.strftime('%Y-%m-%d')}", prev_m_start, prev_m_end),
+        (f"{curr_m_start.strftime('%Y-%m-%d')}～{curr_m_end.strftime('%Y-%m-%d')}", curr_m_start, curr_m_end),
     ]
 
     x_vals = list(range(0, 366))
@@ -712,7 +728,7 @@ def make_alignment_chart(df: pd.DataFrame) -> go.Figure:
         summary_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
     fig.update_layout(
-        title="两个窗口按第N天对齐的指标对比",
+        title=f"两个窗口按第N天对齐的指标对比 (观察时间: {w1_end_str}, 当年第 {w1_end.dayofyear} 天)",
         legend_title="窗口",
         height=5600,
         margin=dict(l=40, r=40, t=60, b=80),

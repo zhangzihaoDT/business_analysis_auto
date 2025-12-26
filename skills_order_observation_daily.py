@@ -23,9 +23,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # 配置常量
-PARQUET_FILE = "/Users/zihao_/Documents/coding/dataset/formatted/intention_order_analysis.parquet"
+PARQUET_FILE = "/Users/zihao_/Documents/coding/dataset/formatted/order_full_data.parquet"
 BUSINESS_DEF_FILE = "/Users/zihao_/Documents/github/W35_workflow/business_definition.json"
-TARGET_MODELS = ["CM2", "DM1", "LS9"]
+# 适配新数据集的 series 值：CM2->LS6, DM1->L6
+TARGET_MODELS = ["LS6", "L6", "LS9"]
 WEBHOOK_URL = os.getenv("FS_WEBHOOK_URL")
 
 def parse_arguments():
@@ -110,7 +111,8 @@ def analyze_daily_lock_orders(df, start_date, end_date):
                 product_to_capacity[product] = capacity
 
     # 确保必要的列存在
-    required_columns = ['Lock_Time', 'Order Number', '车型分组', 'Product Name']
+    # 更新为新数据集的列名
+    required_columns = ['lock_time', 'order_number', 'series', 'product_name']
     for col in required_columns:
         if col not in df.columns:
             print(f"❌ 错误: 数据缺失列 {col}")
@@ -118,35 +120,35 @@ def analyze_daily_lock_orders(df, start_date, end_date):
 
     # 数据预处理
     df_copy = df.copy()
-    df_copy['Lock_Time'] = pd.to_datetime(df_copy['Lock_Time'], errors='coerce').dt.date
+    df_copy['lock_time'] = pd.to_datetime(df_copy['lock_time'], errors='coerce').dt.date
     
     # 筛选目标日期范围的锁单数据
     daily_orders = df_copy[
-        (df_copy['Lock_Time'] >= start_date) & 
-        (df_copy['Lock_Time'] <= end_date)
+        (df_copy['lock_time'] >= start_date) & 
+        (df_copy['lock_time'] <= end_date)
     ]
     
-    # 1. 计算总锁单数 (基于 Order Number 去重)
-    total_lock_count = daily_orders['Order Number'].nunique()
+    # 1. 计算总锁单数 (基于 order_number 去重)
+    total_lock_count = daily_orders['order_number'].nunique()
     
     # 2. 分车型统计
     model_stats = {}
     for model in TARGET_MODELS:
-        model_df = daily_orders[daily_orders['车型分组'] == model]
-        count = model_df['Order Number'].nunique()
+        model_df = daily_orders[daily_orders['series'] == model]
+        count = model_df['order_number'].nunique()
         
         stats = {"count": count}
         
-        # 对 CM2 和 LS9 进行电池容量细分
-        if model in ["CM2", "LS9"]:
+        # 对 LS6 (原CM2) 和 LS9 进行电池容量细分
+        if model in ["LS6", "LS9"]:
             capacity_counts = {"52kwh": 0, "66kwh": 0}
             # 只有当 product_to_capacity 存在时才进行细分
             if product_to_capacity:
-                # 获取去重后的订单号及其对应的 Product Name
-                unique_orders = model_df[['Order Number', 'Product Name']].drop_duplicates('Order Number')
+                # 获取去重后的订单号及其对应的 product_name
+                unique_orders = model_df[['order_number', 'product_name']].drop_duplicates('order_number')
                 
                 for _, row in unique_orders.iterrows():
-                    p_name = row['Product Name']
+                    p_name = row['product_name']
                     cap = product_to_capacity.get(p_name)
                     if cap in ["52kwh", "66kwh"]:
                         capacity_counts[cap] += 1
@@ -162,15 +164,16 @@ def analyze_daily_lock_orders(df, start_date, end_date):
         "models": model_stats
     }
 
-def analyze_daily_delivery_orders(df, start_date, end_date):
+def analyze_daily_invoice_orders(df, start_date, end_date):
     """
-    分析交付数据 (基于 Invoice_Upload_Time)
+    分析开票数据 (基于 Invoice_Upload_Time)
     定义：有 Invoice_Upload_Time 且有 Lock_Time 的 Order Number 数
     """
-    print(f"正在分析 {start_date} 至 {end_date} 的交付数据...")
+    print(f"正在分析 {start_date} 至 {end_date} 的开票数据...")
     
     # 确保必要的列存在
-    required_columns = ['Invoice_Upload_Time', 'Lock_Time', 'Order Number', '车型分组']
+    # 更新为新数据集的列名
+    required_columns = ['invoice_upload_time', 'lock_time', 'order_number', 'series', 'invoice_amount']
     for col in required_columns:
         if col not in df.columns:
             print(f"❌ 错误: 数据缺失列 {col}")
@@ -178,34 +181,34 @@ def analyze_daily_delivery_orders(df, start_date, end_date):
 
     # 数据预处理
     df_copy = df.copy()
-    df_copy['Invoice_Upload_Time'] = pd.to_datetime(df_copy['Invoice_Upload_Time'], errors='coerce').dt.date
+    df_copy['invoice_upload_time'] = pd.to_datetime(df_copy['invoice_upload_time'], errors='coerce').dt.date
     
     # 筛选条件：
-    # 1. Invoice_Upload_Time 在目标日期范围内
-    # 2. Lock_Time 不为空 (题目要求：有 Invoice_Upload_Time 且有 Lock_Time)
-    delivery_orders = df_copy[
-        (df_copy['Invoice_Upload_Time'] >= start_date) & 
-        (df_copy['Invoice_Upload_Time'] <= end_date) &
-        (df_copy['Lock_Time'].notna())
+    # 1. invoice_upload_time 在目标日期范围内
+    # 2. lock_time 不为空 (题目要求：有 invoice_upload_time 且有 lock_time)
+    invoice_orders = df_copy[
+        (df_copy['invoice_upload_time'] >= start_date) & 
+        (df_copy['invoice_upload_time'] <= end_date) &
+        (df_copy['lock_time'].notna())
     ]
     
-    # 1. 计算总交付数 (基于 Order Number 去重)
-    total_delivery_count = delivery_orders['Order Number'].nunique()
+    # 1. 计算总开票数 (基于 order_number 去重)
+    total_invoice_count = invoice_orders['order_number'].nunique()
     
     # 2. 分车型统计
-    model_stats = {}
+    model_invoice_stats = {}
     for model in TARGET_MODELS:
-        model_df = delivery_orders[delivery_orders['车型分组'] == model]
-        count = model_df['Order Number'].nunique()
+        model_df = invoice_orders[invoice_orders['series'] == model]
+        count = model_df['order_number'].nunique()
         
         # 计算该车型的平均开票价格
         model_valid_prices = model_df[
-            (model_df['开票价格'].notna()) & 
-            (model_df['开票价格'] > 0)
-        ]['开票价格']
+            (model_df['invoice_amount'].notna()) & 
+            (model_df['invoice_amount'] > 0)
+        ]['invoice_amount']
         avg_price = model_valid_prices.mean() if not model_valid_prices.empty else 0
         
-        model_stats[model] = {
+        model_invoice_stats[model] = {
             "count": count,
             "avg_price": avg_price
         }
@@ -213,11 +216,11 @@ def analyze_daily_delivery_orders(df, start_date, end_date):
     return {
         "start_date": start_date,
         "end_date": end_date,
-        "total": total_delivery_count,
-        "models": model_stats
+        "total": total_invoice_count,
+        "models": model_invoice_stats
     }
 
-def send_feishu_notification(lock_stats, delivery_stats):
+def send_feishu_notification(lock_stats, invoice_stats):
     """发送飞书通知"""
     if not WEBHOOK_URL:
         print("❌ 错误: 未设置 FS_WEBHOOK_URL 环境变量，跳过发送消息")
@@ -230,12 +233,12 @@ def send_feishu_notification(lock_stats, delivery_stats):
         date_str = str(start_date)
         title_prefix = "每日"
         lock_label = "昨日锁单数"
-        delivery_label = "昨日交付数"
+        invoice_label = "昨日开票数"
     else:
         date_str = f"{start_date} ~ {end_date}"
         title_prefix = "阶段性"
         lock_label = "期间锁单数"
-        delivery_label = "期间交付数"
+        invoice_label = "期间开票数"
 
     # 构建锁单明细文本
     lock_model_details = []
@@ -254,12 +257,12 @@ def send_feishu_notification(lock_stats, delivery_stats):
         lock_model_details.append(f"- {model}: {count} 单{detail_str}")
     lock_model_text = "\n".join(lock_model_details)
 
-    # 构建交付明细文本
-    delivery_model_details = []
-    for model, info in delivery_stats['models'].items():
+    # 构建开票明细文本
+    invoice_model_details = []
+    for model, info in invoice_stats['models'].items():
         price_str = f"{info['avg_price']/10000:.1f}w" if info['avg_price'] > 0 else "N/A"
-        delivery_model_details.append(f"- {model}: {info['count']} 台｜平均开票价格：{price_str}")
-    delivery_model_text = "\n".join(delivery_model_details)
+        invoice_model_details.append(f"- {model}: {info['count']} 台｜平均开票价格：{price_str}")
+    invoice_model_text = "\n".join(invoice_model_details)
 
     # 构建卡片内容
     card_content = {
@@ -287,7 +290,7 @@ def send_feishu_notification(lock_stats, delivery_stats):
                     "tag": "div",
                     "text": {
                         "tag": "lark_md",
-                        "content": f"**{delivery_label}：** {delivery_stats['total']} 台\n{delivery_model_text}"
+                        "content": f"**{invoice_label}：** {invoice_stats['total']} 台\n{invoice_model_text}"
                     }
                 },
                 {
@@ -328,9 +331,9 @@ def main():
 
     # 2. 分析数据
     lock_stats = analyze_daily_lock_orders(df, start_date, end_date)
-    delivery_stats = analyze_daily_delivery_orders(df, start_date, end_date)
+    invoice_stats = analyze_daily_invoice_orders(df, start_date, end_date)
     
-    if lock_stats and delivery_stats:
+    if lock_stats and invoice_stats:
         # 打印结果到控制台
         print("\n" + "="*30)
         if start_date == end_date:
@@ -356,15 +359,15 @@ def main():
             
         print("-" * 30)
         
-        print(f"🚚 总交付数: {delivery_stats['total']} 台")
-        print("   车型分布:")
-        for model, info in delivery_stats['models'].items():
+        print(f"🚚 总开票数: {invoice_stats['total']} 台")
+        print("   车型分布 (开票):")
+        for model, info in invoice_stats['models'].items():
             price_display = f"{info['avg_price']/10000:.1f}w" if info['avg_price'] > 0 else "N/A"
             print(f"   - {model}: {info['count']} 台｜平均开票价格：{price_display}")
         print("="*30 + "\n")
 
         # 3. 发送飞书通知
-        send_feishu_notification(lock_stats, delivery_stats)
+        send_feishu_notification(lock_stats, invoice_stats)
 
 if __name__ == "__main__":
     main()

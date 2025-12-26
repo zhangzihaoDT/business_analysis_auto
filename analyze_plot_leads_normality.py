@@ -1,3 +1,11 @@
+"""
+该脚本用于分析日线索量数据的正态性。
+主要功能包括：
+1. 加载最新的处理后线索 CSV 文件。
+2. 计算日线索量的统计指标（均值、标准差、偏度、峰度）。
+3. 进行正态性检验（Shapiro-Wilk, D'Agostino's K^2, Kolmogorov-Smirnov）。
+4. 生成 Plotly 可视化报告，包含直方图、正态拟合曲线和 Q-Q 图。
+"""
 import argparse
 import os
 from pathlib import Path

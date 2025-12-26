@@ -35,6 +35,7 @@ export_analyze_lc2td.py
 automated_data_pipeline.py
 WORKFLOW_SUMMARY.md
 configuration_workflow.py
+order_update_and_process.py
 
 # Virtual environments
 venv/
