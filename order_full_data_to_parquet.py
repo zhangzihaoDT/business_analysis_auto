@@ -69,6 +69,10 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
     # 去除前后空格
     df.columns = df.columns.str.strip()
     
+    # 预处理：统一将 'xxx_年/月/日' 格式转换为 'xxx 年/月/日'，以匹配下方的映射表
+    # 这样可以兼容下划线和空格两种分隔符
+    df.columns = df.columns.str.replace('_年/月/日', ' 年/月/日', regex=False)
+
     # 重命名映射表（根据之前的分析报告）
     rename_map = {
         'first_touch_time 年/月/日': 'first_touch_time',
@@ -82,6 +86,8 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
         'lock_time 年/月/日': 'lock_time',
         'order_create_time 年/月/日': 'order_create_date', # 区分 order_create_time
         'store_create_date 年/月/日': 'store_create_date',
+        'approve_refund_time 年/月/日': 'approve_refund_time',
+        'apply_refund_time 年/月/日': 'apply_refund_time',
         'Td CountD': 'td_countd',
         'Drive Series Cn': 'drive_series_cn',
         'Main Lead Id': 'main_lead_id',
@@ -107,7 +113,8 @@ def convert_types(df: pd.DataFrame) -> pd.DataFrame:
         'first_touch_time', 'delivery_date', 'deposit_payment_time', 
         'deposit_refund_time', 'first_test_drive_time', 'intention_payment_time', 
         'intention_refund_time', 'invoice_upload_time', 'lock_time', 
-        'order_create_date', 'store_create_date', 'order_create_time'
+        'order_create_date', 'store_create_date', 'order_create_time',
+        'approve_refund_time', 'apply_refund_time'
     ]
     
     for col in date_cols:
@@ -184,10 +191,41 @@ def main():
             df_existing = pd.read_parquet(OUTPUT_FILE)
             print(f"   现有数据: {df_existing.shape[0]} 行")
 
+            # 修复：重命名旧数据中的未清洗列名 (防止 duplicate columns)
+            legacy_map = {
+                'approve_refund_time_年/月/日': 'approve_refund_time',
+                'apply_refund_time_年/月/日': 'apply_refund_time',
+                'approve_refund_time 年/月/日': 'approve_refund_time', # 增加空格版本以防万一
+                'apply_refund_time 年/月/日': 'apply_refund_time'
+            }
+            
+            for old_col, new_col in legacy_map.items():
+                if old_col in df_existing.columns:
+                    print(f"   🧹 处理旧数据列: {old_col} -> {new_col}")
+                    
+                    # 1. 先转换类型 (如果是字符串)
+                    if df_existing[old_col].dtype == 'object':
+                         try:
+                             s = df_existing[old_col].astype(str)
+                             s = s.str.replace('年', '-', regex=False).str.replace('月', '-', regex=False).str.replace('日', '', regex=False)
+                             s = s.replace({'nan': None, 'None': None, '': None})
+                             df_existing[old_col] = pd.to_datetime(s, errors='coerce')
+                         except Exception as e:
+                             print(f"      ⚠️ 转换失败: {e}")
+
+                    # 2. 合并或重命名
+                    if new_col in df_existing.columns:
+                        # 如果目标列已存在，合并 (优先保留目标列的值，填充 NaNs)
+                        df_existing[new_col] = df_existing[new_col].combine_first(df_existing[old_col])
+                        df_existing = df_existing.drop(columns=[old_col])
+                    else:
+                        # 直接重命名
+                        df_existing = df_existing.rename(columns={old_col: new_col})
+
             # 修复：移除冗余的 order_create_time 列（如果存在，且与 order_create_date 重复或新数据无此列）
-            if 'order_create_time' in df_existing.columns:
-                print("   🧹 清理冗余列 'order_create_time' 以保持结构一致...")
-                df_existing = df_existing.drop(columns=['order_create_time'])
+            # if 'order_create_time' in df_existing.columns:
+            #    print("   🧹 清理冗余列 'order_create_time' 以保持结构一致...")
+            #    df_existing = df_existing.drop(columns=['order_create_time'])
             
             # 确保列结构一致
             common_cols = list(set(df_existing.columns) & set(df_new.columns))

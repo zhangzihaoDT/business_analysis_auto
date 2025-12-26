@@ -24,7 +24,7 @@ load_dotenv()
 
 # 配置常量
 PARQUET_FILE = "/Users/zihao_/Documents/coding/dataset/formatted/order_full_data.parquet"
-BUSINESS_DEF_FILE = "/Users/zihao_/Documents/github/W35_workflow/business_definition.json"
+BUSINESS_DEF_FILE = "/Users/zihao_/Documents/github/W52_reasoning/world/business_definition.json"
 # 适配新数据集的 series 值：CM2->LS6, DM1->L6
 TARGET_MODELS = ["LS6", "L6", "LS9"]
 WEBHOOK_URL = os.getenv("FS_WEBHOOK_URL")
