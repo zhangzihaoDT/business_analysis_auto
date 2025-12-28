@@ -558,18 +558,33 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
     try:
         # Prepare data
         df_store = df.copy()
-        df_store['order_create_time'] = pd.to_datetime(df_store['order_create_time'], errors='coerce')
+        
+        # Priority: order_create_date > order_create_time
+        # Use order_create_date if available and valid
+        if 'order_create_date' in df_store.columns:
+             df_store['order_create_date'] = pd.to_datetime(df_store['order_create_date'], errors='coerce')
+             df_store['date'] = df_store['order_create_date']
+        
+        # Fallback to order_create_time if date is missing
+        if 'order_create_time' in df_store.columns:
+             df_store['order_create_time'] = pd.to_datetime(df_store['order_create_time'], errors='coerce')
+             if 'date' not in df_store.columns:
+                 df_store['date'] = df_store['order_create_time'].dt.floor('D')
+             else:
+                 # Fill NaT in date with time
+                 df_store['date'] = df_store['date'].fillna(df_store['order_create_time'].dt.floor('D'))
+
         df_store['store_create_date'] = pd.to_datetime(df_store['store_create_date'], errors='coerce')
         
-        # Valid records only
-        df_store = df_store.dropna(subset=['store_name', 'order_create_time'])
+        # Valid records only (must have store_name and a valid date)
+        df_store = df_store.dropna(subset=['store_name', 'date'])
         
         if not df_store.empty:
             # 1. Store Opening Dates (Min per store)
             open_map = df_store.groupby('store_name')['store_create_date'].min()
             
             # 2. Daily Orders per Store
-            df_store['date'] = df_store['order_create_time'].dt.floor('D')
+            # Date is already prepared above
             daily_counts = df_store.groupby(['date', 'store_name']).size().unstack(fill_value=0)
             
             # Full date range
@@ -660,6 +675,150 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
         
     except Exception as e:
         print(f"Error calculating daily invoice price: {e}")
+
+    # 15. Module 5: Lead Conversion Rate (线索转化率)
+    try:
+        assign_file = Path("original/assign_data.csv")
+        if assign_file.exists():
+            # Try loading with utf-16 (from check script)
+            try:
+                df_assign = pd.read_csv(assign_file, sep='\t', encoding='utf-16')
+            except:
+                # Fallback to gbk or utf-8 if needed
+                try:
+                    df_assign = pd.read_csv(assign_file, sep='\t', encoding='gbk')
+                except:
+                    df_assign = pd.read_csv(assign_file, sep='\t', encoding='utf-8')
+
+            # Ensure columns exist
+            required_cols = ['Assign Time 年/月/日', '下发线索数', '下发线索当日试驾数', 
+                             '下发线索 7 日试驾数', '下发线索 7 日锁单数', 
+                             '下发线索 30日试驾数', '下发线索 30 日锁单数', '下发门店数']
+            
+            if all(col in df_assign.columns for col in required_cols):
+                # Parse date
+                df_assign['date'] = pd.to_datetime(df_assign['Assign Time 年/月/日'], format='%Y年%m月%d日', errors='coerce')
+                df_assign = df_assign.dropna(subset=['date'])
+                
+                module5_stats = {}
+                
+                for year in [2024, 2025]:
+                    df_year = df_assign[df_assign['date'].dt.year == year].copy()
+                    
+                    if df_year.empty:
+                        # Ensure structure exists even if empty
+                        module5_stats[year] = None
+                        continue
+                        
+                    stats = {}
+                    
+                    # 1. Total Leads
+                    total_leads = df_year['下发线索数'].sum()
+                    stats['total_leads'] = total_leads
+                    
+                    # Helper for rates
+                    def calc_rate(col_num, col_denom):
+                        sum_num = df_year[col_num].sum()
+                        sum_denom = df_year[col_denom].sum()
+                        return sum_num / sum_denom if sum_denom > 0 else 0.0
+                    
+                    # 2. Rates
+                    stats['rate_same_day_test_drive'] = calc_rate('下发线索当日试驾数', '下发线索数')
+                    stats['rate_7d_test_drive'] = calc_rate('下发线索 7 日试驾数', '下发线索数')
+                    stats['rate_7d_lock'] = calc_rate('下发线索 7 日锁单数', '下发线索数')
+                    stats['rate_30d_test_drive'] = calc_rate('下发线索 30日试驾数', '下发线索数')
+                    stats['rate_30d_lock'] = calc_rate('下发线索 30 日锁单数', '下发线索数')
+                    
+                    # 3. Store Avg Daily Leads
+                    # Calculate daily leads/store then mean
+                    # Handle 0 stores
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        df_year['daily_leads_per_store'] = df_year['下发线索数'] / df_year['下发门店数']
+                        df_year['daily_leads_per_store'] = df_year['daily_leads_per_store'].replace([np.inf, -np.inf], np.nan)
+                        
+                    stats['avg_daily_leads_per_store'] = df_year['daily_leads_per_store'].mean()
+                    
+                    module5_stats[year] = stats
+                    
+                metrics['module5_stats'] = module5_stats
+                
+                # Save daily series for Module 5.1
+                # Keep relevant columns
+                cols_to_keep = ['date', '下发线索数', '下发线索 30日试驾数', '下发线索 30 日锁单数']
+                df_daily_leads = df_assign[cols_to_keep].copy()
+                df_daily_leads = df_daily_leads.rename(columns={
+                    '下发线索数': 'leads_count',
+                    '下发线索 30日试驾数': 'test_drive_30d',
+                    '下发线索 30 日锁单数': 'lock_30d'
+                })
+                # Ensure date is index for easier plotting
+                df_daily_leads = df_daily_leads.set_index('date').sort_index()
+                metrics['module5_daily_series'] = df_daily_leads
+                
+    except Exception as e:
+        print(f"Error calculating Module 5 stats: {e}")
+
+    # 16. Module 6: Test Drive Analysis (试驾分析)
+    try:
+        td_file = Path("original/test_drive_data.csv")
+        if td_file.exists():
+            # Try loading with utf-16 (confirmed by check script)
+            try:
+                df_td = pd.read_csv(td_file, sep='\t', encoding='utf-16')
+            except:
+                try:
+                    df_td = pd.read_csv(td_file, sep='\t', encoding='gbk')
+                except:
+                    df_td = pd.read_csv(td_file, sep='\t', encoding='utf-8')
+                    
+            # Check columns
+            required_cols = ['create_date 年/月/日', '有效试驾数', 'L6有效试驾数', 'LS6有效试驾数', 'LS9有效试驾数', '试驾门店数']
+            if all(col in df_td.columns for col in required_cols):
+                # Parse date
+                df_td['date'] = pd.to_datetime(df_td['create_date 年/月/日'], format='%Y年%m月%d日', errors='coerce')
+                df_td = df_td.dropna(subset=['date'])
+                
+                module6_stats = {}
+                
+                for year in [2024, 2025]:
+                    df_year = df_td[df_td['date'].dt.year == year].copy()
+                    
+                    if df_year.empty:
+                        module6_stats[year] = None
+                        continue
+                        
+                    stats = {}
+                    
+                    # 1. Total Valid Test Drives
+                    stats['total_valid_td'] = df_year['有效试驾数'].sum()
+                    stats['total_L6_td'] = df_year['L6有效试驾数'].sum()
+                    stats['total_LS6_td'] = df_year['LS6有效试驾数'].sum()
+                    stats['total_LS9_td'] = df_year['LS9有效试驾数'].sum()
+                    
+                    # 2. Store Daily Avg Test Drives
+                    # Mean of (Daily Valid Test Drives / Daily Stores)
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        df_year['daily_avg_per_store'] = df_year['有效试驾数'] / df_year['试驾门店数']
+                        df_year['daily_avg_L6'] = df_year['L6有效试驾数'] / df_year['试驾门店数']
+                        df_year['daily_avg_LS6'] = df_year['LS6有效试驾数'] / df_year['试驾门店数']
+                        
+                        df_year['daily_avg_per_store'] = df_year['daily_avg_per_store'].replace([np.inf, -np.inf], np.nan)
+                        df_year['daily_avg_L6'] = df_year['daily_avg_L6'].replace([np.inf, -np.inf], np.nan)
+                        df_year['daily_avg_LS6'] = df_year['daily_avg_LS6'].replace([np.inf, -np.inf], np.nan)
+                        
+                    stats['store_daily_avg'] = df_year['daily_avg_per_store'].mean()
+                    
+                    # Store series data for Module 6.1
+                    series_data = df_year[['date', 'daily_avg_per_store', 'daily_avg_L6', 'daily_avg_LS6']].copy()
+                    series_data = series_data.set_index('date').sort_index()
+                    stats['daily_series'] = series_data
+                    
+                    module6_stats[year] = stats
+                    
+                metrics['module6_stats'] = module6_stats
+                
+    except Exception as e:
+        print(f"Error calculating Module 6 stats: {e}")
 
     return metrics
 
@@ -1959,6 +2118,316 @@ def generate_html(metrics: dict, output_file: Path):
         
         chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
         html_content.append(chart_html)
+
+    # 5. Module 5: Lead Conversion Rate (线索转化率)
+    if 'module5_stats' in metrics:
+        m5_stats = metrics['module5_stats']
+        html_content.append("<h2>5. 线索转化率分析 (Lead Conversion Analysis)</h2>")
+        
+        # Build Table
+        # (Label, Key, FormatType)
+        # FormatType: 'int', 'percent', 'float'
+        row_configs = [
+            ("下发线索数 (Total Leads)", 'total_leads', 'int'),
+            ("当日试驾率 (Same-day Test Drive Rate)", 'rate_same_day_test_drive', 'percent'),
+            ("7日试驾率 (7-day Test Drive Rate)", 'rate_7d_test_drive', 'percent'),
+            ("7日锁单率 (7-day Lock Rate)", 'rate_7d_lock', 'percent'),
+            ("30日试驾率 (30-day Test Drive Rate)", 'rate_30d_test_drive', 'percent'),
+            ("30日锁单率 (30-day Lock Rate)", 'rate_30d_lock', 'percent'),
+            ("店日均下发线索数 (Avg Daily Leads per Store)", 'avg_daily_leads_per_store', 'float')
+        ]
+        
+        tbody_html = ""
+        
+        for label, key, fmt in row_configs:
+            # Get values safely
+            stats_2024 = m5_stats.get(2024)
+            stats_2025 = m5_stats.get(2025)
+            
+            v2024 = stats_2024.get(key, 0) if stats_2024 else 0
+            v2025 = stats_2025.get(key, 0) if stats_2025 else 0
+            
+            # Calculate Diff and Ratio (YoY)
+            diff = v2025 - v2024
+            
+            if v2024 != 0:
+                ratio = (v2025 - v2024) / v2024
+            else:
+                ratio = np.nan
+            
+            # Formatting
+            if fmt == 'int':
+                v24_str = f"{v2024:,.0f}"
+                v25_str = f"{v2025:,.0f}"
+                diff_str = f"{diff:+,.0f}"
+                ratio_str = f"{ratio:+.1%}" if not pd.isna(ratio) else "-"
+            elif fmt == 'percent':
+                v24_str = f"{v2024:.1%}"
+                v25_str = f"{v2025:.1%}"
+                diff_str = f"{diff:+.1%}" 
+                ratio_str = f"{ratio:+.1%}" if not pd.isna(ratio) else "-"
+            elif fmt == 'float':
+                v24_str = f"{v2024:.2f}"
+                v25_str = f"{v2025:.2f}"
+                diff_str = f"{diff:+.2f}"
+                ratio_str = f"{ratio:+.1%}" if not pd.isna(ratio) else "-"
+            else:
+                v24_str = str(v2024)
+                v25_str = str(v2025)
+                diff_str = str(diff)
+                ratio_str = str(ratio)
+                
+            # Colors
+            diff_color = "green" if diff > 0 else "red" if diff < 0 else "black"
+            ratio_color = "green" if (pd.notna(ratio) and ratio > 0) else "red" if (pd.notna(ratio) and ratio < 0) else "black"
+            
+            diff_html = f"<span style='color: {diff_color}'>{diff_str}</span>"
+            ratio_html = f"<span style='color: {ratio_color}'>{ratio_str}</span>"
+            
+            tbody_html += f"""
+                <tr>
+                    <td>{label}</td>
+                    <td>{v24_str}</td>
+                    <td>{v25_str}</td>
+                    <td>{diff_html}</td>
+                    <td>{ratio_html}</td>
+                </tr>
+            """
+            
+        table_html = f"""
+        <table class="table table-striped">
+            <thead>
+                <tr>
+                    <th>指标 (Metric)</th>
+                    <th>2024</th>
+                    <th>2025</th>
+                    <th>差异 (Diff)</th>
+                    <th>同比 (YoY)</th>
+                </tr>
+            </thead>
+            <tbody>
+                {tbody_html}
+            </tbody>
+        </table>
+        """
+        html_content.append(table_html)
+
+    # 5.1 Module 5.1: Lead Trends (Module 5.1 模块)
+    if 'module5_daily_series' in metrics:
+        df_series = metrics['module5_daily_series']
+        html_content.append("<h2>5.1 线索趋势对比 (Lead Trends - MA7 Smoothed)</h2>")
+        
+        # Helper to plot daily comparison
+        def plot_daily_metric(col_name, title, y_axis_title, is_rate=False):
+            fig = go.Figure()
+            
+            for year in [2024, 2025]:
+                # Filter by year
+                df_year = df_series[df_series.index.year == year].copy()
+                if df_year.empty:
+                    continue
+                    
+                # Apply MA7 Smoothing
+                # 1. Reindex to full year range to handle missing days correctly
+                min_date = df_year.index.min()
+                max_date = df_year.index.max()
+                full_idx = pd.date_range(min_date, max_date, freq='D')
+                df_year = df_year.reindex(full_idx)
+                
+                # Calculate Y values (Daily)
+                if is_rate:
+                    # Avoid div by zero
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        y_daily = df_year[col_name] / df_year['leads_count']
+                        y_daily = y_daily.replace([np.inf, -np.inf], np.nan)
+                else:
+                    y_daily = df_year[col_name]
+                
+                # 2. Calculate MA7
+                # Use min_periods=1 to allow calculation even with some missing data
+                y_ma7 = y_daily.rolling(window=7, min_periods=1).mean()
+                
+                # Prepare Date Strings for Tooltip
+                dates_str = y_ma7.index.strftime('%Y-%m-%d')
+                
+                color = '#3498DB' if year == 2024 else '#E67E22'
+                
+                # Plot
+                fig.add_trace(go.Scatter(
+                    x=y_ma7.index.dayofyear,
+                    y=y_ma7,
+                    mode='lines',
+                    name=f'{year} (MA7)',
+                    line=dict(color=color),
+                    customdata=dates_str,
+                    hovertemplate=f"Day %{{x}} (%{{customdata}})<br>{year} MA7: %{{y:.1%}}<extra></extra>" if is_rate else f"Day %{{x}} (%{{customdata}})<br>{year} MA7: %{{y:,.0f}}<extra></extra>",
+                ))
+            
+            layout = get_common_layout(
+                title=f"{title} (MA7 Smoothed)",
+                xaxis_title="年份天数 (Day of Year)",
+                yaxis_title=y_axis_title
+            )
+            layout['xaxis']['range'] = [1, 366]
+            if is_rate:
+                 layout['yaxis']['tickformat'] = '.0%'
+            
+            fig.update_layout(layout)
+            return pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+
+        # 1. Daily Leads Count
+        html_content.append("<h3>5.1.1 下发线索数趋势 (Daily Leads Count)</h3>")
+        html_content.append(plot_daily_metric('leads_count', '每日下发线索数对比', '线索数', is_rate=False))
+        
+        # 2. 30d Test Drive Rate
+        html_content.append("<h3>5.1.2 30日试驾率趋势 (30-day Test Drive Rate)</h3>")
+        html_content.append(plot_daily_metric('test_drive_30d', '30日试驾率对比', '转化率', is_rate=True))
+        
+        # 3. 30d Lock Rate
+        html_content.append("<h3>5.1.3 30日锁单率趋势 (30-day Lock Rate)</h3>")
+        html_content.append(plot_daily_metric('lock_30d', '30日锁单率对比', '转化率', is_rate=True))
+
+    # 6. Module 6: Test Drive Analysis (试驾分析)
+    if 'module6_stats' in metrics:
+        m6_stats = metrics['module6_stats']
+        html_content.append("<h2>6. 试驾分析 (Test Drive Analysis)</h2>")
+        
+        row_configs = [
+            ("有效试驾数 (Total Valid Test Drives)", 'total_valid_td', 'int'),
+            ("L6有效试驾数 (L6 Valid Test Drives)", 'total_L6_td', 'int'),
+            ("LS6有效试驾数 (LS6 Valid Test Drives)", 'total_LS6_td', 'int'),
+            ("LS9有效试驾数 (LS9 Valid Test Drives)", 'total_LS9_td', 'int'),
+            ("店日均试驾数 (Store Daily Avg Test Drives)", 'store_daily_avg', 'float')
+        ]
+        
+        tbody_html = ""
+        for label, key, fmt in row_configs:
+            stats_2024 = m6_stats.get(2024)
+            stats_2025 = m6_stats.get(2025)
+            
+            v2024 = stats_2024.get(key, 0) if stats_2024 else 0
+            v2025 = stats_2025.get(key, 0) if stats_2025 else 0
+            
+            diff = v2025 - v2024
+            if v2024 != 0:
+                ratio = (v2025 - v2024) / v2024
+            else:
+                ratio = np.nan
+            
+            # Format values
+            if fmt == 'int':
+                v24_str = f"{int(v2024):,}"
+                v25_str = f"{int(v2025):,}"
+                diff_str = f"{int(diff):+,}"
+            else:
+                v24_str = f"{v2024:.2f}"
+                v25_str = f"{v2025:.2f}"
+                diff_str = f"{diff:+.2f}"
+                
+            if pd.isna(ratio):
+                ratio_str = "N/A"
+            else:
+                ratio_str = f"{ratio:+.1%}"
+            
+            # Color coding
+            diff_color = "green" if diff > 0 else "red" if diff < 0 else "black"
+            ratio_color = "green" if (pd.notna(ratio) and ratio > 0) else "red" if (pd.notna(ratio) and ratio < 0) else "black"
+            
+            diff_html = f"<span style='color: {diff_color}'>{diff_str}</span>"
+            ratio_html = f"<span style='color: {ratio_color}'>{ratio_str}</span>"
+            
+            tbody_html += f"""
+            <tr>
+                <td>{label}</td>
+                <td>{v24_str}</td>
+                <td>{v25_str}</td>
+                <td>{diff_html}</td>
+                <td>{ratio_html}</td>
+            </tr>
+            """
+            
+        table_html = f"""
+        <table class="table table-striped">
+            <thead>
+                <tr>
+                    <th>指标 (Metric)</th>
+                    <th>2024</th>
+                    <th>2025</th>
+                    <th>差异 (Diff)</th>
+                    <th>同比 (YoY)</th>
+                </tr>
+            </thead>
+            <tbody>
+                {tbody_html}
+            </tbody>
+        </table>
+        """
+        html_content.append(table_html)
+
+        # 6.1 Module 6.1: Test Drive Trends
+        html_content.append("<h2>6.1 试驾趋势分析 (Test Drive Trends)</h2>")
+        
+        # Define charts to generate
+        charts_config = [
+            ('daily_avg_per_store', '店日均试驾数 (Store Daily Avg Test Drives)', 'Avg Test Drives'),
+            ('daily_avg_LS6', '店日均LS6试驾数 (Store Daily Avg LS6)', 'Avg LS6 Test Drives'),
+            ('daily_avg_L6', '店日均L6试驾数 (Store Daily Avg L6)', 'Avg L6 Test Drives')
+        ]
+        
+        for col_key, title, y_label in charts_config:
+            fig = go.Figure()
+            
+            for year in [2024, 2025]:
+                m6_stats_year = m6_stats.get(year)
+                if not m6_stats_year or 'daily_series' not in m6_stats_year:
+                    continue
+                    
+                df_series_year = m6_stats_year['daily_series']
+                if df_series_year.empty:
+                    continue
+                
+                # Reindex to full year for correct smoothing
+                min_date = df_series_year.index.min()
+                max_date = df_series_year.index.max()
+                if pd.isna(min_date) or pd.isna(max_date):
+                     continue
+
+                full_idx = pd.date_range(min_date, max_date, freq='D')
+                df_resampled = df_series_year.reindex(full_idx)
+                
+                # Get series
+                if col_key not in df_resampled.columns:
+                    continue
+                    
+                y_daily = df_resampled[col_key]
+                
+                # MA7 Smoothing
+                y_ma7 = y_daily.rolling(window=7, min_periods=1).mean()
+                
+                # Prepare Tooltip Data
+                dates_str = y_ma7.index.strftime('%Y-%m-%d')
+                color = '#3498DB' if year == 2024 else '#E67E22'
+                
+                fig.add_trace(go.Scatter(
+                    x=y_ma7.index.dayofyear,
+                    y=y_ma7,
+                    mode='lines',
+                    name=f'{year} (MA7)',
+                    line=dict(color=color),
+                    customdata=dates_str,
+                    hovertemplate=f"Day %{{x}} (%{{customdata}})<br>{year} MA7: %{{y:.2f}}<extra></extra>"
+                ))
+            
+            layout = get_common_layout(
+                title=f"{title} (MA7 Smoothed)",
+                xaxis_title="年份天数 (Day of Year)",
+                yaxis_title=y_label
+            )
+            layout['xaxis']['range'] = [1, 366]
+            fig.update_layout(layout)
+            
+            chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+            html_content.append(chart_html)
 
     html_content.append("</body></html>")
     

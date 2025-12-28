@@ -281,6 +281,8 @@ def main():
     
     parser.add_argument("--server", default="https://tableau-hs.immotors.com", 
                         help="Tableau服务器URL")
+    parser.add_argument("--mobile", action="store_true", 
+                        help="使用移动端/非办公网络服务器地址 (https://mobile-tableau-hs.immotors.com/)")
     parser.add_argument("--username", default="analysis", 
                         help="Tableau用户名")
     parser.add_argument("--password", default="analysis888", 
@@ -303,6 +305,12 @@ def main():
                         help="显示详细日志")
     
     args = parser.parse_args()
+    
+    # 如果指定了mobile参数，覆盖server地址
+    if args.mobile:
+        args.server = "https://mobile-tableau-hs.immotors.com/"
+        if not args.no_progress:
+            print("📱 使用移动端/非办公网络服务器地址")
     
     # 设置日志级别
     if args.verbose:
