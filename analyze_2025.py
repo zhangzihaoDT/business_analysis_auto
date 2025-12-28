@@ -554,6 +554,113 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
         
     metrics['delivery_trend'] = trend_data
 
+    # 10. 在营门店数 (Active Store Count) - Module 4
+    try:
+        # Prepare data
+        df_store = df.copy()
+        df_store['order_create_time'] = pd.to_datetime(df_store['order_create_time'], errors='coerce')
+        df_store['store_create_date'] = pd.to_datetime(df_store['store_create_date'], errors='coerce')
+        
+        # Valid records only
+        df_store = df_store.dropna(subset=['store_name', 'order_create_time'])
+        
+        if not df_store.empty:
+            # 1. Store Opening Dates (Min per store)
+            open_map = df_store.groupby('store_name')['store_create_date'].min()
+            
+            # 2. Daily Orders per Store
+            df_store['date'] = df_store['order_create_time'].dt.floor('D')
+            daily_counts = df_store.groupby(['date', 'store_name']).size().unstack(fill_value=0)
+            
+            # Full date range
+            min_date = df_store['date'].min()
+            max_date = df_store['date'].max()
+            full_days = pd.date_range(min_date, max_date, freq='D')
+            
+            # Reindex daily counts
+            daily_counts = daily_counts.reindex(full_days, fill_value=0)
+            
+            # 3. Rolling Activity (30 days)
+            rolling_activity = daily_counts.rolling(window=30, min_periods=1).sum()
+            
+            # 4. Calculate Active Count
+            active_counts = []
+            for d in full_days:
+                if d not in rolling_activity.index:
+                    active_counts.append(0)
+                    continue
+                    
+                # Stores with activity > 0
+                activity_mask = rolling_activity.loc[d] > 0
+                current_stores = activity_mask.index
+                
+                # Check opening date
+                store_open_dates = open_map.reindex(current_stores)
+                is_open = (store_open_dates <= d)
+                
+                # Active = Active Activity & Open
+                is_active_store = activity_mask & is_open
+                active_counts.append(is_active_store.sum())
+                
+            metrics['active_store_series'] = pd.Series(active_counts, index=full_days)
+    except Exception as e:
+        print(f"Error calculating active stores: {e}")
+
+    # 11. Daily Lock Counts (for Module 4.4)
+    try:
+        daily_locks = df.groupby(df['lock_time'].dt.floor('D')).size()
+        metrics['daily_lock_counts'] = daily_locks
+    except Exception as e:
+        print(f"Error calculating daily lock counts: {e}")
+
+    # 12. Daily Lock Counts by Series (for Module 4.4 Breakdown)
+    try:
+        # Group by Date and Series, unstack to get columns as series names
+        daily_locks_series = df.groupby([df['lock_time'].dt.floor('D'), 'series']).size().unstack(fill_value=0)
+        metrics['daily_locks_series'] = daily_locks_series
+    except Exception as e:
+        print(f"Error calculating daily lock counts by series: {e}")
+
+    # 13. Daily Total Invoice Amount (for Module 4.5)
+    try:
+        # Ensure invoice_upload_time is datetime
+        if not pd.api.types.is_datetime64_any_dtype(df['invoice_upload_time']):
+             df['invoice_upload_time'] = pd.to_datetime(df['invoice_upload_time'], errors='coerce')
+        
+        # Ensure invoice_amount is numeric
+        df['invoice_amount'] = pd.to_numeric(df['invoice_amount'], errors='coerce')
+        
+        # Filter for valid dates and sum amount
+        daily_invoice_sum = df.groupby(df['invoice_upload_time'].dt.floor('D'))['invoice_amount'].sum()
+        metrics['daily_invoice_sum'] = daily_invoice_sum
+    except Exception as e:
+        print(f"Error calculating daily invoice sum: {e}")
+
+    # 14. Daily Invoice Price Trend (for Module 1.4)
+    try:
+        # Filter delivered orders
+        df_delivered = df[df['delivery_date'].notna()].copy()
+        
+        # Ensure types (already done above if reused, but safe to check)
+        if not pd.api.types.is_datetime64_any_dtype(df_delivered['invoice_upload_time']):
+             df_delivered['invoice_upload_time'] = pd.to_datetime(df_delivered['invoice_upload_time'], errors='coerce')
+        
+        df_delivered['invoice_amount'] = pd.to_numeric(df_delivered['invoice_amount'], errors='coerce')
+        
+        # Filter valid invoice time and amount
+        df_delivered = df_delivered.dropna(subset=['invoice_upload_time', 'invoice_amount'])
+        
+        # Group by Date: Average Invoice Price
+        daily_price = df_delivered.groupby(df_delivered['invoice_upload_time'].dt.floor('D'))['invoice_amount'].mean()
+        metrics['daily_invoice_price'] = daily_price
+        
+        # Group by Date and Series: Average Invoice Price
+        daily_price_series = df_delivered.groupby([df_delivered['invoice_upload_time'].dt.floor('D'), 'series'])['invoice_amount'].mean().unstack()
+        metrics['daily_invoice_price_series'] = daily_price_series
+        
+    except Exception as e:
+        print(f"Error calculating daily invoice price: {e}")
+
     return metrics
 
 def calculate_conversion_probability(metrics):
@@ -719,6 +826,206 @@ def generate_html(metrics: dict, output_file: Path):
             html_content.append(f"<h3>{s}</h3>")
             html_content.append(df_table.to_html(index=False, classes='table', escape=False, float_format=lambda x: '{:,.0f}'.format(x) if isinstance(x, (int, float)) else x))
     
+    # 1.3 锁单趋势分析 (Lock Order Trends)
+    html_content.append("<h2>1.3 锁单趋势分析 (Lock Order Trends)</h2>")
+    html_content.append("<p>X轴: Lock Time (Day of Year), Y轴: 锁单数 (MA7 Smoothed)</p>")
+    html_content.append("<p>注：数据已进行 7天移动平均 (MA7) 平滑处理。</p>")
+
+    # 1.3.0 Summary
+    if 'daily_lock_counts' in metrics:
+        html_content.append("<h3>1.3.0 整体锁单趋势 (Overall Lock Trends - MA7)</h3>")
+        daily_locks = metrics['daily_lock_counts']
+        
+        fig = go.Figure()
+        for year in [2024, 2025]:
+            # Filter
+            data_year = daily_locks[daily_locks.index.year == year]
+            if data_year.empty: continue
+            
+            # Apply MA7 Smoothing
+            # Ensure full date range for correct rolling
+            min_date = data_year.index.min()
+            max_date = data_year.index.max()
+            full_idx = pd.date_range(min_date, max_date, freq='D')
+            data_year = data_year.reindex(full_idx, fill_value=0)
+            
+            # Calculate MA7
+            ma7_data = data_year.rolling(window=7, min_periods=1).mean()
+            
+            # X = Day of Year
+            x_days = ma7_data.index.dayofyear
+            dates_str = ma7_data.index.strftime('%Y-%m-%d')
+            color = '#3498DB' if year == 2024 else '#E67E22'
+            
+            fig.add_trace(go.Scatter(
+                x=x_days,
+                y=ma7_data.values,
+                mode='lines',
+                name=f'{year} (MA7)',
+                line=dict(color=color, width=2),
+                hovertemplate="Day %{x} (%{customdata})<br>MA7 Locks: %{y:.1f}<extra></extra>",
+                customdata=dates_str
+            ))
+            
+        layout = get_common_layout(
+            title="整体锁单趋势对比 (Overall Daily Lock Counts - MA7)",
+            xaxis_title="年份天数 (Day of Year)",
+            yaxis_title="锁单数 (MA7)"
+        )
+        layout['xaxis']['range'] = [1, 366]
+        fig.update_layout(layout)
+        chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+        html_content.append(chart_html)
+
+    # 1.3.1 - 1.3.3 Series Breakdown
+    if 'daily_locks_series' in metrics:
+        df_locks_series = metrics['daily_locks_series']
+        target_series = ['LS6', 'L6', 'LS9']
+        
+        for ser_name in target_series:
+            if ser_name not in df_locks_series.columns: continue
+            
+            html_content.append(f"<h3>1.3.{target_series.index(ser_name)+1} {ser_name} 锁单趋势 (MA7)</h3>")
+            s_locks_ser = df_locks_series[ser_name]
+            
+            fig = go.Figure()
+            for year in [2024, 2025]:
+                data_year = s_locks_ser[s_locks_ser.index.year == year]
+                if data_year.empty: continue
+                
+                # Apply MA7 Smoothing
+                min_date = data_year.index.min()
+                max_date = data_year.index.max()
+                full_idx = pd.date_range(min_date, max_date, freq='D')
+                data_year = data_year.reindex(full_idx, fill_value=0)
+                
+                ma7_data = data_year.rolling(window=7, min_periods=1).mean()
+                
+                x_days = ma7_data.index.dayofyear
+                dates_str = ma7_data.index.strftime('%Y-%m-%d')
+                color = '#3498DB' if year == 2024 else '#E67E22'
+                
+                fig.add_trace(go.Scatter(
+                    x=x_days,
+                    y=ma7_data.values,
+                    mode='lines',
+                    name=f'{year} (MA7)',
+                    line=dict(color=color, width=2),
+                    hovertemplate="Day %{x} (%{customdata})<br>MA7 Locks: %{y:.1f}<extra></extra>",
+                    customdata=dates_str
+                ))
+                
+            layout = get_common_layout(
+                title=f"{ser_name} 锁单趋势对比 (Daily Lock Counts - MA7)",
+                xaxis_title="年份天数 (Day of Year)",
+                yaxis_title="锁单数 (MA7)"
+            )
+            layout['xaxis']['range'] = [1, 366]
+            fig.update_layout(layout)
+            chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+            html_content.append(chart_html)
+
+    # 1.4 开票价格趋势 (Invoice Price Trends)
+    html_content.append("<h2>1.4 开票价格趋势 (Invoice Price Trends)</h2>")
+    html_content.append("<p>X轴: Invoice Upload Time (Day of Year), Y轴: 平均开票价格 (MA7 Smoothed)</p>")
+    html_content.append("<p>筛选条件: 含有 delivery_date 的已交付订单。</p>")
+    html_content.append("<p>注：数据已进行 7天移动平均 (MA7) 平滑处理。</p>")
+
+    # 1.4.0 Summary
+    if 'daily_invoice_price' in metrics:
+        html_content.append("<h3>1.4.0 整体开票价格趋势 (Overall Invoice Price Trends - MA7)</h3>")
+        daily_price = metrics['daily_invoice_price']
+        
+        fig = go.Figure()
+        for year in [2024, 2025]:
+            # Filter
+            data_year = daily_price[daily_price.index.year == year]
+            if data_year.empty: continue
+            
+            # Apply MA7 Smoothing
+            # For price, we reindex to full daily range but fill with NaN (not 0)
+            # rolling().mean() will skip NaNs but provide smoothing over available data
+            min_date = data_year.index.min()
+            max_date = data_year.index.max()
+            full_idx = pd.date_range(min_date, max_date, freq='D')
+            data_year = data_year.reindex(full_idx) # Default fill_value is NaN
+            
+            # Calculate MA7
+            ma7_data = data_year.rolling(window=7, min_periods=1).mean()
+            
+            # X = Day of Year
+            x_days = ma7_data.index.dayofyear
+            dates_str = ma7_data.index.strftime('%Y-%m-%d')
+            color = '#3498DB' if year == 2024 else '#E67E22'
+            
+            fig.add_trace(go.Scatter(
+                x=x_days,
+                y=ma7_data.values,
+                mode='lines',
+                name=f'{year} (MA7)',
+                line=dict(color=color, width=2),
+                hovertemplate="Day %{x} (%{customdata})<br>MA7 Price: %{y:,.0f}<extra></extra>",
+                customdata=dates_str
+            ))
+            
+        layout = get_common_layout(
+            title="整体开票价格趋势对比 (Overall Daily Average Invoice Price - MA7)",
+            xaxis_title="年份天数 (Day of Year)",
+            yaxis_title="平均开票价格 (CNY)"
+        )
+        layout['xaxis']['range'] = [1, 366]
+        fig.update_layout(layout)
+        chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+        html_content.append(chart_html)
+
+    # 1.4.1 - 1.4.3 Series Breakdown
+    if 'daily_invoice_price_series' in metrics:
+        df_price_series = metrics['daily_invoice_price_series']
+        target_series = ['LS6', 'L6', 'LS9']
+        
+        for ser_name in target_series:
+            if ser_name not in df_price_series.columns: continue
+            
+            html_content.append(f"<h3>1.4.{target_series.index(ser_name)+1} {ser_name} 开票价格趋势 (MA7)</h3>")
+            s_price_ser = df_price_series[ser_name]
+            
+            fig = go.Figure()
+            for year in [2024, 2025]:
+                data_year = s_price_ser[s_price_ser.index.year == year]
+                if data_year.empty: continue
+                
+                # Apply MA7 Smoothing
+                min_date = data_year.index.min()
+                max_date = data_year.index.max()
+                full_idx = pd.date_range(min_date, max_date, freq='D')
+                data_year = data_year.reindex(full_idx) # Default fill_value is NaN
+                
+                ma7_data = data_year.rolling(window=7, min_periods=1).mean()
+                
+                x_days = ma7_data.index.dayofyear
+                dates_str = ma7_data.index.strftime('%Y-%m-%d')
+                color = '#3498DB' if year == 2024 else '#E67E22'
+                
+                fig.add_trace(go.Scatter(
+                    x=x_days,
+                    y=ma7_data.values,
+                    mode='lines',
+                    name=f'{year} (MA7)',
+                    line=dict(color=color, width=2),
+                    hovertemplate="Day %{x} (%{customdata})<br>MA7 Price: %{y:,.0f}<extra></extra>",
+                    customdata=dates_str
+                ))
+                
+            layout = get_common_layout(
+                title=f"{ser_name} 开票价格趋势对比 (Daily Average Invoice Price - MA7)",
+                xaxis_title="年份天数 (Day of Year)",
+                yaxis_title="平均开票价格 (CNY)"
+            )
+            layout['xaxis']['range'] = [1, 366]
+            fig.update_layout(layout)
+            chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+            html_content.append(chart_html)
+
     # 2. 退订分析
     html_content.append("<h2>2. 退订分析 (Refund Analysis)</h2>")
     html_content.append("<p>定义：统计周期内提交退订申请 (approve_refund_time) 且存在锁单时间 (lock_time) 的订单。</p>")
@@ -970,12 +1277,12 @@ def generate_html(metrics: dict, output_file: Path):
             html_content.append(f"<p><strong>预估最终交付: {int(total_est_deliveries):,} (转化率: {total_est_deliveries/pending_counts.sum():.1%})</strong></p>")
             html_content.append(chart_html)
 
-    # Module 3: 交付分析 (Delivery Analysis)
-    html_content.append("<h2>Module 3: 交付分析</h2>")
+    # 3. 交付分析 (Delivery Analysis)
+    html_content.append("<h2>3. 交付分析</h2>")
     
-    # 3.0 交付概览 (Delivery Overview)
+    # 交付概览 (Delivery Overview)
     if 'delivery_overview' in metrics:
-        html_content.append("<h3>3.0 交付效率概览 (Delivery Efficiency)</h3>")
+        html_content.append("<h3>交付效率概览 (Delivery Efficiency)</h3>")
         
         overview = metrics['delivery_overview']
         # Data structure: list of dicts [{'year': 2024, ...}, {'year': 2025, ...}]
@@ -1179,6 +1486,479 @@ def generate_html(metrics: dict, output_file: Path):
             
             chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
             html_content.append(chart_html)
+
+    # 4. 渠道分析 (Channel Analysis)
+    if 'active_store_series' in metrics:
+        html_content.append("<h2>4. 渠道分析 (Channel Analysis)</h2>")
+        html_content.append("<h3>4.1 在营门店数概览 (Active Store Overview)</h3>")
+        
+        s_active = metrics['active_store_series']
+        
+        # Calculate stats for each year
+        stats = {}
+        raw_stats = {} # Store raw numbers for calculation
+        
+        for year in [2024, 2025]:
+            s_year = s_active[s_active.index.year == year]
+            if s_year.empty:
+                stats[year] = {'min': '-', 'max': '-', 'mean': '-'}
+                raw_stats[year] = {'min': np.nan, 'max': np.nan, 'mean': np.nan}
+            else:
+                _min = int(s_year.min())
+                _max = int(s_year.max())
+                _mean = s_year.mean()
+                
+                stats[year] = {
+                    'min': _min,
+                    'max': _max,
+                    'mean': f"{_mean:.1f}"
+                }
+                raw_stats[year] = {
+                    'min': _min,
+                    'max': _max,
+                    'mean': _mean
+                }
+        
+        # Helper to calculate Diff and Ratio
+        def get_diff_ratio(metric_key):
+            v24 = raw_stats[2024][metric_key]
+            v25 = raw_stats[2025][metric_key]
+            
+            if pd.isna(v24) or pd.isna(v25):
+                return "-", "-"
+                
+            diff = v25 - v24
+            if v24 != 0:
+                ratio = diff / v24
+            else:
+                ratio = np.nan
+                
+            # Format Diff
+            diff_color = "green" if diff > 0 else "red" if diff < 0 else "black"
+            diff_prefix = "+" if diff > 0 else ""
+            diff_str = f"<span style='color: {diff_color}'>{diff_prefix}{diff:.1f}</span>"
+            
+            # Format Ratio
+            if pd.isna(ratio):
+                ratio_str = "-"
+            else:
+                ratio_color = "green" if ratio > 0 else "red" if ratio < 0 else "black"
+                ratio_prefix = "+" if ratio > 0 else ""
+                ratio_str = f"<span style='color: {ratio_color}'>{ratio_prefix}{ratio:.1%}</span>"
+                
+            return diff_str, ratio_str
+
+        diff_min, ratio_min = get_diff_ratio('min')
+        diff_max, ratio_max = get_diff_ratio('max')
+        diff_mean, ratio_mean = get_diff_ratio('mean')
+
+        # Build Transposed Table
+        # Rows: Indicators
+        # Columns: Years, Diff, Ratio
+        table_html = f"""
+        <table>
+            <thead>
+                <tr>
+                    <th>指标 (Metric)</th>
+                    <th>2024</th>
+                    <th>2025</th>
+                    <th>差异 (Diff)</th>
+                    <th>同比 (YoY)</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>最小值 (Min)</td>
+                    <td>{stats[2024]['min']}</td>
+                    <td>{stats[2025]['min']}</td>
+                    <td>{diff_min}</td>
+                    <td>{ratio_min}</td>
+                </tr>
+                <tr>
+                    <td>最大值 (Max)</td>
+                    <td>{stats[2024]['max']}</td>
+                    <td>{stats[2025]['max']}</td>
+                    <td>{diff_max}</td>
+                    <td>{ratio_max}</td>
+                </tr>
+                <tr>
+                    <td>平均值 (Mean)</td>
+                    <td>{stats[2024]['mean']}</td>
+                    <td>{stats[2025]['mean']}</td>
+                    <td>{diff_mean}</td>
+                    <td>{ratio_mean}</td>
+                </tr>
+            </tbody>
+        </table>
+        """
+        html_content.append(table_html)
+
+        # Prepare data for 4.2 and 4.3
+        s_2024 = s_active[s_active.index.year == 2024]
+        s_2025 = s_active[s_active.index.year == 2025]
+
+        # 4.2 Total Operating Days Analysis (Moved from 4.3)
+        html_content.append("<h3>4.2 营业总时长分析 (Total Operating Days Analysis)</h3>")
+        html_content.append("<p>统计2024年和2025年所有在营门店的营业天数总和 (Sum of operating days for all active stores).</p>")
+        
+        # Calculate Total Operating Days
+        total_days_2024 = int(s_2024.sum()) if not s_2024.empty else 0
+        total_days_2025 = int(s_2025.sum()) if not s_2025.empty else 0
+        
+        # Calculate Diff and Ratio
+        diff_days = total_days_2025 - total_days_2024
+        
+        if total_days_2024 != 0:
+            ratio_days = diff_days / total_days_2024
+        else:
+            ratio_days = np.nan
+            
+        # Format Diff
+        diff_color = "green" if diff_days > 0 else "red" if diff_days < 0 else "black"
+        diff_prefix = "+" if diff_days > 0 else ""
+        diff_str = f"<span style='color: {diff_color}'>{diff_prefix}{diff_days:,}</span>"
+        
+        # Format Ratio
+        if pd.isna(ratio_days):
+            ratio_str = "-"
+        else:
+            ratio_color = "green" if ratio_days > 0 else "red" if ratio_days < 0 else "black"
+            ratio_prefix = "+" if ratio_days > 0 else ""
+            ratio_str = f"<span style='color: {ratio_color}'>{ratio_prefix}{ratio_days:.1%}</span>"
+            
+        # Table for 4.2
+        table_4_2 = f"""
+        <table>
+            <thead>
+                <tr>
+                    <th>指标 (Metric)</th>
+                    <th>2024 总计</th>
+                    <th>2025 总计</th>
+                    <th>差异 (Diff)</th>
+                    <th>同比 (YoY)</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>营业总时长 (Total Operating Days)</td>
+                    <td>{total_days_2024:,}</td>
+                    <td>{total_days_2025:,}</td>
+                    <td>{diff_str}</td>
+                    <td>{ratio_str}</td>
+                </tr>
+            </tbody>
+        </table>
+        """
+        html_content.append(table_4_2)
+
+        # 4.3 Comparison Chart (Active Store Comparison - Day Aligned) (Moved from 4.2)
+        html_content.append("<h3>4.3 在营门店数对比 (2024 vs 2025 对齐对比)</h3>")
+        
+        fig = go.Figure()
+        
+        # 2024 Trace
+        if not s_2024.empty:
+            # X = Day of Year
+            x_2024 = s_2024.index.dayofyear
+            # Format dates for hover
+            dates_2024 = s_2024.index.strftime('%Y-%m-%d')
+            
+            fig.add_trace(go.Scatter(
+                x=x_2024,
+                y=s_2024.values,
+                mode='lines',
+                name='2024',
+                line=dict(color='#3498DB', width=2),
+                hovertemplate="Day %{x} (%{customdata})<br>Active Stores: %{y}<extra>2024</extra>",
+                customdata=dates_2024
+            ))
+            
+        # 2025 Trace
+        if not s_2025.empty:
+            x_2025 = s_2025.index.dayofyear
+            dates_2025 = s_2025.index.strftime('%Y-%m-%d')
+            
+            fig.add_trace(go.Scatter(
+                x=x_2025,
+                y=s_2025.values,
+                mode='lines',
+                name='2025',
+                line=dict(color='#E67E22', width=2),
+                hovertemplate="Day %{x} (%{customdata})<br>Active Stores: %{y}<extra>2025</extra>",
+                customdata=dates_2025
+            ))
+            
+        layout = get_common_layout(
+            title="4.3 在营门店数对比 (2024 vs 2025 对齐对比)",
+            xaxis_title="年份天数 (Day of Year)",
+            yaxis_title="在营门店数"
+        )
+        layout['xaxis']['range'] = [1, 366] # Explicitly set range to match 2024
+        
+        fig.update_layout(layout)
+        
+        chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+        html_content.append(chart_html)
+
+    # 4.4 Average Lock Orders per Store (Daily)
+    html_content.append("<h3>4.4 店均锁单数分析 (Average Daily Lock Orders per Store)</h3>")
+    html_content.append("<p>统计2024年和2025年每日的“当日锁单数”除以“当日在营门店数”。</p>")
+    html_content.append("<p>定义：店均锁单数(d) = 当日锁单数(d) / 在营门店数(d)</p>")
+
+    if 'active_store_series' in metrics and 'daily_lock_counts' in metrics:
+        html_content.append("<h4>4.4.0 整体店均锁单数趋势</h4>")
+        s_active = metrics['active_store_series']
+        daily_locks = metrics['daily_lock_counts']
+        
+        fig = go.Figure()
+        
+        for year in [2024, 2025]:
+            # Filter data for year
+            s_active_year = s_active[s_active.index.year == year]
+            daily_locks_year = daily_locks[daily_locks.index.year == year]
+            
+            if s_active_year.empty:
+                continue
+                
+            # Align dates: Reindex daily locks to match active store dates (fill 0 for no locks)
+            # Ensure index is DatetimeIndex
+            daily_locks_year = daily_locks_year.reindex(s_active_year.index, fill_value=0)
+            
+            # Use Daily Locks instead of Cumulative
+            # cum_locks = daily_locks_year.cumsum() # REMOVED
+            
+            # Calculate Average per Store
+            # Handle division by zero
+            with np.errstate(divide='ignore', invalid='ignore'):
+                avg_per_store = daily_locks_year / s_active_year
+                avg_per_store = avg_per_store.replace([np.inf, -np.inf], np.nan)
+            
+            # Add LOWESS smoothing for better readability
+            # X must be numeric
+            x_numeric = (s_active_year.index - s_active_year.index.min()).days.values
+            
+            # Filter NaNs for smoothing
+            mask = ~np.isnan(avg_per_store)
+            if mask.sum() > 10:
+                y_smooth = sm.nonparametric.lowess(avg_per_store[mask], x_numeric[mask], frac=0.1)[:, 1]
+                x_smooth = s_active_year.index[mask]
+            else:
+                y_smooth = []
+                x_smooth = []
+
+            # Plot
+            # X = Day of Year
+            x_days = s_active_year.index.dayofyear
+            # Format dates for hover
+            dates_str = s_active_year.index.strftime('%Y-%m-%d')
+            
+            color = '#3498DB' if year == 2024 else '#E67E22'
+            
+            # Scatter points (faint)
+            fig.add_trace(go.Scatter(
+                x=x_days,
+                y=avg_per_store,
+                mode='markers',
+                name=f'{year} (Daily)',
+                marker=dict(color=color, size=4, opacity=0.3),
+                hovertemplate=f"Day %{{x}} (%{{customdata[2]}})<br>{year} Avg: %{{y:.2f}} orders/store<br>(Locks: %{{customdata[0]}}, Stores: %{{customdata[1]}})<extra></extra>",
+                customdata=np.stack((daily_locks_year.values, s_active_year.values, dates_str.values), axis=-1),
+                showlegend=False
+            ))
+            
+            # Smooth line (Solid)
+            if len(x_smooth) > 0:
+                # Get dates for smooth line (subset of original dates)
+                dates_smooth = x_smooth.strftime('%Y-%m-%d')
+                
+                fig.add_trace(go.Scatter(
+                    x=x_smooth.dayofyear,
+                    y=y_smooth,
+                    mode='lines',
+                    name=f'{year} (Trend)',
+                    line=dict(color=color, width=2),
+                    hovertemplate=f"Day %{{x}} (%{{customdata}})<br>{year} Trend: %{{y:.2f}} orders/store<extra></extra>",
+                    customdata=dates_smooth
+                ))
+            
+        layout = get_common_layout(
+            title="4.4.0 整体店均锁单数趋势对比 (Overall Daily Locks per Store)",
+            xaxis_title="年份天数 (Day of Year)",
+            yaxis_title="店均锁单数 (Orders per Store)"
+        )
+        layout['xaxis']['range'] = [1, 366]
+        layout['yaxis']['range'] = [0, 2] # Default Y-axis scale
+        
+        fig.update_layout(layout)
+        
+        chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+        html_content.append(chart_html)
+
+    # 4.4 Series Breakdown (LS6, L6, LS9)
+    if 'active_store_series' in metrics and 'daily_locks_series' in metrics:
+        s_active = metrics['active_store_series']
+        df_locks_series = metrics['daily_locks_series']
+        target_series = ['LS6', 'L6', 'LS9']
+        
+        for ser_name in target_series:
+            if ser_name not in df_locks_series.columns:
+                continue
+                
+            html_content.append(f"<h4>4.4.{target_series.index(ser_name)+1} {ser_name} 店均锁单数趋势</h4>")
+            
+            s_locks_ser = df_locks_series[ser_name]
+            
+            fig = go.Figure()
+            
+            for year in [2024, 2025]:
+                # Filter data for year
+                s_active_year = s_active[s_active.index.year == year]
+                s_locks_year = s_locks_ser[s_locks_ser.index.year == year]
+                
+                if s_active_year.empty:
+                    continue
+                    
+                # Align dates
+                s_locks_year = s_locks_year.reindex(s_active_year.index, fill_value=0)
+                
+                # Calculate Average per Store (Series Locks / Total Active Stores)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    avg_per_store = s_locks_year / s_active_year
+                    avg_per_store = avg_per_store.replace([np.inf, -np.inf], np.nan)
+                
+                # LOWESS Smoothing
+                x_numeric = (s_active_year.index - s_active_year.index.min()).days.values
+                mask = ~np.isnan(avg_per_store)
+                
+                if mask.sum() > 10:
+                    y_smooth = sm.nonparametric.lowess(avg_per_store[mask], x_numeric[mask], frac=0.1)[:, 1]
+                    x_smooth = s_active_year.index[mask]
+                else:
+                    y_smooth = []
+                    x_smooth = []
+
+                # Plot
+                x_days = s_active_year.index.dayofyear
+                dates_str = s_active_year.index.strftime('%Y-%m-%d')
+                color = '#3498DB' if year == 2024 else '#E67E22'
+                
+                # Scatter points (faint)
+                fig.add_trace(go.Scatter(
+                    x=x_days,
+                    y=avg_per_store,
+                    mode='markers',
+                    name=f'{year} (Daily)',
+                    marker=dict(color=color, size=4, opacity=0.3),
+                    hovertemplate=f"Day %{{x}} (%{{customdata[2]}})<br>{ser_name} {year} Avg: %{{y:.2f}} orders/store<br>(Locks: %{{customdata[0]}}, Total Stores: %{{customdata[1]}})<extra></extra>",
+                    customdata=np.stack((s_locks_year.values, s_active_year.values, dates_str.values), axis=-1),
+                    showlegend=False
+                ))
+                
+                # Smooth line (Solid)
+                if len(x_smooth) > 0:
+                    dates_smooth = x_smooth.strftime('%Y-%m-%d')
+                    fig.add_trace(go.Scatter(
+                        x=x_smooth.dayofyear,
+                        y=y_smooth,
+                        mode='lines',
+                        name=f'{year} (Trend)',
+                        line=dict(color=color, width=2),
+                        hovertemplate=f"Day %{{x}} (%{{customdata}})<br>{ser_name} {year} Trend: %{{y:.2f}} orders/store<extra></extra>",
+                        customdata=dates_smooth
+                    ))
+            
+            layout = get_common_layout(
+                title=f"{ser_name} 店均锁单数趋势 (Series Locks / Total Stores)",
+                xaxis_title="年份天数 (Day of Year)",
+                yaxis_title="店均锁单数 (Orders per Store)"
+            )
+            layout['xaxis']['range'] = [1, 366]
+            layout['yaxis']['range'] = [0, 2] # Default Y-axis scale
+            fig.update_layout(layout)
+            
+            chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+            html_content.append(chart_html)
+
+    # 4.5 Average Invoice Amount per Store
+    html_content.append("<h3>4.5 店均开票价格分析 (Average Invoice Amount per Store)</h3>")
+    html_content.append("<p>统计每日“总开票金额”除以“当日在营门店数”。</p>")
+    html_content.append("<p>定义：店均开票金额(d) = sum(invoice_amount where upload_time=d) / 在营门店数(d)</p>")
+
+    if 'active_store_series' in metrics and 'daily_invoice_sum' in metrics:
+        s_active = metrics['active_store_series']
+        daily_invoice = metrics['daily_invoice_sum']
+        
+        fig = go.Figure()
+        
+        for year in [2024, 2025]:
+            # Filter data for year
+            s_active_year = s_active[s_active.index.year == year]
+            daily_invoice_year = daily_invoice[daily_invoice.index.year == year]
+            
+            if s_active_year.empty:
+                continue
+                
+            # Align dates
+            daily_invoice_year = daily_invoice_year.reindex(s_active_year.index, fill_value=0)
+            
+            # Calculate Average per Store
+            with np.errstate(divide='ignore', invalid='ignore'):
+                avg_per_store = daily_invoice_year / s_active_year
+                avg_per_store = avg_per_store.replace([np.inf, -np.inf], np.nan)
+            
+            # LOWESS Smoothing
+            x_numeric = (s_active_year.index - s_active_year.index.min()).days.values
+            mask = ~np.isnan(avg_per_store)
+            
+            if mask.sum() > 10:
+                y_smooth = sm.nonparametric.lowess(avg_per_store[mask], x_numeric[mask], frac=0.1)[:, 1]
+                x_smooth = s_active_year.index[mask]
+            else:
+                y_smooth = []
+                x_smooth = []
+
+            # Plot
+            x_days = s_active_year.index.dayofyear
+            dates_str = s_active_year.index.strftime('%Y-%m-%d')
+            color = '#3498DB' if year == 2024 else '#E67E22'
+            
+            # Scatter points (faint)
+            fig.add_trace(go.Scatter(
+                x=x_days,
+                y=avg_per_store,
+                mode='markers',
+                name=f'{year} (Daily)',
+                marker=dict(color=color, size=4, opacity=0.3),
+                hovertemplate=f"Day %{{x}} (%{{customdata[2]}})<br>{year} Avg: ¥%{{y:,.0f}}<br>(Total: ¥%{{customdata[0]:,.0f}}, Stores: %{{customdata[1]}})<extra></extra>",
+                customdata=np.stack((daily_invoice_year.values, s_active_year.values, dates_str.values), axis=-1),
+                showlegend=False
+            ))
+            
+            # Smooth line (Solid)
+            if len(x_smooth) > 0:
+                dates_smooth = x_smooth.strftime('%Y-%m-%d')
+                fig.add_trace(go.Scatter(
+                    x=x_smooth.dayofyear,
+                    y=y_smooth,
+                    mode='lines',
+                    name=f'{year} (Trend)',
+                    line=dict(color=color, width=2),
+                    hovertemplate=f"Day %{{x}} (%{{customdata}})<br>{year} Trend: ¥%{{y:,.0f}}<extra></extra>",
+                    customdata=dates_smooth
+                ))
+        
+        layout = get_common_layout(
+            title="4.5 店均开票金额趋势对比 (Average Invoice Amount per Store)",
+            xaxis_title="年份天数 (Day of Year)",
+            yaxis_title="店均开票金额 (RMB)"
+        )
+        layout['xaxis']['range'] = [1, 366]
+        # Auto-scale Y-axis for amount
+        
+        fig.update_layout(layout)
+        
+        chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+        html_content.append(chart_html)
 
     html_content.append("</body></html>")
     
