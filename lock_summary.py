@@ -1,24 +1,34 @@
 import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Any
+import json
+import re
 
 import pandas as pd
 
 
 DEFAULT_INPUT = Path(
-    "/Users/zihao_/Documents/coding/dataset/formatted/intention_order_analysis.parquet"
+    "/Users/zihao_/Documents/coding/dataset/formatted/order_full_data.parquet"
 )
 OUT_DIR = Path(
     "/Users/zihao_/Documents/coding/dataset/processed/analysis_results"
 )
+BUSINESS_DEF_FILE = Path(
+    "/Users/zihao_/Documents/github/W52_reasoning/world/business_definition.json"
+)
+
+# Will be populated from JSON
+BUSINESS_GROUPS = {}
 
 
-BUSINESS_GROUPS = {
-    "LS6纯电": ["CM0", "CM1", "CM2"],
-    "LS6增程": ["CM2 增程"],
-    "L6": ["DM0", "DM1"],
-}
+def load_business_definition(file_path: Path) -> dict:
+    if not file_path.exists():
+        # Fallback or raise error? User said to use it.
+        raise FileNotFoundError(f"Business definition file not found: {file_path}")
+    with open(file_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
 
 def normalize(name: str) -> str:
     return name.strip().lower().replace("_", " ").replace(" ", " ")
@@ -36,6 +46,70 @@ def resolve_column(df: pd.DataFrame, candidates: List[str]) -> str:
     raise KeyError(
         f"Unable to resolve column from candidates: {candidates}. Available columns: {list(df.columns)}"
     )
+
+
+def parse_sql_condition(df: pd.DataFrame, condition_str: str, product_col: str) -> pd.Series:
+    """
+    Parses simple SQL-like conditions for product filtering.
+    Replaces 'Product Name' with the actual column name.
+    """
+    # Replace "Product Name" (case insensitive) with reference to product_col
+    # We use a placeholder to avoid messing up if product_col has spaces/quotes
+    
+    # 1. Normalize the condition string to use a standard placeholder for the column
+    # The JSON uses "Product Name". 
+    # Example: "Product Name LIKE '%LS6%'"
+    
+    # We will simply interpret the logic by manual parsing or eval with replacement.
+    # Given the complexity, eval is easiest if we sanitize/prepare the string.
+    
+    # Replace "Product Name" with "df[product_col]" is risky if product_col is not a valid identifier.
+    # Safer: Use a variable name `series_col` in eval context.
+    
+    # Prepare the string for python eval:
+    # LIKE '%...%' -> .str.contains('...', case=False, na=False)
+    # NOT LIKE -> ~...
+    # AND -> &
+    # OR -> |
+    
+    # Note: analyze_2025.py uses regex substitution. I will use similar approach.
+    
+    # Step 1: Replace column name variants with a standard token
+    # Regex for "Product Name" (case insensitive)
+    # Be careful not to match inside quotes if possible, but here keys are usually field names.
+    s = re.sub(r"(?i)product\s+name", "TARGET_COL", condition_str)
+    s = re.sub(r"(?i)product_name", "TARGET_COL", s)
+    
+    # Step 2: NOT LIKE
+    # TARGET_COL NOT LIKE '%value%'
+    def not_like_replacer(match):
+        val = match.group(1)
+        return f"~df['{product_col}'].astype(str).str.contains('{val}', case=False, na=False)"
+
+    s = re.sub(r"TARGET_COL\s+NOT\s+LIKE\s+'%([^%]+)%+'", not_like_replacer, s)
+
+    # Step 3: LIKE
+    # TARGET_COL LIKE '%value%'
+    def like_replacer(match):
+        val = match.group(1)
+        return f"df['{product_col}'].astype(str).str.contains('{val}', case=False, na=False)"
+
+    s = re.sub(r"TARGET_COL\s+LIKE\s+'%([^%]+)%+'", like_replacer, s)
+    
+    # Step 4: AND / OR / ELSE
+    s = s.replace(" AND ", " & ").replace(" OR ", " | ")
+    
+    if "ELSE" in s:
+        # ELSE usually means "True" (fallback) if checked last, but here we return True 
+        # so it can be assigned if nothing else matched. 
+        # However, usually we apply these in sequence.
+        return pd.Series([True] * len(df), index=df.index)
+
+    try:
+        return eval(s)
+    except Exception as e:
+        print(f"Warning: Failed to parse condition: {condition_str}. Error: {e}")
+        return pd.Series([False] * len(df), index=df.index)
 
 
 def df_to_md(df: pd.DataFrame) -> str:
@@ -62,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         default=str(DEFAULT_INPUT),
-        help="输入 Parquet 文件路径（默认为 intention_order_analysis.parquet）",
+        help="输入 Parquet 文件路径",
     )
     parser.add_argument(
         "--models",
@@ -81,6 +155,29 @@ def main() -> None:
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Load Business Definition
+    try:
+        biz_def = load_business_definition(BUSINESS_DEF_FILE)
+        series_group_logic = biz_def.get("series_group_logic", {})
+        product_type_logic = biz_def.get("product_type_logic", {})
+        model_series_mapping = biz_def.get("model_series_mapping", {})
+    except Exception as e:
+        print(f"Error loading business definition: {e}")
+        # Fallback or exit?
+        # Assuming required.
+        raise e
+
+    # Update global BUSINESS_GROUPS based on model_series_mapping
+    # But we also need to account for "CM2 增程" if we create it.
+    # We will update this after processing data or just prepopulate from mapping.
+    # The script uses BUSINESS_GROUPS for filtering.
+    
+    # Construct initial BUSINESS_GROUPS from JSON mapping
+    # Note: user wants to use "series" from new data source.
+    # So keys are series names (LS6, L6).
+    global BUSINESS_GROUPS
+    BUSINESS_GROUPS = model_series_mapping.copy()
 
     df = pd.read_parquet(input_path)
 
@@ -96,30 +193,48 @@ def main() -> None:
             "LockDate",
         ],
     )
-    region_col = resolve_column(
-        df,
-        [
-            "Parent Region Name",
-            "Parent_Region_Name",
-            "Parent Region",
-            "Region Name",
-            "区域",
-            "大区",
-        ],
-    )
-    model_group_col = resolve_column(
-        df,
-        [
-            "车型分组",
-            "Model Group",
-            "Vehicle Group",
-            "Car Group",
-            "车型",
-        ],
-    )
+    # Region col might be different now.
+    # New data has license_province, license_city.
+    # Old script grouped by "Parent Region Name". 
+    # If not present, we can default to "license_province" or just try to find it.
+    try:
+        region_col = resolve_column(
+            df,
+            [
+                "Parent Region Name",
+                "Parent_Region_Name",
+                "Parent Region",
+                "Region Name",
+                "区域",
+                "大区",
+            ],
+        )
+    except KeyError:
+        # If absolutely no region column, create a dummy one
+        print("Warning: No region column found. Using 'Unknown'.")
+        df["Unknown_Region"] = "Unknown"
+        region_col = "Unknown_Region"
+
+    # Resolve approve_refund_time for Retained Lock Logic
+    try:
+        approve_refund_col = resolve_column(
+            df,
+            [
+                "approve_refund_time",
+                "Approve Refund Time",
+                "ApproveRefundTime",
+            ]
+        )
+        df[approve_refund_col] = pd.to_datetime(df[approve_refund_col], errors="coerce")
+    except KeyError:
+        approve_refund_col = None
+        print("Warning: approve_refund_time not found. Retained Lock Total will equal Lock Total.")
+
+    # We don't need model_group_col input anymore because we construct it from product_name
     product_name_col = resolve_column(
         df,
         [
+            "product_name",
             "productname",
             "ProductName",
             "Product Name",
@@ -130,6 +245,7 @@ def main() -> None:
     order_no_col = resolve_column(
         df,
         [
+            "order_number",
             "Order Number",
             "Order_Number",
             "OrderNo",
@@ -140,26 +256,98 @@ def main() -> None:
             "Intention Order Number",
         ],
     )
+    
+    # Series col
+    series_col = resolve_column(
+        df,
+        [
+            "series",
+            "Series",
+            "车系",
+        ]
+    )
 
     df[lock_col] = pd.to_datetime(df[lock_col], errors="coerce")
 
-    df["车型分类"] = df[model_group_col].astype(str)
-    _cm2_all = df[model_group_col].astype(str).str.upper() == "CM2"
-    _is_range_ext_all = df[product_name_col].astype(str).str.contains(r"52|66", case=False, na=False)
-    df.loc[_cm2_all & _is_range_ext_all, "车型分类"] = "CM2 增程"
-    df.loc[_cm2_all & ~_is_range_ext_all, "车型分类"] = "CM2"
+    # --- Classification Logic ---
+    # 1. Generate "车型分类" (Sub-model) using series_group_logic
+    df["车型分类"] = "其他" # Default
     
-    # 构建反向映射: 车型 -> 业务组名
+    # Iterate through logic. Order matters.
+    # Since JSON dicts are ordered, we follow that order.
+    for code, condition in series_group_logic.items():
+        mask = parse_sql_condition(df, condition, product_name_col)
+        # Apply to those who are currently "其他" or overwrite?
+        # Usually specific rules come first or last.
+        # "series_group_logic" has "其他": "ELSE" at the end.
+        # So we should probably apply if match.
+        # But if multiple match? The first one usually wins in CASE WHEN logic.
+        # Let's assume we fill "车型分类" if it is still "其他" or just overwrite in sequence?
+        # If we overwrite in sequence, the last one wins.
+        # "CM2" condition: ...
+        # "CM0" condition: ...
+        # They seem mutually exclusive.
+        if condition == "ELSE":
+             # Apply to remaining "其他"
+             pass
+        else:
+             df.loc[mask, "车型分类"] = code
+
+    # 2. Refine "CM2 增程" using product_type_logic
+    # Check if we have "增程" logic
+    range_ext_condition = product_type_logic.get("增程")
+    if range_ext_condition:
+        is_range_ext = parse_sql_condition(df, range_ext_condition, product_name_col)
+        # If model is CM2 AND is range ext -> CM2 增程
+        cm2_mask = df["车型分类"] == "CM2"
+        df.loc[cm2_mask & is_range_ext, "车型分类"] = "CM2 增程"
+        
+        # Update BUSINESS_GROUPS to include "CM2 增程" in "LS6" (since CM2 is in LS6)
+        # We find which group contains CM2
+        for grp, models in BUSINESS_GROUPS.items():
+            if "CM2" in models and "CM2 增程" not in models:
+                # Need to append. But models might be a list from JSON which we shouldn't mutate in place if it affects others?
+                # It's a new list in our dict.
+                BUSINESS_GROUPS[grp] = models + ["CM2 增程"]
+
+    # 3. Set "业务定义" (Business Group) based on series column
+    # The user said: "lock_summary.py#L17-21 的部分直接使用新数据源中的 series"
+    df["业务定义"] = df[series_col].fillna("其他")
+    
+    # Ensure consistency between BUSINESS_GROUPS and df["业务定义"]
+    # If the data has a series "XYZ" not in BUSINESS_GROUPS, we might want to add it?
+    # Or strict filtering?
+    # The script uses BUSINESS_GROUPS keys to filter "requested_biz".
+    # So if data has "L6", BUSINESS_GROUPS must have "L6".
+    # JSON mapping has "L6".
+    
+    # Check for any Series in data that is not in BUSINESS_GROUPS
+    unique_series = df["业务定义"].unique()
+    for s in unique_series:
+        if s not in BUSINESS_GROUPS:
+            # Dynamically add it?
+            # Find what sub-models belong to this series in the data
+            sub_models = df.loc[df["业务定义"] == s, "车型分类"].unique().tolist()
+            BUSINESS_GROUPS[s] = sub_models
+
+    # Re-build model_to_biz for consistency (though we used series col directly)
     model_to_biz = {}
     for grp_name, models in BUSINESS_GROUPS.items():
         for m in models:
             model_to_biz[m] = grp_name
             
-    df["业务定义"] = df["车型分类"].map(model_to_biz).fillna("其他")
+    # --- End Classification Logic ---
 
     mask = df[lock_col].notna() & (
         (df[lock_col].dt.date >= start_date) & (df[lock_col].dt.date <= end_date)
     )
+
+    # Retained Lock Mask: Lock time exists AND approve_refund_time is NULL
+    if approve_refund_col:
+        retained_mask = mask & df[approve_refund_col].isna()
+    else:
+        retained_mask = mask
+
     wanted_tokens = [m.strip() for m in str(args.models).split(",") if m.strip()] if args.models else []
     requested_biz = [t for t in wanted_tokens if t in BUSINESS_GROUPS]
     requested_models = [t for t in wanted_tokens if t not in BUSINESS_GROUPS]
@@ -172,7 +360,9 @@ def main() -> None:
     model_filter_series = df["车型分类"].isin(expanded_models) if expanded_models else pd.Series(True, index=df.index)
     biz_filter_series = df["业务定义"].isin(requested_biz) if biz_mode else pd.Series(True, index=df.index)
     active_filter = model_filter_series & biz_filter_series
+    
     lock_total = int(df.loc[mask & active_filter, order_no_col].nunique())
+    retained_lock_total = int(df.loc[retained_mask & active_filter, order_no_col].nunique())
 
     # 2) 大定相关统计（周期内、含大定支付时间）
     summary_df = None
@@ -185,9 +375,9 @@ def main() -> None:
         deposit_col = resolve_column(
             df,
             [
+                "deposit_payment_time", # New data
                 "Deposit_Payment_Time",
                 "Deposit Payment Time",
-                "deposit_payment_time",
                 "大定支付时间",
                 "大定时间",
                 "下定时间",
@@ -203,12 +393,13 @@ def main() -> None:
             refund_col = resolve_column(
                 df,
                 [
+                    "deposit_refund_time", # New data preferred
                     "Deposit_Refund_Time",
                     "Deposit Refund Time",
-                    "deposit_refund_time",
                     "大定退订时间",
                     "退订时间",
                     "退款时间",
+                    # Removed fallback to approve_refund_time to strictly follow user request
                 ],
             )
             df[refund_col] = pd.to_datetime(df[refund_col], errors="coerce")
@@ -244,6 +435,7 @@ def main() -> None:
                         {
                             "车型分类": m,
                             "锁单总数": int(df.loc[mask & active_filter & m_filter, order_no_col].nunique()),
+                            "留存锁单总数": int(df.loc[retained_mask & active_filter & m_filter, order_no_col].nunique()),
                             "大定总数": int(df.loc[dmask & active_filter & m_filter, order_no_col].nunique()),
                             "大定留存总数": int(df.loc[dmask & active_filter & m_filter & df[refund_col].isna() & df[lock_col].isna(), order_no_col].nunique()),
                             "大定退订数": int(df.loc[dmask & active_filter & m_filter & df[refund_col].notna(), order_no_col].nunique()),
@@ -281,6 +473,7 @@ def main() -> None:
                         {
                             "车型分类": m,
                             "锁单总数": int(df.loc[mask & active_filter & m_filter, order_no_col].nunique()),
+                            "留存锁单总数": int(df.loc[retained_mask & active_filter & m_filter, order_no_col].nunique()),
                             "大定总数": int(df.loc[dmask & active_filter & m_filter, order_no_col].nunique()),
                             "大定留存总数": int(df.loc[dmask & active_filter & m_filter & df[lock_col].isna(), order_no_col].nunique()),
                             "大定退订数": 0,
@@ -290,8 +483,8 @@ def main() -> None:
 
         summary_df = pd.DataFrame(
             {
-                "指标": ["锁单总数", "大定总数", "大定留存总数", "大定退订数"],
-                "数量": [lock_total, deposit_total, deposit_retained_total, deposit_refund_total],
+                "指标": ["锁单总数", "留存锁单总数", "大定总数", "大定留存总数", "大定退订数"],
+                "数量": [lock_total, retained_lock_total, deposit_total, deposit_retained_total, deposit_refund_total],
             }
         )
         if per_model_df is not None and not per_model_df.empty:
@@ -301,15 +494,11 @@ def main() -> None:
     except KeyError as e:
         # 无大定支付时间字段，仅输出锁单总数并提示缺失字段
         summary_missing_msg = f"字段缺失：{e}"
-        summary_df = pd.DataFrame({"指标": ["锁单总数"], "数量": [lock_total]})
-    df_period = df.loc[mask & active_filter, [lock_col, region_col, model_group_col, product_name_col, order_no_col]].copy()
-    df_period["车型分类"] = df_period[model_group_col].astype(str)
-    cm2_mask = df_period[model_group_col].astype(str).str.upper() == "CM2"
-    is_range_ext = df_period[product_name_col].astype(str).str.contains(r"52|66", case=False, na=False)
-    df_period.loc[cm2_mask & is_range_ext, "车型分类"] = "CM2 增程"
-    df_period.loc[cm2_mask & ~is_range_ext, "车型分类"] = "CM2"
-    df_period["业务定义"] = df_period["车型分类"].map(model_to_biz).fillna("其他")
-
+        summary_df = pd.DataFrame({"指标": ["锁单总数", "留存锁单总数"], "数量": [lock_total, retained_lock_total]})
+    
+    # --- Pivot Logic ---
+    df_period = df.loc[retained_mask & active_filter, [lock_col, region_col, "车型分类", "业务定义", order_no_col]].copy()
+    
     grouped = (
         df_period.groupby([region_col, "车型分类"], observed=False).agg(订单数=(order_no_col, pd.Series.nunique)).reset_index()
     )
@@ -399,6 +588,8 @@ def main() -> None:
         md_lines.append(df_to_md(percent_df.reset_index()))
         preview_pivot = pivot_df
         preview_percent = percent_df
+    
+    # Always output biz breakdown
     grouped_biz = (
         df_period.groupby([region_col, "业务定义"], observed=False).agg(订单数=(order_no_col, pd.Series.nunique)).reset_index()
     )
@@ -436,7 +627,7 @@ def main() -> None:
                 "上牌城市等级",
             ],
         )
-        level_series = df.loc[mask & active_filter, level_col]
+        level_series = df.loc[retained_mask & active_filter, level_col]
         
         # 统计剔除前的“未知”情况（NaN 或 "nan"）
         total_count_l = len(level_series)
@@ -455,7 +646,7 @@ def main() -> None:
 
         level_counts = level_series_valid.value_counts()
         total_orders = len(level_series_valid)
-        level_share = (level_counts / max(total_orders, 1) * 100).round(2)
+        level_share = (level_counts / max(total_orders, 1)).round(3)
         level_df = (
             pd.DataFrame({"level": level_counts.index, "lock_orders": level_counts.values, "share_pct": level_share.values})
             .sort_values(["lock_orders", "share_pct"], ascending=[False, False])
@@ -469,7 +660,7 @@ def main() -> None:
         md_lines.append("## 分 license_city_level 的锁单量与占比")
         md_lines.append(f"字段缺失：{e}")
 
-    # 追加：分 License Province 的锁单量与占比（Top 10）
+    # 追加：分 License Province 的锁单量与占比
     try:
         prov_col = resolve_column(
             df,
@@ -484,21 +675,20 @@ def main() -> None:
                 "省份",
             ],
         )
-        prov_series = df.loc[mask & active_filter, prov_col].astype(str).fillna("未知")
+        prov_series = df.loc[retained_mask & active_filter, prov_col].astype(str).fillna("未知")
         prov_counts = prov_series.value_counts()
         total_orders_p = int(prov_series.size)
-        prov_share = (prov_counts / max(total_orders_p, 1) * 100).round(2)
+        prov_share = (prov_counts / max(total_orders_p, 1)).round(3)
         prov_df = (
             pd.DataFrame({"province": prov_counts.index, "lock_orders": prov_counts.values, "share_pct": prov_share.values})
             .sort_values(["lock_orders", "share_pct"], ascending=[False, False])
-            .head(10)
         )
         md_lines.append("")
-        md_lines.append("## 分 License Province 的锁单量与占比（Top 10）")
+        md_lines.append("## 分 License Province 的锁单量与占比")
         md_lines.append(df_to_md(prov_df))
     except KeyError as e:
         md_lines.append("")
-        md_lines.append("## 分 License Province 的锁单量与占比（Top 10）")
+        md_lines.append("## 分 License Province 的锁单量与占比")
         md_lines.append(f"字段缺失：{e}")
 
     # 追加：分 License City 的锁单量与占比（Top 10）
@@ -519,7 +709,7 @@ def main() -> None:
         city_series = df.loc[mask & active_filter, city_col].astype(str).fillna("未知")
         city_counts = city_series.value_counts()
         total_orders_c = int(city_series.size)
-        city_share = (city_counts / max(total_orders_c, 1) * 100).round(2)
+        city_share = (city_counts / max(total_orders_c, 1)).round(3)
         city_df = (
             pd.DataFrame({"city": city_counts.index, "lock_orders": city_counts.values, "share_pct": city_share.values})
             .sort_values(["lock_orders", "share_pct"], ascending=[False, False])
@@ -646,7 +836,7 @@ def main() -> None:
         # --- A. 总体分布 (Backward Compatibility) ---
         group_counts = valid_group_df["age_group"].value_counts()
         total_orders_age = len(valid_group_df)
-        age_share = (group_counts / max(total_orders_age, 1) * 100).round(2)
+        age_share = (group_counts / max(total_orders_age, 1)).round(3)
 
         age_df = pd.DataFrame({
             "age_group": group_counts.index,
@@ -682,6 +872,8 @@ def main() -> None:
             md_lines.append("")
             md_lines.append("## 分年龄段的锁单量与占比（分车型占比%）")
             md_lines.append(df_to_md(age_pct_df.reset_index()))
+            
+            # Regional breakdown by age
             age_region_df = valid_group_df[[ "age_group", "车型分类", region_col, order_no_col ]].copy()
             age_region_df = age_region_df[age_region_df[region_col].notna()]
             if not age_region_df.empty:
@@ -733,7 +925,7 @@ def main() -> None:
                 "性别",
             ],
         )
-        raw_gender_series = df.loc[mask & active_filter, gender_col]
+        raw_gender_series = df.loc[retained_mask & active_filter, gender_col]
 
         def is_unknown_gender(val):
             if pd.isna(val):
@@ -759,7 +951,7 @@ def main() -> None:
         
         gender_counts = gender_series_valid.value_counts()
         total_orders_gender = len(gender_series_valid)
-        gender_share = (gender_counts / max(total_orders_gender, 1) * 100).round(2)
+        gender_share = (gender_counts / max(total_orders_gender, 1)).round(3)
 
         gender_df = (
             pd.DataFrame({"gender": gender_counts.index, "lock_orders": gender_counts.values, "share_pct": gender_share.values})

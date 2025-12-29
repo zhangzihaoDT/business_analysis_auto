@@ -9,6 +9,7 @@ Order 完整数据处理脚本
 输入文件: 
 - original/Order_完整数据_data.csv
 - original/Order_完整数据_data_2024.csv
+- original/Order_完整数据_data_20251229.csv
 输出文件: formatted/order_full_data.parquet
 """
 
@@ -91,6 +92,8 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
         'Td CountD': 'td_countd',
         'Drive Series Cn': 'drive_series_cn',
         'Main Lead Id': 'main_lead_id',
+        'Parent Region Name': 'parent_region_name',
+        'Parent_Region_Name': 'parent_region_name',
     }
     
     # 应用重命名
@@ -143,7 +146,7 @@ def convert_types(df: pd.DataFrame) -> pd.DataFrame:
         'first_middle_channel_name', 'gender', 'is_hold', 'is_staff',
         'license_city', 'license_city_level', 'license_province',
         'order_type', 'series', 'store_city', 'belong_intent_series',
-        'drive_series_cn'
+        'drive_series_cn', 'parent_region_name'
     ]
     
     for col in cat_cols:
@@ -162,27 +165,36 @@ def convert_types(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def main():
-    # 1. 查找最新的数据文件
-    csv_files = sorted(list(ORIGINAL_DIR.glob("Order_完整数据*.csv")), key=lambda x: x.stat().st_mtime, reverse=True)
+    # 1. 查找所有匹配的数据文件
+    # 按文件名排序，确保带日期的文件通常排在后面（例如 2024.csv, 20251229.csv）
+    # 这样后面的数据会覆盖前面的数据（如果有重复）
+    csv_files = sorted(list(ORIGINAL_DIR.glob("Order_完整数据*.csv")), key=lambda x: x.name)
     
     if not csv_files:
         print(f"❌ 未在 {ORIGINAL_DIR} 找到任何 'Order_完整数据*.csv' 文件")
         return
 
-    latest_file = csv_files[0]
-    print(f"🔍 发现最新数据文件: {latest_file.name}")
+    print(f"🔍 找到 {len(csv_files)} 个数据文件，将按以下顺序处理:")
+    for f in csv_files:
+        print(f"   - {f.name}")
     
-    # 2. 读取新数据
-    df_new = read_csv_smart(latest_file)
-    if df_new.empty:
-        print("❌ 读取新数据失败，退出。")
+    # 2. 读取并合并所有新数据
+    dfs = []
+    for file_path in csv_files:
+        df = read_csv_smart(file_path)
+        if not df.empty:
+            # 清理列名和转换类型
+            # 注意：必须在合并前清理列名，以确保列名一致
+            df = clean_column_names(df)
+            df = convert_types(df)
+            dfs.append(df)
+        
+    if not dfs:
+        print("❌ 没有成功读取到任何数据，退出。")
         return
         
-    # 3. 清理列名和转换类型（在新数据上进行）
-    df_new = clean_column_names(df_new)
-    df_new = convert_types(df_new)
-    
-    print(f"✅ 新数据处理完成: {df_new.shape[0]} 行")
+    df_new = pd.concat(dfs, ignore_index=True)
+    print(f"✅ 所有新数据合并完成: {df_new.shape[0]} 行")
 
     # 4. 增量更新逻辑
     if OUTPUT_FILE.exists():
@@ -190,88 +202,45 @@ def main():
         try:
             df_existing = pd.read_parquet(OUTPUT_FILE)
             print(f"   现有数据: {df_existing.shape[0]} 行")
-
-            # 修复：重命名旧数据中的未清洗列名 (防止 duplicate columns)
             legacy_map = {
                 'approve_refund_time_年/月/日': 'approve_refund_time',
                 'apply_refund_time_年/月/日': 'apply_refund_time',
-                'approve_refund_time 年/月/日': 'approve_refund_time', # 增加空格版本以防万一
-                'apply_refund_time 年/月/日': 'apply_refund_time'
+                'approve_refund_time 年/月/日': 'approve_refund_time',
+                'apply_refund_time 年/月/日': 'apply_refund_time',
+                'Parent Region Name': 'parent_region_name',
+                'Parent_Region_Name': 'parent_region_name'
             }
-            
             for old_col, new_col in legacy_map.items():
                 if old_col in df_existing.columns:
-                    print(f"   🧹 处理旧数据列: {old_col} -> {new_col}")
-                    
-                    # 1. 先转换类型 (如果是字符串)
                     if df_existing[old_col].dtype == 'object':
-                         try:
-                             s = df_existing[old_col].astype(str)
-                             s = s.str.replace('年', '-', regex=False).str.replace('月', '-', regex=False).str.replace('日', '', regex=False)
-                             s = s.replace({'nan': None, 'None': None, '': None})
-                             df_existing[old_col] = pd.to_datetime(s, errors='coerce')
-                         except Exception as e:
-                             print(f"      ⚠️ 转换失败: {e}")
-
-                    # 2. 合并或重命名
+                        try:
+                            s = df_existing[old_col].astype(str)
+                            s = s.str.replace('年', '-', regex=False).str.replace('月', '-', regex=False).str.replace('日', '', regex=False)
+                            s = s.replace({'nan': None, 'None': None, '': None})
+                            df_existing[old_col] = pd.to_datetime(s, errors='coerce')
+                        except Exception as e:
+                            print(f"      ⚠️ 转换失败: {e}")
                     if new_col in df_existing.columns:
-                        # 如果目标列已存在，合并 (优先保留目标列的值，填充 NaNs)
                         df_existing[new_col] = df_existing[new_col].combine_first(df_existing[old_col])
                         df_existing = df_existing.drop(columns=[old_col])
                     else:
-                        # 直接重命名
                         df_existing = df_existing.rename(columns={old_col: new_col})
-
-            # 修复：移除冗余的 order_create_time 列（如果存在，且与 order_create_date 重复或新数据无此列）
-            # if 'order_create_time' in df_existing.columns:
-            #    print("   🧹 清理冗余列 'order_create_time' 以保持结构一致...")
-            #    df_existing = df_existing.drop(columns=['order_create_time'])
-            
-            # 确保列结构一致
             common_cols = list(set(df_existing.columns) & set(df_new.columns))
             new_only = set(df_new.columns) - set(df_existing.columns)
             existing_only = set(df_existing.columns) - set(df_new.columns)
-            
             if new_only or existing_only:
-                print(f"⚠️ 列结构不一致:")
-                if new_only: print(f"   新数据独有: {new_only}")
-                if existing_only: print(f"   旧数据独有: {existing_only}")
-                
-                # 对齐列
                 all_cols = list(set(df_existing.columns) | set(df_new.columns))
                 df_existing = df_existing.reindex(columns=all_cols)
                 df_new = df_new.reindex(columns=all_cols)
-            
-            # 智能合并
             if 'order_number' in df_new.columns and 'order_number' in df_existing.columns:
-                print(f"🔄 执行智能增量合并...")
-                
-                # 转换为集合进行快速查找
                 existing_orders = set(df_existing['order_number'].dropna())
                 new_orders = set(df_new['order_number'].dropna())
-                
                 truly_new_orders = new_orders - existing_orders
                 updated_orders = new_orders & existing_orders
-                
-                print(f"   新增订单: {len(truly_new_orders)}")
-                print(f"   更新订单: {len(updated_orders)}")
-                
-                # 1. 保留旧数据中不在新数据里的（未更新的历史数据）
-                # 注意：这里假设新文件只是增量或部分快照。如果是全量快照，逻辑可能不同。
-                # 但根据用户描述，似乎是希望保留历史累积。
-                # 如果新文件包含已有的订单，通常我们认为新文件的数据更新。
-                
-                # 移除旧数据中将被更新的订单
                 df_final = df_existing[~df_existing['order_number'].isin(updated_orders)].copy()
-                
-                # 添加新数据（包含真正的新增和更新的订单）
-                # 这里假设新文件里的记录就是最新的状态
                 df_final = pd.concat([df_final, df_new], ignore_index=True)
-                
             else:
-                print("⚠️ 未找到 order_number 列，执行追加合并...")
                 df_final = pd.concat([df_existing, df_new], ignore_index=True)
-                
         except Exception as e:
             print(f"❌ 读取现有 Parquet 文件失败: {e}")
             print("   将仅使用新数据。")
@@ -279,6 +248,12 @@ def main():
     else:
         print("📝 未发现现有 Parquet 文件，创建新文件...")
         df_final = df_new
+
+    if 'parent_region_name' in df_final.columns:
+        if df_final['parent_region_name'].nunique() < df_final.shape[0] * 0.5:
+            df_final['parent_region_name'] = df_final['parent_region_name'].astype('category')
+        else:
+            df_final['parent_region_name'] = df_final['parent_region_name'].astype('string')
 
     # 5. 最终去重（以防万一）
     if 'order_number' in df_final.columns:
