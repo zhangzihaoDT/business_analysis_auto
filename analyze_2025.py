@@ -91,7 +91,7 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
     metrics = {}
     
     # 定义指标列表
-    metric_names = ["锁单数", "开票数", "锁单退订数"]
+    metric_names = ["锁单数", "开票数", "锁单退订数", "留存锁单数"]
     
     def get_metric_mask(metric_name: str, year: int) -> pd.Series:
         """
@@ -117,6 +117,25 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
                  lock_mask = df["lock_time"].notna()
                  
             return time_mask & lock_mask
+
+        elif metric_name == "留存锁单数":
+            # lock_time 在周期内 且 (approve_refund_time 为空 或 approve_refund_time > 周期结束)
+            
+            # 1. lock_time 在周期内
+            lock_mask = get_period_mask(df, "lock_time", year)
+            
+            # 2. approve_refund_time 为空 或 > 周期结束
+            if "approve_refund_time" not in df.columns:
+                 refund_mask = pd.Series([True] * len(df), index=df.index)
+            else:
+                 # Ensure datetime
+                 if not pd.api.types.is_datetime64_any_dtype(df["approve_refund_time"]):
+                      df["approve_refund_time"] = pd.to_datetime(df["approve_refund_time"], errors='coerce')
+                 
+                 # Strict definition: Never refunded (as requested by user)
+                 refund_mask = df["approve_refund_time"].isna()
+            
+            return lock_mask & refund_mask
             
         return pd.Series([False] * len(df), index=df.index)
     
@@ -209,7 +228,7 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
         
     metrics['series_details'] = series_details
     
-    # 3. 分能源形式对比 (仅关注锁单数)
+    # 3. 分能源形式对比 (锁单数 & 留存锁单数)
     # 加载业务定义
     try:
         business_def = load_business_definition(BUSINESS_DEF_FILE)
@@ -222,65 +241,67 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
     
     # 明确指定需要展示的 series 顺序
     target_series = ["L6", "LS6", "LS9"]
+    target_energy_metrics = ["锁单数", "留存锁单数"]
     
-    # 反转逻辑：先遍历 Series，再遍历 Energy Type
+    # 结构: energy_details[series][metric] = DataFrame
+    
     for s in target_series:
-        rows = []
+        energy_details[s] = {}
         series_mask = (df['series'] == s)
         
-        for energy_type, condition_str in product_type_logic.items():
-            # 获取该能源形式的 Mask
-            energy_mask = parse_sql_condition(df, condition_str)
+        for metric_name in target_energy_metrics:
+            rows = []
             
-            # Series + Energy Mask
-            combined_mask = series_mask & energy_mask
+            for energy_type, condition_str in product_type_logic.items():
+                # 获取该能源形式的 Mask
+                energy_mask = parse_sql_condition(df, condition_str)
+                
+                # Series + Energy Mask
+                combined_mask = series_mask & energy_mask
+                
+                # 2024
+                mask_2024 = combined_mask & get_metric_mask(metric_name, 2024)
+                val_2024 = df[mask_2024]['order_number'].nunique()
+                
+                # 2025
+                mask_2025 = combined_mask & get_metric_mask(metric_name, 2025)
+                val_2025 = df[mask_2025]['order_number'].nunique()
+                
+                # Diff & Ratio
+                diff = val_2025 - val_2024
+                ratio = (diff / val_2024) if val_2024 > 0 else 0.0
+                
+                ratio_str = f"{ratio:.1%}"
+                if ratio < 0:
+                    ratio_str = f"<span style='color: red'>{ratio_str}</span>"
+                
+                rows.append({
+                    "能源形式": energy_type,
+                    "2024 全年": val_2024,
+                    "2025 (至今)": val_2025,
+                    "Diff": diff,
+                    "Ratio": ratio_str
+                })
+                
+            # 2. 计算 Total (该 Series 下所有能源形式的总和)
+            total_2024 = sum(row["2024 全年"] for row in rows)
+            total_2025 = sum(row["2025 (至今)"] for row in rows)
+            total_diff = total_2025 - total_2024
+            total_ratio = (total_diff / total_2024) if total_2024 > 0 else 0.0
             
-            # 2024 (锁单数)
-            mask_2024 = combined_mask & get_metric_mask("锁单数", 2024)
-            val_2024 = df[mask_2024]['order_number'].nunique()
-            
-            # 2025 (锁单数)
-            mask_2025 = combined_mask & get_metric_mask("锁单数", 2025)
-            val_2025 = df[mask_2025]['order_number'].nunique()
-            
-            # Diff & Ratio
-            diff = val_2025 - val_2024
-            ratio = (diff / val_2024) if val_2024 > 0 else 0.0
-            
-            ratio_str = f"{ratio:.1%}"
-            if ratio < 0:
-                ratio_str = f"<span style='color: red'>{ratio_str}</span>"
-            
+            total_ratio_str = f"{total_ratio:.1%}"
+            if total_ratio < 0:
+                total_ratio_str = f"<span style='color: red'>{total_ratio_str}</span>"
+                
             rows.append({
-                "能源形式": energy_type,
-                "2024 全年": val_2024,
-                "2025 (至今)": val_2025,
-                "Diff": diff,
-                "Ratio": ratio_str
+                "能源形式": "总计",
+                "2024 全年": total_2024,
+                "2025 (至今)": total_2025,
+                "Diff": total_diff,
+                "Ratio": total_ratio_str
             })
             
-        # 2. 计算 Total (该 Series 下所有能源形式的总和)
-        # 注意：如果 product_type_logic 未覆盖所有情况，这里的 Total 仅代表已定义的能源形式之和
-        # 如果需要 Series 的绝对 Total，可以直接用 series_mask 计算，但为了表格逻辑一致性，这里通常展示 breakdown 的 sum
-        # 这里为了确保数据准确性，我们使用 breakdown sum
-        total_2024 = sum(row["2024 全年"] for row in rows)
-        total_2025 = sum(row["2025 (至今)"] for row in rows)
-        total_diff = total_2025 - total_2024
-        total_ratio = (total_diff / total_2024) if total_2024 > 0 else 0.0
-        
-        total_ratio_str = f"{total_ratio:.1%}"
-        if total_ratio < 0:
-            total_ratio_str = f"<span style='color: red'>{total_ratio_str}</span>"
-            
-        rows.append({
-            "能源形式": "总计",
-            "2024 全年": total_2024,
-            "2025 (至今)": total_2025,
-            "Diff": total_diff,
-            "Ratio": total_ratio_str
-        })
-        
-        energy_details[s] = pd.DataFrame(rows)
+            energy_details[s][metric_name] = pd.DataFrame(rows)
         
     metrics['energy_details'] = energy_details
     
@@ -797,10 +818,19 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
                     
                     # 2. Store Daily Avg Test Drives
                     # Mean of (Daily Valid Test Drives / Daily Stores)
+                    # Modified: Use 'active_store_series' (Module 4.3) as denominator if available
+                    
+                    if 'active_store_series' in metrics:
+                         # Map dates to active store counts
+                         df_year['active_store_count'] = df_year['date'].map(metrics['active_store_series'])
+                         denominator = df_year['active_store_count']
+                    else:
+                         denominator = df_year['试驾门店数']
+                    
                     with np.errstate(divide='ignore', invalid='ignore'):
-                        df_year['daily_avg_per_store'] = df_year['有效试驾数'] / df_year['试驾门店数']
-                        df_year['daily_avg_L6'] = df_year['L6有效试驾数'] / df_year['试驾门店数']
-                        df_year['daily_avg_LS6'] = df_year['LS6有效试驾数'] / df_year['试驾门店数']
+                        df_year['daily_avg_per_store'] = df_year['有效试驾数'] / denominator
+                        df_year['daily_avg_L6'] = df_year['L6有效试驾数'] / denominator
+                        df_year['daily_avg_LS6'] = df_year['LS6有效试驾数'] / denominator
                         
                         df_year['daily_avg_per_store'] = df_year['daily_avg_per_store'].replace([np.inf, -np.inf], np.nan)
                         df_year['daily_avg_L6'] = df_year['daily_avg_L6'].replace([np.inf, -np.inf], np.nan)
@@ -819,6 +849,270 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
                 
     except Exception as e:
         print(f"Error calculating Module 6 stats: {e}")
+
+    # ==========================================
+    # 17. 用户画像 (User Profile) - Module 7.1
+    # ==========================================
+    try:
+        # 7.1 Age Structure
+        # Filter valid age (18-100) and Lock Orders
+        if 'age' in df.columns:
+            valid_age_mask = (df['age'] >= 18) & (df['age'] <= 100)
+            
+            # Helper to calculate mean age
+            def calc_mean_age(mask):
+                valid_data = df[mask & valid_age_mask]
+                if valid_data.empty:
+                    return 0.0
+                return valid_data['age'].mean()
+
+            # 7.1.1 By Series
+            age_series_stats = []
+            target_series = ["L6", "LS6", "LS9"]
+            
+            for s in target_series:
+                series_mask = df['series'] == s
+                
+                # 2024
+                mask_2024 = series_mask & get_metric_mask("留存锁单数", 2024)
+                mean_2024 = calc_mean_age(mask_2024)
+                
+                # 2025
+                mask_2025 = series_mask & get_metric_mask("留存锁单数", 2025)
+                mean_2025 = calc_mean_age(mask_2025)
+                
+                # Diff
+                diff = mean_2025 - mean_2024
+                diff_str = f"{diff:+.1f}"
+                if diff < 0:
+                    diff_str = f"<span style='color: red'>{diff_str}</span>"
+                
+                age_series_stats.append({
+                    "Series": s,
+                    "2024 Avg Age": mean_2024,
+                    "2025 Avg Age": mean_2025,
+                    "Diff": diff_str
+                })
+            
+            # Total
+            mask_total_2024 = get_metric_mask("锁单数", 2024)
+            mean_total_2024 = calc_mean_age(mask_total_2024)
+            
+            mask_total_2025 = get_metric_mask("锁单数", 2025)
+            mean_total_2025 = calc_mean_age(mask_total_2025)
+            
+            diff_total = mean_total_2025 - mean_total_2024
+            diff_total_str = f"{diff_total:+.1f}"
+            if diff_total < 0:
+                diff_total_str = f"<span style='color: red'>{diff_total_str}</span>"
+            
+            age_series_stats.append({
+                "Series": "总计",
+                "2024 Avg Age": mean_total_2024,
+                "2025 Avg Age": mean_total_2025,
+                "Diff": diff_total_str
+            })
+            
+            metrics['age_series_stats'] = pd.DataFrame(age_series_stats)
+            
+            # 7.1.2 By Parent Region
+            if 'parent_region_name' in df.columns:
+                age_region_stats = []
+                # Get unique regions, sorted
+                regions = sorted(df['parent_region_name'].dropna().unique())
+                
+                for region in regions:
+                    region_mask = df['parent_region_name'] == region
+                    
+                    # 2024
+                    mask_2024 = region_mask & get_metric_mask("锁单数", 2024)
+                    mean_2024 = calc_mean_age(mask_2024)
+                    
+                    # 2025
+                    mask_2025 = region_mask & get_metric_mask("锁单数", 2025)
+                    mean_2025 = calc_mean_age(mask_2025)
+                    
+                    # Diff
+                    diff = mean_2025 - mean_2024
+                    diff_str = f"{diff:+.1f}"
+                    if diff < 0:
+                        diff_str = f"<span style='color: red'>{diff_str}</span>"
+                    
+                    age_region_stats.append({
+                        "Region": region,
+                        "2024 Avg Age": mean_2024,
+                        "2025 Avg Age": mean_2025,
+                        "Diff": diff_str
+                    })
+                    
+                metrics['age_region_stats'] = pd.DataFrame(age_region_stats)
+
+            # 7.2 Age Trends (Daily Mean Age)
+            age_trends = {}
+            for s in target_series:
+                age_trends[s] = {}
+                series_mask = df['series'] == s
+                
+                for year in [2024, 2025]:
+                    # Strict Retained Logic
+                    mask = series_mask & get_metric_mask("留存锁单数", year)
+                    
+                    # Also need valid age
+                    valid_age_mask = (df['age'] >= 18) & (df['age'] <= 100)
+                    final_mask = mask & valid_age_mask
+                    
+                    data = df[final_mask].copy()
+                    if data.empty:
+                        age_trends[s][year] = pd.Series()
+                        continue
+                        
+                    # Group by Day of Year
+                    # Use 'lock_time' as date source
+                    if not pd.api.types.is_datetime64_any_dtype(data['lock_time']):
+                        data['lock_time'] = pd.to_datetime(data['lock_time'], errors='coerce')
+                    
+                    data['doy'] = data['lock_time'].dt.dayofyear
+                    
+                    # Calculate mean age per day
+                    daily_avg = data.groupby('doy')['age'].mean()
+                    
+                    age_trends[s][year] = daily_avg
+            
+            metrics['age_trends'] = age_trends
+
+            # 7.3 Gender Structure (Retained Lock Orders)
+            # Use 'gender' field.
+            # Calculate counts for 2024 vs 2025.
+            # Output:
+            # 1. By Series (LS6, L6, LS9)
+            # 2. By Region (parent_region_name)
+            
+            gender_stats = {'series': {}, 'region': {}}
+            
+            # Helper to standardize gender and filter Unknown
+            def standardize_gender(g):
+                if pd.isna(g): return None
+                if g in ['男', 'Male']: return "男"
+                if g in ['女', 'Female']: return "女"
+                return None
+
+            # 7.3.1 By Series
+            for s in target_series:
+                gender_stats['series'][s] = {}
+                series_mask = df['series'] == s
+                
+                rows = []
+                
+                # Pre-calculate masks for 2024 and 2025
+                mask_2024 = series_mask & get_metric_mask("留存锁单数", 2024)
+                mask_2025 = series_mask & get_metric_mask("留存锁单数", 2025)
+                
+                data_2024 = df[mask_2024].copy()
+                data_2025 = df[mask_2025].copy()
+                
+                data_2024['std_gender'] = data_2024['gender'].apply(standardize_gender)
+                data_2025['std_gender'] = data_2025['gender'].apply(standardize_gender)
+                
+                # Filter out Unknown/None
+                data_2024 = data_2024.dropna(subset=['std_gender'])
+                data_2025 = data_2025.dropna(subset=['std_gender'])
+                
+                counts_2024 = data_2024['std_gender'].value_counts()
+                counts_2025 = data_2025['std_gender'].value_counts()
+                
+                total_2024 = counts_2024.sum()
+                total_2025 = counts_2025.sum()
+                
+                for g_label in ['男', '女']:
+                    c_2024 = counts_2024.get(g_label, 0)
+                    c_2025 = counts_2025.get(g_label, 0)
+                    
+                    share_2024 = (c_2024 / total_2024) if total_2024 > 0 else 0.0
+                    share_2025 = (c_2025 / total_2025) if total_2025 > 0 else 0.0
+                    
+                    diff_share = share_2025 - share_2024
+                    diff_share_str = f"{diff_share:.1%}"
+                    if diff_share > 0:
+                        diff_share_str = f"+{diff_share_str}"
+                    elif diff_share < 0:
+                        diff_share_str = f"<span style='color: red'>{diff_share_str}</span>"
+                    
+                    rows.append({
+                        "Gender": g_label,
+                        "2024 Count": c_2024,
+                        "2024 Share": f"{share_2024:.1%}",
+                        "2025 Count": c_2025,
+                        "2025 Share": f"{share_2025:.1%}",
+                        "Share Diff": diff_share_str
+                    })
+                
+                gender_stats['series'][s] = pd.DataFrame(rows)
+            
+            # 7.3.2 By Region (parent_region_name)
+            # Identify regions
+            if 'parent_region_name' in df.columns:
+                regions = df['parent_region_name'].dropna().unique()
+                # Sort regions to ensure consistent order
+                regions = sorted(regions)
+                
+                for region in regions:
+                    # Get Region Mask
+                    region_mask = df['parent_region_name'] == region
+                    
+                    rows = []
+                    
+                    mask_2024 = region_mask & get_metric_mask("留存锁单数", 2024)
+                    mask_2025 = region_mask & get_metric_mask("留存锁单数", 2025)
+                    
+                    data_2024 = df[mask_2024].copy()
+                    data_2025 = df[mask_2025].copy()
+                    
+                    data_2024['std_gender'] = data_2024['gender'].apply(standardize_gender)
+                    data_2025['std_gender'] = data_2025['gender'].apply(standardize_gender)
+                    
+                    # Filter out Unknown/None
+                    data_2024 = data_2024.dropna(subset=['std_gender'])
+                    data_2025 = data_2025.dropna(subset=['std_gender'])
+                    
+                    counts_2024 = data_2024['std_gender'].value_counts()
+                    counts_2025 = data_2025['std_gender'].value_counts()
+                    
+                    total_2024 = counts_2024.sum()
+                    total_2025 = counts_2025.sum()
+                    
+                    # Skip empty regions if no data at all (optional, but cleaner)
+                    if total_2024 == 0 and total_2025 == 0:
+                        continue
+                    
+                    for g_label in ['男', '女']:
+                        c_2024 = counts_2024.get(g_label, 0)
+                        c_2025 = counts_2025.get(g_label, 0)
+                        
+                        share_2024 = (c_2024 / total_2024) if total_2024 > 0 else 0.0
+                        share_2025 = (c_2025 / total_2025) if total_2025 > 0 else 0.0
+                        
+                        diff_share = share_2025 - share_2024
+                        diff_share_str = f"{diff_share:.1%}"
+                        if diff_share > 0:
+                            diff_share_str = f"+{diff_share_str}"
+                        elif diff_share < 0:
+                            diff_share_str = f"<span style='color: red'>{diff_share_str}</span>"
+                        
+                        rows.append({
+                            "Gender": g_label,
+                            "2024 Count": c_2024,
+                            "2024 Share": f"{share_2024:.1%}",
+                            "2025 Count": c_2025,
+                            "2025 Share": f"{share_2025:.1%}",
+                            "Share Diff": diff_share_str
+                        })
+                        
+                    gender_stats['region'][region] = pd.DataFrame(rows)
+            
+            metrics['gender_stats'] = gender_stats
+
+    except Exception as e:
+        print(f"Error calculating Module 7 stats: {e}")
 
     return metrics
 
@@ -963,8 +1257,8 @@ def generate_html(metrics: dict, output_file: Path):
     html_content.append("<h2>1.1 指标概览 - 分车型 (By Series)</h2>")
     
     series_details = metrics['series_details']
-    # 按特定顺序展示：锁单 -> 开票 -> 退订
-    display_order = ["锁单数", "开票数", "锁单退订数"]
+    # 按特定顺序展示：锁单 -> 开票 -> 退订 -> 留存锁单
+    display_order = ["锁单数", "开票数", "锁单退订数", "留存锁单数"]
     
     for metric_name in display_order:
         if metric_name in series_details:
@@ -973,17 +1267,23 @@ def generate_html(metrics: dict, output_file: Path):
             html_content.append(df_table.to_html(index=False, classes='table', escape=False, float_format=lambda x: '{:,.0f}'.format(x) if isinstance(x, (int, float)) else x))
             
     # 1.2 指标概览（分能源形式）
-    html_content.append("<h2>1.2 指标概览 - 分能源形式 (By Energy Type) - 仅锁单数</h2>")
+    html_content.append("<h2>1.2 指标概览 - 分能源形式 (By Energy Type)</h2>")
     
     energy_details = metrics.get('energy_details', {})
     # 按照 target_series 顺序展示
     target_series_order = ["L6", "LS6", "LS9"]
+    target_energy_metrics = ["锁单数", "留存锁单数"]
     
     for s in target_series_order:
         if s in energy_details:
-            df_table = energy_details[s]
             html_content.append(f"<h3>{s}</h3>")
-            html_content.append(df_table.to_html(index=False, classes='table', escape=False, float_format=lambda x: '{:,.0f}'.format(x) if isinstance(x, (int, float)) else x))
+            series_data = energy_details[s]
+            
+            for metric_name in target_energy_metrics:
+                if metric_name in series_data:
+                    df_table = series_data[metric_name]
+                    html_content.append(f"<h4>{metric_name}</h4>")
+                    html_content.append(df_table.to_html(index=False, classes='table', escape=False, float_format=lambda x: '{:,.0f}'.format(x) if isinstance(x, (int, float)) else x))
     
     # 1.3 锁单趋势分析 (Lock Order Trends)
     html_content.append("<h2>1.3 锁单趋势分析 (Lock Order Trends)</h2>")
@@ -2428,6 +2728,159 @@ def generate_html(metrics: dict, output_file: Path):
             
             chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
             html_content.append(chart_html)
+
+    # ==========================================
+    # 7. 用户画像 (User Profile)
+    # ==========================================
+    if 'age_series_stats' in metrics or 'age_region_stats' in metrics:
+        html_content.append("<h2>7. 用户画像 (User Profile)</h2>")
+        
+        # 7.1 Age Structure
+        html_content.append("<h3>7.1 年龄结构 (Age Structure)</h3>")
+        html_content.append("<p>统计口径：基于留存锁单数据 (Retained Lock Orders，即不包含任何已退订订单)，年龄范围过滤 [18, 100]。</p>")
+        
+        # 7.1.1 By Series
+        if 'age_series_stats' in metrics:
+            html_content.append("<h4>7.1.1 分车型平均年龄 (Average Age by Series)</h4>")
+            df_table = metrics['age_series_stats']
+            html_content.append(df_table.to_html(index=False, classes='table', escape=False, float_format=lambda x: '{:,.1f}'.format(x) if isinstance(x, (int, float)) else x))
+            
+        # 7.1.2 By Parent Region
+        if 'age_region_stats' in metrics:
+            html_content.append("<h4>7.1.2 分大区平均年龄 (Average Age by Region)</h4>")
+            df_table = metrics['age_region_stats']
+            html_content.append(df_table.to_html(index=False, classes='table', escape=False, float_format=lambda x: '{:,.1f}'.format(x) if isinstance(x, (int, float)) else x))
+
+        # 7.2 Age Trends
+        if 'age_trends' in metrics:
+            html_content.append("<h3>7.2 年龄趋势 (Age Trends)</h3>")
+            html_content.append("<p>展示每日平均年龄走势 (Day of Year 对齐)。包含：<br>1. 每日散点 (Daily)<br>2. 7日移动平均 (MA7)<br>3. LOWESS 平滑趋势线</p>")
+            
+            age_trends = metrics['age_trends']
+            # Series: LS6, L6, LS9
+            target_series = ["L6", "LS6", "LS9"] # Align order with previous sections if possible, or just iterate dict
+            
+            for s in target_series:
+                if s not in age_trends:
+                    continue
+                    
+                fig = go.Figure()
+                
+                # Colors
+                color_2024 = '#95a5a6' # Gray
+                color_2025 = '#3498db' # Blue
+                
+                # 2024
+                data_2024 = age_trends[s][2024]
+                if not data_2024.empty:
+                    # Sort by index (doy)
+                    data_2024 = data_2024.sort_index()
+                    x_2024 = data_2024.index
+                    y_2024 = data_2024.values
+                    
+                    # 1. Scatter (Raw)
+                    fig.add_trace(go.Scatter(
+                        x=x_2024, y=y_2024,
+                        mode='markers',
+                        name='2024 Daily',
+                        marker=dict(color=color_2024, size=4, opacity=0.3),
+                        showlegend=False
+                    ))
+                    
+                    # 2. MA7
+                    ma7_2024 = data_2024.rolling(window=7, min_periods=1).mean()
+                    fig.add_trace(go.Scatter(
+                        x=ma7_2024.index, y=ma7_2024.values,
+                        mode='lines',
+                        name='2024 MA7',
+                        line=dict(color=color_2024, width=2),
+                        opacity=0.8
+                    ))
+                    
+                    # 3. LOWESS
+                    # frac=0.2 means using 20% of data for smoothing window
+                    lowess_2024 = sm.nonparametric.lowess(y_2024, x_2024, frac=0.2)
+                    fig.add_trace(go.Scatter(
+                        x=lowess_2024[:, 0], y=lowess_2024[:, 1],
+                        mode='lines',
+                        name='2024 LOWESS',
+                        line=dict(color=color_2024, width=3, dash='dash'),
+                    ))
+
+                # 2025
+                data_2025 = age_trends[s][2025]
+                if not data_2025.empty:
+                    # Sort by index
+                    data_2025 = data_2025.sort_index()
+                    x_2025 = data_2025.index
+                    y_2025 = data_2025.values
+                    
+                    # 1. Scatter (Raw)
+                    fig.add_trace(go.Scatter(
+                        x=x_2025, y=y_2025,
+                        mode='markers',
+                        name='2025 Daily',
+                        marker=dict(color=color_2025, size=4, opacity=0.3),
+                        showlegend=False
+                    ))
+                    
+                    # 2. MA7
+                    ma7_2025 = data_2025.rolling(window=7, min_periods=1).mean()
+                    fig.add_trace(go.Scatter(
+                        x=ma7_2025.index, y=ma7_2025.values,
+                        mode='lines',
+                        name='2025 MA7',
+                        line=dict(color=color_2025, width=2),
+                        opacity=0.8
+                    ))
+                    
+                    # 3. LOWESS
+                    lowess_2025 = sm.nonparametric.lowess(y_2025, x_2025, frac=0.2)
+                    fig.add_trace(go.Scatter(
+                        x=lowess_2025[:, 0], y=lowess_2025[:, 1],
+                        mode='lines',
+                        name='2025 LOWESS',
+                        line=dict(color=color_2025, width=3, dash='dash'),
+                    ))
+
+                layout = get_common_layout(
+                    title=f"7.2 {s} 平均年龄趋势 (Average Age Trend)",
+                    xaxis_title="Day of Year",
+                    yaxis_title="Average Age"
+                )
+                layout['xaxis']['range'] = [1, 366]
+                # Auto Y-axis should be fine, or strictly [20, 50]? Auto is better for detail.
+                fig.update_layout(layout)
+                
+                chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+                html_content.append(chart_html)
+
+        # 7.3 Gender Structure
+        if 'gender_stats' in metrics:
+            html_content.append("<h3>7.3 性别结构 (Gender Structure)</h3>")
+            html_content.append("<p>统计口径：基于留存锁单数据 (Retained Lock Orders)。</p>")
+            
+            gender_stats = metrics['gender_stats']
+            
+            # 7.3.1 By Series
+            html_content.append("<h4>7.3.1 分车型性别分布 (Gender by Series)</h4>")
+            if 'series' in gender_stats:
+                target_series = ["L6", "LS6", "LS9"]
+                for s in target_series:
+                    if s in gender_stats['series']:
+                        html_content.append(f"<h5>{s}</h5>")
+                        df_table = gender_stats['series'][s]
+                        html_content.append(df_table.to_html(index=False, classes='table', escape=False))
+            
+            # 7.3.2 By Region
+            html_content.append("<h4>7.3.2 分区域性别分布 (Gender by Region)</h4>")
+            if 'region' in gender_stats:
+                # Sort regions alphabetically for display consistency
+                regions = sorted(gender_stats['region'].keys())
+                for region in regions:
+                    df_table = gender_stats['region'][region]
+                    html_content.append(f"<h5>{region}</h5>")
+                    html_content.append(df_table.to_html(index=False, classes='table', escape=False))
 
     html_content.append("</body></html>")
     
