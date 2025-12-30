@@ -142,6 +142,15 @@ def parse_args() -> argparse.Namespace:
         "--models",
         help="逗号分隔的车型列表，仅显示这些车型列，例如: 'CM2,CM2 增程,LS9'",
     )
+    parser.add_argument(
+        "--sections",
+        help="逗号分隔的模块键或组：overview,deposit,region,city_level,province,city,age,gender",
+    )
+    parser.add_argument(
+        "--send",
+        action="store_true",
+        help="生成报告后自动发送到飞书",
+    )
     return parser.parse_args()
 
 
@@ -155,6 +164,27 @@ def main() -> None:
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    SECTION_GROUPS = {
+        "overview": {"overview"},
+        "deposit": {"deposit_daily"},
+        "region": {"region_biz_matrix", "region_model_matrix"},
+        "city_level": {"city_level"},
+        "province": {"province"},
+        "city": {"city_top10"},
+        "age": {"age_stats", "age_distribution", "age_model_pct", "age_region_pct_by_model"},
+        "gender": {"gender"},
+    }
+    raw_sections = set([s.strip() for s in str(args.sections).split(",") if s.strip()]) if getattr(args, "sections", None) else set()
+    expanded = set()
+    for t in raw_sections:
+        if t in SECTION_GROUPS:
+            expanded |= SECTION_GROUPS[t]
+        else:
+            expanded.add(t)
+    include_sections = expanded
+    def section_enabled(key: str) -> bool:
+        return (not include_sections) or (key in include_sections)
     
     # Load Business Definition
     try:
@@ -348,21 +378,95 @@ def main() -> None:
     else:
         retained_mask = mask
 
+    # --- Token Logic for Filter and Grouping ---
     wanted_tokens = [m.strip() for m in str(args.models).split(",") if m.strip()] if args.models else []
+    
+    # Calculate expanded_models for legacy modules (that rely on 车型分类 pivot)
+    expanded_models = []
+    if wanted_tokens:
+        for t in wanted_tokens:
+            if t in BUSINESS_GROUPS:
+                expanded_models.extend(BUSINESS_GROUPS[t])
+            else:
+                expanded_models.append(t)
+        # Remove duplicates
+        expanded_models = list(set(expanded_models))
+
     requested_biz = [t for t in wanted_tokens if t in BUSINESS_GROUPS]
     requested_models = [t for t in wanted_tokens if t not in BUSINESS_GROUPS]
-    expanded_models: List[str] = []
-    for t in requested_models:
-        expanded_models.append(t)
-    for t in requested_biz:
-        expanded_models.extend(BUSINESS_GROUPS[t])
     biz_mode = True if requested_biz and not requested_models else False
-    model_filter_series = df["车型分类"].isin(expanded_models) if expanded_models else pd.Series(True, index=df.index)
-    biz_filter_series = df["业务定义"].isin(requested_biz) if biz_mode else pd.Series(True, index=df.index)
-    active_filter = model_filter_series & biz_filter_series
-    
+
+    # We need to construct a mask for each token to allow flexible aggregation
+    # Token can be a Series (in df["业务定义"]) or a Model (in df["车型分类"])
+    token_masks = {}
+    if wanted_tokens:
+        for t in wanted_tokens:
+            # Match either Business Group (Series) or Model Classification
+            # Use strict equality for now, assuming user knows exact names
+            t_mask = (df["业务定义"] == t) | (df["车型分类"] == t)
+            token_masks[t] = t_mask
+        
+        # Combine all masks for global filtering
+        if token_masks:
+            import operator
+            from functools import reduce
+            active_filter = reduce(operator.or_, token_masks.values())
+        else:
+            active_filter = pd.Series(True, index=df.index)
+    else:
+        active_filter = pd.Series(True, index=df.index)
+
     lock_total = int(df.loc[mask & active_filter, order_no_col].nunique())
     retained_lock_total = int(df.loc[retained_mask & active_filter, order_no_col].nunique())
+
+    # Helper to calculate metric per token
+    def calculate_token_metric(
+        base_df: pd.DataFrame, 
+        tokens: List[str], 
+        masks: Dict[str, pd.Series], 
+        groupby_col: str, 
+        metric_col: str
+    ) -> pd.DataFrame:
+        """
+        Calculates metric for each token separately and combines them.
+        Returns DataFrame with index=groupby_col and columns=tokens.
+        """
+        results = []
+        # Get all unique groups first to ensure alignment? 
+        # Or just concat (outer join) which is safer.
+        
+        for t in tokens:
+            t_mask = masks.get(t, pd.Series(False, index=base_df.index))
+            # Apply token mask to base_df
+            # Note: base_df usually already has some time/status filters applied (e.g. mask & active_filter)
+            # But active_filter is the UNION of all tokens.
+            # So we need to apply the SPECIFIC token mask AND the common filters.
+            # However, base_df passed in should be the FULL df (or filtered by time only), 
+            # and we apply specific mask here?
+            # Actually, the caller usually passes a filtered DF. 
+            # If caller passes df[mask & active_filter], then applying t_mask again is redundant but safe 
+            # ONLY IF t_mask is a subset of active_filter (which it is).
+            # BUT: If row A belongs to Token 1 but not Token 2, it is in active_filter.
+            # When processing Token 2, we must exclude it.
+            # So yes, we must apply t_mask.
+            
+            # Use base_df index alignment
+            subset = base_df[t_mask.reindex(base_df.index, fill_value=False)]
+            
+            if subset.empty:
+                s = pd.Series(0, index=[])
+            else:
+                s = subset.groupby(groupby_col, observed=False)[metric_col].nunique()
+            
+            s.name = t
+            results.append(s)
+            
+        if not results:
+            return pd.DataFrame()
+            
+        return pd.concat(results, axis=1).fillna(0).astype(int)
+
+
 
     # 2) 大定相关统计（周期内、含大定支付时间）
     summary_df = None
@@ -520,7 +624,7 @@ def main() -> None:
             pivot_df = pivot_df[cols]
 
     percent_df = pivot_df.div(pivot_df.sum(axis=0).replace(0, pd.NA), axis=1).fillna(0) * 100
-    percent_df = percent_df.round(2)
+    percent_df = percent_df.round(0).astype(int).astype(str) + "%"
 
     md_lines = []
     md_lines.append("# 锁单分车型分大区汇总")
@@ -528,33 +632,73 @@ def main() -> None:
     md_lines.append(f"- 源文件: `{input_path}`")
     md_lines.append(f"- 时间区间: `{args.start}` ~ `{args.end}`")
     md_lines.append("")
-    if per_model_pivot_df is not None:
-        md_lines.append("## 概览统计（分车型）")
-        md_lines.append(df_to_md(per_model_pivot_df))
-        md_lines.append("")
-    else:
-        md_lines.append("## 概览统计")
-        md_lines.append(df_to_md(summary_df))
-        if summary_missing_msg:
+    if section_enabled("overview"):
+        if per_model_pivot_df is not None:
+            md_lines.append("## 概览统计（分车型）")
+            md_lines.append(df_to_md(per_model_pivot_df))
             md_lines.append("")
-            md_lines.append(f"缺失字段提示：{summary_missing_msg}")
+        else:
+            md_lines.append("## 概览统计")
+            md_lines.append(df_to_md(summary_df))
+            if summary_missing_msg:
+                md_lines.append("")
+                md_lines.append(f"缺失字段提示：{summary_missing_msg}")
+            md_lines.append("")
+    if section_enabled("deposit_daily"):
+        if (not biz_mode) and (requested_models and len(requested_models) >= 2):
+            md_lines.append("## 大定留存的 Deposit_Payment_Time 分布（按日，分车型）")
+            if retained_by_date_pivot_df is not None and not retained_by_date_pivot_df.empty:
+                md_lines.append(df_to_md(retained_by_date_pivot_df.reset_index()))
+            else:
+                md_lines.append("(空表，无数据)")
+        else:
+            md_lines.append("## 大定留存的 Deposit_Payment_Time 分布（按日）")
+            if retained_by_date_total_df is not None and not retained_by_date_total_df.empty:
+                md_lines.append(df_to_md(retained_by_date_total_df))
+            else:
+                md_lines.append("(空表，无数据)")
         md_lines.append("")
-    if (not biz_mode) and (requested_models and len(requested_models) >= 2):
-        md_lines.append("## 大定留存的 Deposit_Payment_Time 分布（按日，分车型）")
-        if retained_by_date_pivot_df is not None and not retained_by_date_pivot_df.empty:
-            md_lines.append(df_to_md(retained_by_date_pivot_df.reset_index()))
-        else:
-            md_lines.append("(空表，无数据)")
-    else:
-        md_lines.append("## 大定留存的 Deposit_Payment_Time 分布（按日）")
-        if retained_by_date_total_df is not None and not retained_by_date_total_df.empty:
-            md_lines.append(df_to_md(retained_by_date_total_df))
-        else:
-            md_lines.append("(空表，无数据)")
-    md_lines.append("")
     preview_pivot = None
     preview_percent = None
     if biz_mode:
+        if section_enabled("region_biz_matrix"):
+            grouped_biz = (
+                df_period.groupby([region_col, "业务定义"], observed=False).agg(订单数=(order_no_col, pd.Series.nunique)).reset_index()
+            )
+            grouped_biz.rename(columns={region_col: "Parent Region Name"}, inplace=True)
+            pivot_biz = grouped_biz.pivot_table(
+                index="Parent Region Name",
+                columns="业务定义",
+                values="订单数",
+                fill_value=0,
+                aggfunc="sum",
+                observed=False,
+            ).sort_index().sort_index(axis=1)
+            if requested_biz:
+                cols_biz = [c for c in requested_biz if c in pivot_biz.columns]
+                if cols_biz:
+                    pivot_biz = pivot_biz[cols_biz]
+            percent_biz = pivot_biz.div(pivot_biz.sum(axis=0).replace(0, pd.NA), axis=1).fillna(0) * 100
+            percent_biz = percent_biz.round(0).astype(int).astype(str) + "%"
+            md_lines.append("## 区域 x 业务定义矩阵")
+            md_lines.append(df_to_md(pivot_biz.reset_index()))
+            md_lines.append("")
+            md_lines.append("## 分 region 占比（%）（按业务定义列归一化）")
+            md_lines.append(df_to_md(percent_biz.reset_index()))
+            preview_pivot = pivot_biz
+            preview_percent = percent_biz
+    else:
+        if section_enabled("region_model_matrix"):
+            md_lines.append("## 区域 x 车型矩阵")
+            md_lines.append(df_to_md(pivot_df.reset_index()))
+            md_lines.append("")
+            md_lines.append("## 分 region 占比（%）（按车型列归一化）")
+            md_lines.append(df_to_md(percent_df.reset_index()))
+            preview_pivot = pivot_df
+            preview_percent = percent_df
+    
+    # Always output biz breakdown
+    if section_enabled("region_biz_matrix"):
         grouped_biz = (
             df_period.groupby([region_col, "业务定义"], observed=False).agg(订单数=(order_no_col, pd.Series.nunique)).reset_index()
         )
@@ -566,51 +710,16 @@ def main() -> None:
             fill_value=0,
             aggfunc="sum",
             observed=False,
-        ).sort_index().sort_index(axis=1)
-        if requested_biz:
-            cols_biz = [c for c in requested_biz if c in pivot_biz.columns]
-            if cols_biz:
-                pivot_biz = pivot_biz[cols_biz]
+        )
+        pivot_biz = pivot_biz.sort_index().sort_index(axis=1)
         percent_biz = pivot_biz.div(pivot_biz.sum(axis=0).replace(0, pd.NA), axis=1).fillna(0) * 100
-        percent_biz = percent_biz.round(2)
+        percent_biz = percent_biz.round(0).astype(int).astype(str) + "%"
+        md_lines.append("")
         md_lines.append("## 区域 x 业务定义矩阵")
         md_lines.append(df_to_md(pivot_biz.reset_index()))
         md_lines.append("")
         md_lines.append("## 分 region 占比（%）（按业务定义列归一化）")
         md_lines.append(df_to_md(percent_biz.reset_index()))
-        preview_pivot = pivot_biz
-        preview_percent = percent_biz
-    else:
-        md_lines.append("## 区域 x 车型矩阵")
-        md_lines.append(df_to_md(pivot_df.reset_index()))
-        md_lines.append("")
-        md_lines.append("## 分 region 占比（%）（按车型列归一化）")
-        md_lines.append(df_to_md(percent_df.reset_index()))
-        preview_pivot = pivot_df
-        preview_percent = percent_df
-    
-    # Always output biz breakdown
-    grouped_biz = (
-        df_period.groupby([region_col, "业务定义"], observed=False).agg(订单数=(order_no_col, pd.Series.nunique)).reset_index()
-    )
-    grouped_biz.rename(columns={region_col: "Parent Region Name"}, inplace=True)
-    pivot_biz = grouped_biz.pivot_table(
-        index="Parent Region Name",
-        columns="业务定义",
-        values="订单数",
-        fill_value=0,
-        aggfunc="sum",
-        observed=False,
-    )
-    pivot_biz = pivot_biz.sort_index().sort_index(axis=1)
-    percent_biz = pivot_biz.div(pivot_biz.sum(axis=0).replace(0, pd.NA), axis=1).fillna(0) * 100
-    percent_biz = percent_biz.round(2)
-    md_lines.append("")
-    md_lines.append("## 区域 x 业务定义矩阵")
-    md_lines.append(df_to_md(pivot_biz.reset_index()))
-    md_lines.append("")
-    md_lines.append("## 分 region 占比（%）（按业务定义列归一化）")
-    md_lines.append(df_to_md(percent_biz.reset_index()))
 
     try:
         level_col = resolve_column(
@@ -646,15 +755,56 @@ def main() -> None:
 
         level_counts = level_series_valid.value_counts()
         total_orders = len(level_series_valid)
-        level_share = (level_counts / max(total_orders, 1)).round(3)
+        level_share = (level_counts / max(total_orders, 1) * 100).round(0).astype(int).astype(str) + "%"
         level_df = (
             pd.DataFrame({"level": level_counts.index, "lock_orders": level_counts.values, "share_pct": level_share.values})
             .sort_values(["lock_orders", "share_pct"], ascending=[False, False])
         )
-        md_lines.append("")
-        md_lines.append("## 分 license_city_level 的锁单量与占比")
-        md_lines.append(f"> 注：已剔除无效/空值样本 {unknown_l_count} 个（占比 {unknown_l_pct:.2f}%），下表基于有效样本 {total_orders} 个统计。")
-        md_lines.append(df_to_md(level_df))
+        if section_enabled("city_level"):
+            md_lines.append("")
+            md_lines.append("## 分 license_city_level 的锁单量与占比")
+            md_lines.append(f"> 注：已剔除无效/空值样本 {unknown_l_count} 个（占比 {unknown_l_pct:.2f}%），下表基于有效样本 {total_orders} 个统计。")
+            md_lines.append(df_to_md(level_df))
+        
+        if section_enabled("city_level"):
+            level_sub_df = df.loc[retained_mask & active_filter, [level_col, "车型分类", order_no_col]].copy()
+            # 过滤无效/未知值
+            level_sub_df["__is_unknown__"] = level_sub_df[level_col].apply(is_unknown_level).astype(bool)
+            level_sub_df = level_sub_df[~level_sub_df["__is_unknown__"]].drop(columns=["__is_unknown__"])
+            if not level_sub_df.empty:
+                if args.models:
+                    pivot_level_model = calculate_token_metric(
+                        level_sub_df, 
+                        wanted_tokens, 
+                        token_masks, 
+                        level_col, 
+                        order_no_col
+                    )
+                    # Align with overall level counts order
+                    pivot_level_model = pivot_level_model.reindex(level_counts.index).fillna(0).astype(int)
+                else:
+                    level_counts_model = (
+                        level_sub_df.groupby([level_col, "车型分类"], observed=False)
+                        .agg(订单数=(order_no_col, pd.Series.nunique))
+                        .reset_index()
+                    )
+                    pivot_level_model = level_counts_model.pivot_table(
+                        index=level_col,
+                        columns="车型分类",
+                        values="订单数",
+                        aggfunc="sum",
+                        fill_value=0,
+                        observed=False,
+                    )
+
+                pivot_level_pct = pivot_level_model.div(pivot_level_model.sum(axis=0).replace(0, pd.NA), axis=1).fillna(0) * 100
+                pivot_level_pct = pivot_level_pct.round(0).astype(int).astype(str) + "%"
+                
+                # Only show if we have columns
+                if not pivot_level_model.empty:
+                    md_lines.append("")
+                    md_lines.append("## 分 license_city_level 的锁单量（分车型占比%）")
+                    md_lines.append(df_to_md(pivot_level_pct.reset_index()).replace("nan%", "0%"))
     except KeyError as e:
         md_lines.append("")
         md_lines.append("## 分 license_city_level 的锁单量与占比")
@@ -678,14 +828,50 @@ def main() -> None:
         prov_series = df.loc[retained_mask & active_filter, prov_col].astype(str).fillna("未知")
         prov_counts = prov_series.value_counts()
         total_orders_p = int(prov_series.size)
-        prov_share = (prov_counts / max(total_orders_p, 1)).round(3)
+        prov_share = (prov_counts / max(total_orders_p, 1) * 100).round(0).astype(int).astype(str) + "%"
         prov_df = (
             pd.DataFrame({"province": prov_counts.index, "lock_orders": prov_counts.values, "share_pct": prov_share.values})
             .sort_values(["lock_orders", "share_pct"], ascending=[False, False])
         )
-        md_lines.append("")
-        md_lines.append("## 分 License Province 的锁单量与占比")
-        md_lines.append(df_to_md(prov_df))
+        if section_enabled("province"):
+            md_lines.append("")
+            md_lines.append("## 分 License Province 的锁单量与占比")
+            md_lines.append(df_to_md(prov_df))
+        
+        if section_enabled("province"):
+            prov_sub_df = df.loc[retained_mask & active_filter, [prov_col, "车型分类", order_no_col, "业务定义"]].copy()
+            if not prov_sub_df.empty:
+                if args.models:
+                    pivot_prov_model = calculate_token_metric(
+                        prov_sub_df, 
+                        wanted_tokens, 
+                        token_masks, 
+                        prov_col, 
+                        order_no_col
+                    )
+                    pivot_prov_model = pivot_prov_model.reindex(prov_counts.index).fillna(0).astype(int)
+                else:
+                    prov_counts_model = (
+                        prov_sub_df.groupby([prov_col, "车型分类"], observed=False)
+                        .agg(订单数=(order_no_col, pd.Series.nunique))
+                        .reset_index()
+                    )
+                    pivot_prov_model = prov_counts_model.pivot_table(
+                        index=prov_col,
+                        columns="车型分类",
+                        values="订单数",
+                        aggfunc="sum",
+                        fill_value=0,
+                        observed=False,
+                    )
+                
+                pivot_prov_pct = pivot_prov_model.div(pivot_prov_model.sum(axis=0).replace(0, pd.NA), axis=1).fillna(0) * 100
+                pivot_prov_pct = pivot_prov_pct.round(0).astype(int).astype(str) + "%"
+                
+                if not pivot_prov_model.empty:
+                    md_lines.append("")
+                    md_lines.append("## 分 License Province 的锁单量（分车型占比%）")
+                    md_lines.append(df_to_md(pivot_prov_pct.reset_index()).replace("nan%", "0%"))
     except KeyError as e:
         md_lines.append("")
         md_lines.append("## 分 License Province 的锁单量与占比")
@@ -709,15 +895,58 @@ def main() -> None:
         city_series = df.loc[mask & active_filter, city_col].astype(str).fillna("未知")
         city_counts = city_series.value_counts()
         total_orders_c = int(city_series.size)
-        city_share = (city_counts / max(total_orders_c, 1)).round(3)
+        city_share = (city_counts / max(total_orders_c, 1) * 100).round(0).astype(int).astype(str) + "%"
         city_df = (
             pd.DataFrame({"city": city_counts.index, "lock_orders": city_counts.values, "share_pct": city_share.values})
             .sort_values(["lock_orders", "share_pct"], ascending=[False, False])
             .head(10)
         )
-        md_lines.append("")
-        md_lines.append("## 分 License City 的锁单量与占比（Top 10）")
-        md_lines.append(df_to_md(city_df))
+        if section_enabled("city_top10"):
+            md_lines.append("")
+            md_lines.append("## 分 License City 的锁单量与占比（Top 10）")
+            md_lines.append(df_to_md(city_df))
+        
+        if section_enabled("city_top10"):
+            if args.models:
+                # Combined table for requested tokens
+                city_sub_df = df.loc[mask & active_filter, [city_col, "车型分类", order_no_col, "业务定义"]].copy()
+                pivot_city_model = calculate_token_metric(
+                    city_sub_df, 
+                    wanted_tokens, 
+                    token_masks, 
+                    city_col, 
+                    order_no_col
+                )
+                # Reindex to Top 10 cities (by total)
+                top10_cities = city_df["city"].tolist()
+                pivot_city_model = pivot_city_model.reindex(top10_cities).fillna(0).astype(int)
+                
+                # Add percentages? Or just counts? User usually wants counts for Top 10.
+                # Let's show counts.
+                if not pivot_city_model.empty:
+                    md_lines.append("")
+                    md_lines.append("## 分 License City 的锁单量（Top 10 Cities Breakdown）")
+                    md_lines.append(df_to_md(pivot_city_model.reset_index()))
+            
+            else:
+                # Original logic: Loop over models found in data
+                models_for_cross = list(df.loc[mask & active_filter, "车型分类"].unique())
+                if models_for_cross:
+                    for m in models_for_cross:
+                        sub_series = df.loc[mask & (df["车型分类"] == m), city_col].astype(str).fillna("未知")
+                        if sub_series.empty:
+                            continue
+                        sub_counts = sub_series.value_counts()
+                        sub_total = int(sub_series.size)
+                        sub_share = (sub_counts / max(sub_total, 1) * 100).round(0).astype(int).astype(str) + "%"
+                        sub_df = (
+                            pd.DataFrame({"city": sub_counts.index, "lock_orders": sub_counts.values, "share_pct": sub_share.values})
+                            .sort_values(["lock_orders", "share_pct"], ascending=[False, False])
+                            .head(10)
+                        )
+                        md_lines.append("")
+                        md_lines.append(f"## 分 License City 的锁单量与占比（Top 10，{m}）")
+                        md_lines.append(df_to_md(sub_df))
     except KeyError as e:
         md_lines.append("")
         md_lines.append("## 分 License City 的锁单量与占比（Top 10）")
@@ -753,44 +982,46 @@ def main() -> None:
         valid_ages_stats = age_series_raw.where((age_series_raw >= 16) & (age_series_raw <= 85)).dropna()
         
         if not valid_ages_stats.empty:
-            age_mean = valid_ages_stats.mean()
-            age_median = valid_ages_stats.median()
-            age_std = valid_ages_stats.std()
-            md_lines.append("")
-            md_lines.append("## 车主年龄统计")
-            md_lines.append(f"- 平均值: {age_mean:.2f}")
-            md_lines.append(f"- 中位数: {age_median:.2f}")
-            md_lines.append(f"- 标准差: {age_std:.2f}")
-            md_lines.append(f"> 注：已根据区间过滤剔除不在 [16,85] 的样本 {out_of_range_count} 个（占比 {out_of_range_pct:.2f}%）。")
-            if (not biz_mode) and (requested_models and len(requested_models) >= 2):
-                age_valid_df = age_sub_df[
-                    age_sub_df["age_raw"].notna()
-                    & (age_sub_df["age_raw"] >= 16)
-                    & (age_sub_df["age_raw"] <= 85)
-                ].copy()
-                if not age_valid_df.empty:
-                    per_model_age = (
-                        age_valid_df.groupby("车型分类")["age_raw"]
-                        .agg(["mean", "median", "std"])
-                        .round(2)
-                    )
-                    if args.models:
-                        wanted = [m.strip() for m in str(args.models).split(",") if m.strip()]
-                        cols = [m for m in wanted if m in per_model_age.index]
-                        if cols:
-                            per_model_age = per_model_age.loc[cols]
-                    per_model_age = per_model_age.rename(
-                        columns={"mean": "平均值", "median": "中位数", "std": "标准差"}
-                    ).T
-                    per_model_age.index.name = "指标"
-                    md_lines.append("")
-                    md_lines.append("## 车主年龄统计（分车型）")
-                    md_lines.append(df_to_md(per_model_age.reset_index()))
+            if section_enabled("age_stats"):
+                age_mean = valid_ages_stats.mean()
+                age_median = valid_ages_stats.median()
+                age_std = valid_ages_stats.std()
+                md_lines.append("")
+                md_lines.append("## 车主年龄统计")
+                md_lines.append(f"- 平均值: {age_mean:.2f}")
+                md_lines.append(f"- 中位数: {age_median:.2f}")
+                md_lines.append(f"- 标准差: {age_std:.2f}")
+                md_lines.append(f"> 注：已根据区间过滤剔除不在 [16,85] 的样本 {out_of_range_count} 个（占比 {out_of_range_pct:.2f}%）。")
+                if (not biz_mode) and (requested_models and len(requested_models) >= 2):
+                    age_valid_df = age_sub_df[
+                        age_sub_df["age_raw"].notna()
+                        & (age_sub_df["age_raw"] >= 16)
+                        & (age_sub_df["age_raw"] <= 85)
+                    ].copy()
+                    if not age_valid_df.empty:
+                        per_model_age = (
+                            age_valid_df.groupby("车型分类")["age_raw"]
+                            .agg(["mean", "median", "std"])
+                            .round(2)
+                        )
+                        if args.models:
+                            wanted = [m.strip() for m in str(args.models).split(",") if m.strip()]
+                            cols = [m for m in wanted if m in per_model_age.index]
+                            if cols:
+                                per_model_age = per_model_age.loc[cols]
+                        per_model_age = per_model_age.rename(
+                            columns={"mean": "平均值", "median": "中位数", "std": "标准差"}
+                        ).T
+                        per_model_age.index.name = "指标"
+                        md_lines.append("")
+                        md_lines.append("## 车主年龄统计（分车型）")
+                        md_lines.append(df_to_md(per_model_age.reset_index()))
         else:
-            md_lines.append("")
-            md_lines.append("## 车主年龄统计")
-            md_lines.append("(无有效年龄数据)")
-            md_lines.append(f"> 注：已根据区间过滤剔除不在 [16,85] 的样本 {out_of_range_count} 个（占比 {out_of_range_pct:.2f}%）。")
+            if section_enabled("age_stats"):
+                md_lines.append("")
+                md_lines.append("## 车主年龄统计")
+                md_lines.append("(无有效年龄数据)")
+                md_lines.append(f"> 注：已根据区间过滤剔除不在 [16,85] 的样本 {out_of_range_count} 个（占比 {out_of_range_pct:.2f}%）。")
 
         # 修正：使用 start_date 的年份作为基准
         current_year = start_date.year
@@ -836,7 +1067,7 @@ def main() -> None:
         # --- A. 总体分布 (Backward Compatibility) ---
         group_counts = valid_group_df["age_group"].value_counts()
         total_orders_age = len(valid_group_df)
-        age_share = (group_counts / max(total_orders_age, 1)).round(3)
+        age_share = (group_counts / max(total_orders_age, 1) * 100).round(0).astype(int).astype(str) + "%"
 
         age_df = pd.DataFrame({
             "age_group": group_counts.index,
@@ -847,19 +1078,21 @@ def main() -> None:
         age_df["age_group"] = pd.Categorical(age_df["age_group"], categories=sort_order, ordered=True)
         age_df = age_df.sort_values("age_group")
 
-        md_lines.append("")
-        md_lines.append("## 分年龄段的锁单量与占比")
-        md_lines.append(f"> 注：已剔除年龄未知或不在[16,85]区间的样本共 {total_excluded} 个（占比 {total_excluded_pct:.2f}%），下表基于有效样本 {valid_sample_count} 个统计。")
-        md_lines.append(df_to_md(age_df))
+        if section_enabled("age_distribution"):
+            md_lines.append("")
+            md_lines.append("## 分年龄段的锁单量与占比")
+            md_lines.append(f"> 注：已剔除年龄未知或不在[16,85]区间的样本共 {total_excluded} 个（占比 {total_excluded_pct:.2f}%），下表基于有效样本 {valid_sample_count} 个统计。")
+            md_lines.append(df_to_md(age_df))
 
         # --- B. 分车型分布 (New Feature) ---
-        if not biz_mode:
+        if not valid_group_df.empty and section_enabled("age_model_pct"):
             age_pivot = valid_group_df.pivot_table(
                 index="age_group",
                 columns="车型分类",
                 values=order_no_col,
                 aggfunc="nunique",
-                fill_value=0
+                fill_value=0,
+                observed=False,
             )
             age_pivot = age_pivot.reindex(sort_order)
             if args.models:
@@ -868,7 +1101,7 @@ def main() -> None:
                 if cols:
                     age_pivot = age_pivot[cols]
             age_pct_df = age_pivot.div(age_pivot.sum(axis=0).replace(0, pd.NA), axis=1).fillna(0) * 100
-            age_pct_df = age_pct_df.round(2)
+            age_pct_df = age_pct_df.round(0).astype(int).astype(str) + "%"
             md_lines.append("")
             md_lines.append("## 分年龄段的锁单量与占比（分车型占比%）")
             md_lines.append(df_to_md(age_pct_df.reset_index()))
@@ -878,7 +1111,7 @@ def main() -> None:
             age_region_df = age_region_df[age_region_df[region_col].notna()]
             if not age_region_df.empty:
                 age_region_counts = (
-                    age_region_df.groupby(["age_group", region_col, "车型分类"])
+                    age_region_df.groupby(["age_group", region_col, "车型分类"], observed=False)
                     .agg(订单数=(order_no_col, pd.Series.nunique))
                     .reset_index()
                 )
@@ -897,14 +1130,16 @@ def main() -> None:
                         values="订单数",
                         aggfunc="sum",
                         fill_value=0,
+                        observed=False,
                     )
                     pivot_counts = pivot_counts.reindex(sort_order)
                     row_sum = pivot_counts.sum(axis=1).replace(0, pd.NA)
                     pivot_pct = pivot_counts.div(row_sum, axis=0).fillna(0) * 100
-                    pivot_pct = pivot_pct.round(2)
-                    md_lines.append("")
-                    md_lines.append(f"## 分年龄段的锁单在不同区域的占比（{m}，按年龄段行归一化）")
-                    md_lines.append(df_to_md(pivot_pct.reset_index()))
+                    pivot_pct = pivot_pct.round(0).astype(int).astype(str) + "%"
+                    if section_enabled("age_region_pct_by_model"):
+                        md_lines.append("")
+                        md_lines.append(f"## 分年龄段的锁单在不同区域的占比（{m}，按年龄段行归一化）")
+                        md_lines.append(df_to_md(pivot_pct.reset_index()))
 
     except KeyError as e:
         md_lines.append("")
@@ -951,17 +1186,18 @@ def main() -> None:
         
         gender_counts = gender_series_valid.value_counts()
         total_orders_gender = len(gender_series_valid)
-        gender_share = (gender_counts / max(total_orders_gender, 1)).round(3)
+        gender_share = (gender_counts / max(total_orders_gender, 1) * 100).round(0).astype(int).astype(str) + "%"
 
         gender_df = (
             pd.DataFrame({"gender": gender_counts.index, "lock_orders": gender_counts.values, "share_pct": gender_share.values})
             .sort_values(["lock_orders", "share_pct"], ascending=[False, False])
         )
 
-        md_lines.append("")
-        md_lines.append("## 分性别的锁单量与占比")
-        md_lines.append(f"> 注：已剔除性别为“默认未知/None/空”的样本 {unknown_g_count} 个（占比 {unknown_g_pct:.2f}%），下表基于有效样本 {total_orders_gender} 个统计。")
-        md_lines.append(df_to_md(gender_df))
+        if section_enabled("gender"):
+            md_lines.append("")
+            md_lines.append("## 分性别的锁单量与占比")
+            md_lines.append(f"> 注：已剔除性别为“默认未知/None/空”的样本 {unknown_g_count} 个（占比 {unknown_g_pct:.2f}%），下表基于有效样本 {total_orders_gender} 个统计。")
+            md_lines.append(df_to_md(gender_df))
 
     except KeyError as e:
         md_lines.append("")
@@ -979,6 +1215,25 @@ def main() -> None:
     print("\n占比预览：")
     if preview_percent is not None:
         print(df_to_md(preview_percent.reset_index()))
+
+    if args.send:
+        print("\nSending report to Feishu...")
+        import subprocess
+        import sys
+        
+        script_dir = Path(__file__).parent
+        send_script = script_dir / "send_lock_summary_to_feishu.py"
+        
+        if send_script.exists():
+            try:
+                subprocess.run(
+                    [sys.executable, str(send_script), "--file", str(report_path)],
+                    check=True
+                )
+            except subprocess.CalledProcessError as e:
+                print(f"Error sending report: {e}")
+        else:
+            print(f"Warning: Send script not found at {send_script}")
 
 
 if __name__ == "__main__":
