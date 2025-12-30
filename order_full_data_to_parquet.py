@@ -3,13 +3,13 @@
 """
 Order 完整数据处理脚本
 
-该脚本用于处理 Order_完整数据_data.csv 和 Order_完整数据_data_2024.csv 文件
+该脚本用于处理 Order_完整数据_data.csv、Order_完整数据_data_2024.csv，以及 original 目录下最新的年度文件（如 Order_完整数据_data_2025*.csv）
 将其合并、去重并转换为优化的 Parquet 格式
 
 输入文件: 
 - original/Order_完整数据_data.csv
 - original/Order_完整数据_data_2024.csv
-- original/Order_完整数据_data_20251229.csv
+- original/Order_完整数据_data_2025*.csv（选最新的一个）
 输出文件: formatted/order_full_data.parquet
 """
 
@@ -165,13 +165,26 @@ def convert_types(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def main():
-    # 1. 查找所有匹配的数据文件
-    # 按文件名排序，确保带日期的文件通常排在后面（例如 2024.csv, 20251229.csv）
-    # 这样后面的数据会覆盖前面的数据（如果有重复）
-    csv_files = sorted(list(ORIGINAL_DIR.glob("Order_完整数据*.csv")), key=lambda x: x.name)
+    # 1. 按要求收集输入文件：基础文件 + 2024年度 + 最新的当前年度文件
+    csv_files = []
+    
+    base_files = [
+        ORIGINAL_DIR / "Order_完整数据_data.csv",
+        ORIGINAL_DIR / "Order_完整数据_data_2024.csv",
+    ]
+    for bf in base_files:
+        if bf.exists():
+            csv_files.append(bf)
+    
+    current_year = datetime.now().strftime("%Y")
+    year_pattern = f"Order_完整数据_data_{current_year}*.csv"
+    year_files = list(ORIGINAL_DIR.glob(year_pattern))
+    if year_files:
+        latest_year_file = max(year_files, key=lambda p: p.stat().st_mtime)
+        csv_files.append(latest_year_file)
     
     if not csv_files:
-        print(f"❌ 未在 {ORIGINAL_DIR} 找到任何 'Order_完整数据*.csv' 文件")
+        print(f"❌ 未在 {ORIGINAL_DIR} 找到所需的输入文件（基础、2024或当年最新）")
         return
 
     print(f"🔍 找到 {len(csv_files)} 个数据文件，将按以下顺序处理:")

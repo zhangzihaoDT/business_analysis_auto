@@ -4,7 +4,7 @@
 """
 每日锁单数据观察脚本
 功能：
-1. 读取 intention_order_analysis.parquet 数据
+1. 读取 order_full_data.parquet 数据
 2. 计算昨日（T-1）的锁单数
 3. 统计指定车型（CM2, DM1, LS9）的锁单情况
 4. 发送飞书通知
