@@ -86,6 +86,133 @@ def get_period_mask(df: pd.DataFrame, date_col: str, year: int) -> pd.Series:
         # For 2025 and beyond, just take everything from start_date
         return df[date_col] >= start_date
 
+def calculate_store_tenure_metrics(df):
+    """
+    Module 4.3.2: Store Tenure Analysis
+    Calculates store tenure (Max Lock Time - Store Create Date) for Retained Lock Orders.
+    Returns bin statistics for 2024 and 2025.
+    """
+    results = {}
+    
+    # Define bins
+    # 0-30, 31-60, ...
+    bins = [-1, 30, 90, 180, 360, 720, 1080, 100000]
+    labels = ['0-30', '31-90', '91-180', '181-360', '361-720', '721-1080', '>1080']
+    
+    # Use internal helper to get mask if possible, but get_metric_mask is inside calculate_metrics.
+    # We can duplicate the logic or pass the mask.
+    # To keep it simple, I'll implement the filtering logic here or move get_metric_mask out.
+    # Moving get_metric_mask is risky due to scope.
+    # I'll re-implement the specific mask logic here for "Retained Lock Orders".
+    
+    for year in [2024, 2025]:
+        # Filter for Retained Lock Orders: lock_time in year AND approve_refund_time is NULL
+        start_date = pd.Timestamp(f"{year}-01-01")
+        if year == 2024:
+            end_date = pd.Timestamp(f"{year}-12-31 23:59:59")
+            lock_mask = (df['lock_time'] >= start_date) & (df['lock_time'] <= end_date)
+        else:
+            lock_mask = df['lock_time'] >= start_date
+            
+        # Refund mask: approve_refund_time is NaT
+        # Ensure approve_refund_time is datetime
+        if not pd.api.types.is_datetime64_any_dtype(df['approve_refund_time']):
+             # We assume it's already converted in calculate_metrics or main, but to be safe:
+             # Actually, we shouldn't modify df here if it's a view.
+             # We'll assume the caller (calculate_metrics) has cleaned the data or we check safely.
+             pass 
+             
+        refund_mask = df['approve_refund_time'].isna()
+        
+        mask = lock_mask & refund_mask
+        df_year = df[mask].copy()
+        
+        if df_year.empty:
+            results[year] = pd.DataFrame()
+            continue
+            
+        # Retained orders per store (for locks & last lock time)
+        store_stats = df_year.groupby('store_name').agg({
+            'lock_time': 'max',
+            'store_create_date': 'first',
+            'order_number': 'count'
+        }).rename(columns={'order_number': 'retained_locks'})
+        
+        store_stats['lock_time'] = pd.to_datetime(store_stats['lock_time'])
+        store_stats['store_create_date'] = pd.to_datetime(store_stats['store_create_date'])
+        
+        period_end = pd.Timestamp(f"{year}-12-31 23:59:59")
+        period_end_per_store = np.minimum(period_end.value, store_stats['lock_time'].astype('int64'))
+        period_end_per_store = pd.to_datetime(period_end_per_store)
+        store_stats['tenure_days'] = (period_end_per_store - store_stats['store_create_date']).dt.days
+        # Clip negative to 0
+        store_stats['tenure_days'] = store_stats['tenure_days'].clip(lower=0)
+        
+        # Active days within observation year (strict, aligned with 4.2)
+        # Build daily counts for all locks in the year (regardless of refund)
+        df_year_all = df[lock_mask].copy()
+        df_year_all['date'] = pd.to_datetime(df_year_all['lock_time']).dt.floor('D')
+        df_year_all = df_year_all.dropna(subset=['store_name', 'date'])
+        
+        # Full days of the year
+        full_days = pd.date_range(pd.Timestamp(f"{year}-01-01"), pd.Timestamp(f"{year}-12-31"), freq='D')
+        
+        if not df_year_all.empty:
+            # Opening date per store (min)
+            open_map = df_year_all.groupby('store_name')['store_create_date'].min()
+            open_map = pd.to_datetime(open_map)
+            open_map = open_map.reindex(store_stats.index)
+            # Fill missing open dates with start of year
+            open_map = open_map.fillna(pd.Timestamp(f"{year}-01-01"))
+            
+            # Daily counts pivot
+            daily_counts = df_year_all.groupby(['date', 'store_name']).size().unstack(fill_value=0)
+            # Ensure columns cover stores we care about
+            daily_counts = daily_counts.reindex(full_days, fill_value=0)
+            missing_cols = [s for s in store_stats.index if s not in daily_counts.columns]
+            if missing_cols:
+                for s in missing_cols:
+                    daily_counts[s] = 0
+            # Ensure column order aligns
+            daily_counts = daily_counts[store_stats.index]
+            
+            # Rolling 30-day activity
+            rolling_activity = daily_counts.rolling(window=30, min_periods=1).sum()
+            
+            # Compute active days per store: activity>0 and day>=open_date
+            active_days = {}
+            for s in store_stats.index:
+                open_date = open_map.loc[s]
+                day_mask = (rolling_activity.index >= open_date)
+                act_mask = rolling_activity[s].values > 0
+                active_days[s] = int(np.sum(day_mask & act_mask))
+            store_stats['active_days'] = pd.Series(active_days)
+        else:
+            store_stats['active_days'] = 0
+        
+        # Binning
+        store_stats['tenure_bin'] = pd.cut(store_stats['tenure_days'], bins=bins, labels=labels)
+        
+        # Aggregation by Bin
+        bin_stats = store_stats.groupby('tenure_bin', observed=False).agg({
+            'retained_locks': ['count', 'sum'],
+            'active_days': ['sum']
+        })
+        
+        # Flatten columns
+        bin_stats.columns = ['store_count', 'total_locks', 'total_active_days']
+        # Calculate Avg Locks per Store
+        bin_stats['avg_locks'] = bin_stats['total_locks'] / bin_stats['store_count']
+        bin_stats['avg_locks'] = bin_stats['avg_locks'].fillna(0)
+        # Calculate Avg Daily Locks per Store (store-day)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            bin_stats['avg_daily_locks'] = bin_stats['total_locks'] / bin_stats['total_active_days']
+            bin_stats['avg_daily_locks'] = bin_stats['avg_daily_locks'].replace([np.inf, -np.inf], np.nan).fillna(0)
+        
+        results[year] = bin_stats
+        
+    return results
+
 def calculate_metrics(df: pd.DataFrame) -> dict:
     """计算核心指标"""
     metrics = {}
@@ -1114,6 +1241,12 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
     except Exception as e:
         print(f"Error calculating Module 7 stats: {e}")
 
+    # 4.3.2 Store Tenure Analysis
+    try:
+        metrics['store_tenure_analysis'] = calculate_store_tenure_metrics(df)
+    except Exception as e:
+        print(f"Error calculating Store Tenure stats: {e}")
+
     return metrics
 
 def calculate_conversion_probability(metrics):
@@ -2111,7 +2244,10 @@ def generate_html(metrics: dict, output_file: Path):
         html_content.append(table_4_2)
 
         # 4.3 Comparison Chart (Active Store Comparison - Day Aligned) (Moved from 4.2)
-        html_content.append("<h3>4.3 在营门店数对比 (2024 vs 2025 对齐对比)</h3>")
+        html_content.append("<h3>4.3 在营门店数对比 (Active Store Count Comparison)</h3>")
+        
+        # 4.3.1 Existing Active Store Analysis
+        html_content.append("<h4>4.3.1 在营门店数（现有）</h4>")
         
         fig = go.Figure()
         
@@ -2148,7 +2284,7 @@ def generate_html(metrics: dict, output_file: Path):
             ))
             
         layout = get_common_layout(
-            title="4.3 在营门店数对比 (2024 vs 2025 对齐对比)",
+            title="4.3.1 在营门店数趋势对比 (2024 vs 2025)",
             xaxis_title="年份天数 (Day of Year)",
             yaxis_title="在营门店数"
         )
@@ -2158,6 +2294,68 @@ def generate_html(metrics: dict, output_file: Path):
         
         chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
         html_content.append(chart_html)
+
+        # 4.3.2 Store Tenure Analysis (New vs Old)
+        if 'store_tenure_analysis' in metrics:
+            html_content.append("<h4>4.3.2 新老门店锁单能力对比 (New vs Old Store Lock Capability)</h4>")
+            html_content.append("<p>基于各周期内门店的存续时长 (Tenure = min(周期末日期, 门店当年最后锁单) - Store Create Date) 进行分组分析。</p>")
+            html_content.append("<p>统计口径：仅包含留存锁单 (Retained Lock Orders)。店日均 = 分箱内留存锁单总数 / 分箱内实际在营天数总和（与 4.2 的 active-day 口径一致）。</p>")
+            
+            tenure_stats = metrics['store_tenure_analysis']
+            
+            # Chart 1: Store Count Distribution
+            fig1 = go.Figure()
+            # Chart 2: Avg Locks Distribution
+            fig2 = go.Figure()
+            
+            colors = {2024: '#3498DB', 2025: '#E67E22'}
+            
+            for year in [2024, 2025]:
+                if year not in tenure_stats or tenure_stats[year].empty:
+                    continue
+                    
+                stats = tenure_stats[year]
+                
+                # Convert index (Interval) to string for X-axis
+                x_vals = stats.index.astype(str)
+                y_count = stats['store_count']
+                y_avg = stats['avg_daily_locks']
+                
+                # Trace for Count
+                fig1.add_trace(go.Bar(
+                    x=x_vals,
+                    y=y_count,
+                    name=f'{year}',
+                    marker_color=colors[year]
+                ))
+                
+                # Trace for Avg Locks
+                fig2.add_trace(go.Bar(
+                    x=x_vals,
+                    y=y_avg,
+                    name=f'{year}',
+                    marker_color=colors[year]
+                ))
+                
+            # Layout 1
+            layout1 = get_common_layout(
+                title="4.3.2.1 不同存续周期门店分布 (Store Count by Tenure)",
+                xaxis_title="存续周期 (Tenure Days)",
+                yaxis_title="门店数量 (Store Count)"
+            )
+            layout1['barmode'] = 'group'
+            fig1.update_layout(layout1)
+            html_content.append(pio.to_html(fig1, full_html=False, include_plotlyjs='cdn'))
+            
+            # Layout 2
+            layout2 = get_common_layout(
+                title="4.3.2.2 不同存续周期店日均锁单数 (Avg Daily Retained Locks per Store by Tenure)",
+                xaxis_title="存续周期 (Tenure Days)",
+                yaxis_title="店日均留存锁单数 (Avg Daily Retained Locks)"
+            )
+            layout2['barmode'] = 'group'
+            fig2.update_layout(layout2)
+            html_content.append(pio.to_html(fig2, full_html=False, include_plotlyjs='cdn'))
 
     # 4.4 Average Lock Orders per Store (Daily)
     html_content.append("<h3>4.4 店均锁单数分析 (Average Daily Lock Orders per Store)</h3>")
