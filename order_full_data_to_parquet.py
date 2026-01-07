@@ -89,6 +89,8 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
         'store_create_date 年/月/日': 'store_create_date',
         'approve_refund_time 年/月/日': 'approve_refund_time',
         'apply_refund_time 年/月/日': 'apply_refund_time',
+        'first_assign_time 年/月/日': 'first_assign_time',
+        'lead_assign_time_max 年/月/日': 'lead_assign_time_max',
         'Td CountD': 'td_countd',
         'Drive Series Cn': 'drive_series_cn',
         'Main Lead Id': 'main_lead_id',
@@ -220,6 +222,10 @@ def main():
                 'apply_refund_time_年/月/日': 'apply_refund_time',
                 'approve_refund_time 年/月/日': 'approve_refund_time',
                 'apply_refund_time 年/月/日': 'apply_refund_time',
+                'first_assign_time_年/月/日': 'first_assign_time',
+                'lead_assign_time_max_年/月/日': 'lead_assign_time_max',
+                'first_assign_time 年/月/日': 'first_assign_time',
+                'lead_assign_time_max 年/月/日': 'lead_assign_time_max',
                 'Parent Region Name': 'parent_region_name',
                 'Parent_Region_Name': 'parent_region_name'
             }
