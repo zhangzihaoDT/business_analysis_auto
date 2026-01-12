@@ -78,13 +78,8 @@ def get_period_mask(df: pd.DataFrame, date_col: str, year: int) -> pd.Series:
          df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
 
     start_date = pd.Timestamp(f"{year}-01-01")
-    
-    if year == 2024:
-        end_date = pd.Timestamp(f"{year}-12-31 23:59:59")
-        return (df[date_col] >= start_date) & (df[date_col] <= end_date)
-    else:
-        # For 2025 and beyond, just take everything from start_date
-        return df[date_col] >= start_date
+    end_date = pd.Timestamp(f"{year}-12-31 23:59:59")
+    return (df[date_col] >= start_date) & (df[date_col] <= end_date)
 
 def calculate_store_tenure_metrics(df):
     """
@@ -108,11 +103,8 @@ def calculate_store_tenure_metrics(df):
     for year in [2024, 2025]:
         # Filter for Retained Lock Orders: lock_time in year AND approve_refund_time is NULL
         start_date = pd.Timestamp(f"{year}-01-01")
-        if year == 2024:
-            end_date = pd.Timestamp(f"{year}-12-31 23:59:59")
-            lock_mask = (df['lock_time'] >= start_date) & (df['lock_time'] <= end_date)
-        else:
-            lock_mask = df['lock_time'] >= start_date
+        end_date = pd.Timestamp(f"{year}-12-31 23:59:59")
+        lock_mask = (df['lock_time'] >= start_date) & (df['lock_time'] <= end_date)
             
         # Refund mask: approve_refund_time is NaT
         # Ensure approve_refund_time is datetime
