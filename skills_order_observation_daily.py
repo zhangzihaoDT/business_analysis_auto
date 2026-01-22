@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import argparse
+import time
 import pandas as pd
 from datetime import datetime, timedelta
 import requests
@@ -309,16 +310,36 @@ def send_feishu_notification(lock_stats, invoice_stats):
         }
     }
 
-    try:
-        response = requests.post(WEBHOOK_URL, json=card_content)
-        response.raise_for_status()
-        result = response.json()
-        if result.get("StatusCode") == 0:
-            print("✅ 飞书消息发送成功")
-        else:
-            print(f"❌ 飞书消息发送异常: {result}")
-    except Exception as e:
-        print(f"❌ 发送飞书消息失败: {e}")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(WEBHOOK_URL, json=card_content)
+            response.raise_for_status()
+            result = response.json()
+            
+            # 兼容不同的成功状态码字段 (StatusCode 或 code)
+            # 飞书自定义机器人通常返回 StatusCode, 但开放平台接口可能返回 code
+            code = result.get("StatusCode")
+            if code is None:
+                code = result.get("code")
+            
+            if code == 0:
+                print("✅ 飞书消息发送成功")
+                return
+            elif code == 11232: # Frequency limited
+                wait_time = 2 * (attempt + 1)
+                print(f"⚠️ 飞书消息发送频率限制 (11232)，等待 {wait_time} 秒后重试 ({attempt + 1}/{max_retries})...")
+                time.sleep(wait_time)
+                continue
+            else:
+                print(f"❌ 飞书消息发送异常: {result}")
+                return
+        except Exception as e:
+            print(f"❌ 发送飞书消息失败: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+            else:
+                print("❌ 重试次数耗尽，发送失败")
 
 def main():
     # 0. 解析参数

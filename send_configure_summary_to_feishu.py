@@ -1,5 +1,6 @@
 import os
 import argparse
+import time
 import requests
 import pandas as pd
 import io
@@ -299,18 +300,37 @@ def main():
         }
     }
 
-    try:
-        print("正在发送飞书消息...")
-        response = requests.post(webhook, json=card_data)
-        response.raise_for_status()
-        result = response.json()
-        if result.get("StatusCode") == 0:
-            print(f"✅ 消息推送成功: {result.get('StatusMessage')}")
-        else:
-            print(f"❌ 消息推送异常: {result}")
+    max_retries = 3
+    print("正在发送飞书消息...")
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(webhook, json=card_data)
+            response.raise_for_status()
+            result = response.json()
             
-    except requests.exceptions.RequestException as e:
-        print(f"❌ 消息推送失败: {e}")
+            # 兼容 StatusCode 和 code
+            code = result.get("StatusCode")
+            if code is None:
+                code = result.get("code")
+                
+            if code == 0:
+                print(f"✅ 消息推送成功: {result.get('StatusMessage', '')}")
+                return
+            elif code == 11232: # Frequency limited
+                wait_time = 2 * (attempt + 1)
+                print(f"⚠️ 飞书消息发送频率限制 (11232)，等待 {wait_time} 秒后重试 ({attempt + 1}/{max_retries})...")
+                time.sleep(wait_time)
+                continue
+            else:
+                print(f"❌ 消息推送异常: {result}")
+                return
+                
+        except requests.exceptions.RequestException as e:
+            print(f"❌ 消息推送失败: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+            else:
+                 print("❌ 重试次数耗尽，发送失败")
 
 if __name__ == "__main__":
     main()
