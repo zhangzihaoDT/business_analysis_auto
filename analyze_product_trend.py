@@ -19,6 +19,9 @@ OUTPUT_CSV = REPORT_DIR / "analyze_product_trend.csv"
 # Colors
 COLORS = {
     "新一代智己LS6 Max+": "#3498DB",  # Blue
+    "新一代智己LS6 Max": "#E67E22",   # Orange
+    "新一代智己LS6 52 Max": "#3498DB", # Blue
+    "新一代智己LS6 66 Max": "#E67E22", # Orange
     "其他": "#E67E22",              # Orange
     "52kWh": "#3498DB",             # Blue
     "66kWh": "#E67E22",             # Orange
@@ -112,22 +115,18 @@ def main():
     print("\n--- Processing Analysis 1: Pure Electric 76kWh ---")
     
     # Product Filter
-    target_products_pe = business_def.get('battery_capacity', {}).get('76kwh', [])
-    if not target_products_pe:
-        raise ValueError("76kwh definition not found in business_definition.json")
+    # target_products_pe = business_def.get('battery_capacity', {}).get('76kwh', [])
+    target_products_pe = ["新一代智己LS6 Max+", "新一代智己LS6 Max"]
     
     # Grouping Logic
     def group_pe(name):
-        if name == "新一代智己LS6 Max+":
-            return "新一代智己LS6 Max+"
-        else:
-            return "其他"
+        return name
 
     figs1, df_csv1 = run_analysis(
         df, 
         time_mask & df['product_name'].isin(target_products_pe), 
         group_pe, 
-        "CM2 纯电 76kWh", 
+        "CM2 纯电 76kWh (Max+ vs Max)", 
         "PE_76kWh"
     )
 
@@ -140,12 +139,17 @@ def main():
     target_products_erev_all = products_52 + products_66
     
     # Filter for CM2 only ("新一代" and "LS6")
-    target_products_cm2_erev = [p for p in target_products_erev_all if "新一代" in p and "LS6" in p]
+    # target_products_cm2_erev = [p for p in target_products_erev_all if "新一代" in p and "LS6" in p]
+    target_products_cm2_erev = ["新一代智己LS6 52 Max", "新一代智己LS6 66 Max"]
     
     if not target_products_cm2_erev:
          print("Warning: No CM2 EREV products found.")
 
     # Grouping Logic
+    def group_erev_cm2(name):
+        return name
+        
+    # Keep original group_erev for Analysis 3
     def group_erev(name):
         if '52' in name:
             return '52kWh'
@@ -157,8 +161,8 @@ def main():
     figs2, df_csv2 = run_analysis(
         df, 
         time_mask & df['product_name'].isin(target_products_cm2_erev), 
-        group_erev, 
-        "CM2 增程 52/66kWh", 
+        group_erev_cm2, 
+        "CM2 增程 (52 Max vs 66 Max)", 
         "EREV_CM2"
     )
 
@@ -353,7 +357,7 @@ def generate_html(output_path, csv_name, start_date, fig_groups):
     """
     
     sections_html = ""
-    titles = ["1. CM2 纯电 76kWh", "2. CM2 增程 52/66kWh", "3. LS9 增程 52/66kWh"]
+    titles = ["1. CM2 纯电 76kWh (Max+ vs Max)", "2. CM2 增程 (52 Max vs 66 Max)", "3. LS9 增程 52/66kWh"]
     
     for title, figs in zip(titles, fig_groups):
         charts_html = "".join([f'<div class="chart-container">{pio.to_html(f, full_html=False, include_plotlyjs="cdn")}</div>' for f in figs])

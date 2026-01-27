@@ -61,27 +61,41 @@ def load_data(file_path):
         logging.info(f"列名: {list(df.columns)}")
         logging.info(f"数据形状: {df.shape}")
         
-        # 检查必要的列是否存在 (兼容新旧字段名)
-        if 'Attribute Code' in df.columns:
-            # 新格式数据
-            required_columns = ['Attribute Code', 'Value Display Name', 'order_number', 'DATE([Order Lock Time])']
-            attribute_col = 'Attribute Code'
-        elif 'Attribute Name' in df.columns:
-            # 旧格式数据
-            required_columns = ['Attribute Name', 'Value Display Name', 'order_number']
-            attribute_col = 'Attribute Name'
-        else:
-            raise ValueError("数据文件中既没有 'Attribute Code' 也没有 'Attribute Name' 列")
+        # ---------------------------------------------------------------------
+        # 1. 字段标准化映射（修复 Tableau 导出字段名不一致问题）
+        # ---------------------------------------------------------------------
+        # 映射规则：{原始可能出现的列名: 统一后的标准列名}
+        column_mapping = {
+            # 属性名
+            'Attribute Code': 'Attribute Name',
+            # 属性值（修复拼写错误 Value Dispaly Name -> Value Display Name）
+            'Value Dispaly Name': 'Value Display Name',
+            # 订单号
+            'Order Number': 'order_number',
+            # 锁单时间
+            'DATE([Order Lock Time])': 'lock_time',
+            # 发票上传时间
+            'DATE([invoice_upload_time])': 'invoice_time'
+        }
+        
+        # 执行重命名
+        df = df.rename(columns=column_mapping)
+        logging.info(f"已执行字段标准化映射，当前列名: {list(df.columns)}")
+
+        # ---------------------------------------------------------------------
+        # 2. 检查必要的列是否存在
+        # ---------------------------------------------------------------------
+        # 核心列：属性名、属性值、订单号
+        # 注意：lock_time 虽然重要，但在某些未锁单数据中可能缺失，这里先作为可选或在清洗阶段处理
+        # 但脚本核心逻辑依赖 order_number 作为主键，Attribute Name/Value 作为转置对象
+        
+        required_columns = ['Attribute Name', 'Value Display Name', 'order_number']
         
         missing_columns = [col for col in required_columns if col not in df.columns]
         if missing_columns:
+            logging.error(f"当前数据列: {list(df.columns)}")
             raise ValueError(f"缺少必要的列: {missing_columns}")
-        
-        # 统一字段名，便于后续处理
-        if attribute_col == 'Attribute Code':
-            df = df.rename(columns={'Attribute Code': 'Attribute Name'})
-            logging.info("已将 'Attribute Code' 重命名为 'Attribute Name'")
-        
+
         return df
     except Exception as e:
         logging.error(f"加载数据失败: {e}")
