@@ -11,7 +11,12 @@ import os
 import subprocess
 import logging
 import sys
+import warnings
 from datetime import datetime
+
+# 忽略 pkg_resources 的废弃警告
+warnings.filterwarnings("ignore", category=UserWarning, module='pkg_resources')
+warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
 
 # 配置日志
 logging.basicConfig(
@@ -106,6 +111,14 @@ def run_command(command, timeout=300, show_progress=True):
         
         if process.returncode != 0:
             logger.error(f"命令执行失败: {stderr_result}")
+            
+            # 智能错误分析
+            if "504 Gateway Time-out" in stderr_result or "504 Gateway Time-out" in stdout_result:
+                logger.warning("检测到 504 Gateway Time-out 错误：这是服务器端网关超时，通常由数据量过大或服务器负载高导致，而非脚本客户端超时。")
+                if show_progress:
+                    print("\n⚠️  检测到 504 Gateway Time-out：")
+                    print("   这是服务器端 (Nginx) 限制了单次请求时长（通常为60秒）。")
+                    print("   建议：减少导出的数据时间范围，或尝试在服务器空闲时段运行。")
         else:
             logger.debug(f"命令执行成功: {stdout_result}")
             
@@ -198,21 +211,28 @@ def export_view(view_path, output_file, format="csv", timeout=600, show_progress
     else:
         # 处理常规视图路径
         # 尝试多种格式化方式
-        # 1. 原始路径
-        paths_to_try = [view_path]
+        # 使用列表保持顺序，使用 set 辅助去重
+        paths_to_try = []
+        seen_paths = set()
         
-        # 2. 移除空格
-        paths_to_try.append(view_path.replace(" ", ""))
-        
-        # 3. 使用URL编码
-        paths_to_try.append(view_path.replace(" ", "%20"))
+        # 定义候选路径生成逻辑
+        candidates = [
+            view_path,                                      # 1. 原始路径
+            view_path.replace(" ", ""),                     # 2. 移除空格
+            view_path.replace(" ", "%20")                   # 3. URL编码
+        ]
         
         # 4. 如果是workbook/sheet格式，尝试单独处理
         parts = view_path.split('/')
         if len(parts) == 2:
             workbook, sheet = parts
-            # 移除所有空格
-            paths_to_try.append(f"{workbook.replace(' ', '')}/{sheet.replace(' ', '')}")
+            candidates.append(f"{workbook.replace(' ', '')}/{sheet.replace(' ', '')}")
+            
+        # 去重添加
+        for p in candidates:
+            if p not in seen_paths:
+                paths_to_try.append(p)
+                seen_paths.add(p)
         
         # 记录所有尝试的路径
         logger.info(f"将尝试以下路径: {paths_to_try}")
@@ -220,24 +240,56 @@ def export_view(view_path, output_file, format="csv", timeout=600, show_progress
             print(f"将尝试以下路径: {', '.join(paths_to_try)}")
         
         # 默认使用第一种格式
-        # 注意：不再自动去除查询参数，允许用户传递带参数的视图路径（如 view/sheet?param=value）
         tableau_path = paths_to_try[0]
     
-    # 首先尝试原始路径
+    # 显式重试机制
+    max_retries = 2
+    
+    # 首先尝试原始路径 (包含重试)
     if show_progress:
         print(f"正在尝试导出视图: {tableau_path}")
     
     command = ["tabcmd", "export", tableau_path, f"--{format}", "-f", output_file]
-    returncode, stdout, stderr = run_command(command, timeout=timeout, show_progress=show_progress)
     
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            if show_progress:
+                print(f"重试中 (第 {attempt}/{max_retries} 次)...")
+            logger.info(f"重试中 (第 {attempt}/{max_retries} 次)...")
+            
+        returncode, stdout, stderr = run_command(command, timeout=timeout, show_progress=show_progress)
+        
+        if returncode == 0:
+            break
+        
+        # 如果是 504 错误，重试可能有用（也可能没用），但值得一试
+        # 如果是 404 错误（资源未找到），重试通常没用，应该尝试下一个 path
+        if "404 Not Found" in stderr or "Resource Not Found" in stderr:
+            logger.warning("检测到 404 错误，放弃当前路径重试，尝试替代路径")
+            break
+            
     # 如果失败且有多种路径可尝试，则逐一尝试其他路径
     if returncode != 0 and 'paths_to_try' in locals() and len(paths_to_try) > 1:
         for i, path in enumerate(paths_to_try[1:], 1):
             if show_progress:
                 print(f"\n尝试替代路径 {i}: {path}")
             logger.info(f"尝试替代路径 {i}: {path}")
+            
             command = ["tabcmd", "export", path, f"--{format}", "-f", output_file]
-            returncode, stdout, stderr = run_command(command, timeout=timeout, show_progress=show_progress)
+            
+            # 替代路径也支持一次重试
+            for attempt in range(2): 
+                if attempt > 0:
+                    if show_progress:
+                        print(f"替代路径重试中...")
+                
+                returncode, stdout, stderr = run_command(command, timeout=timeout, show_progress=show_progress)
+                if returncode == 0:
+                    break
+                
+                if "404 Not Found" in stderr:
+                    break
+                    
             if returncode == 0:
                 logger.info(f"使用替代路径 {i} 成功")
                 if show_progress:
@@ -344,6 +396,26 @@ def main():
     # 显示进度标志
     show_progress = not args.no_progress
     
+    # 定义默认服务器列表
+    DEFAULT_SERVER_URL = "https://tableau-hs.immotors.com"
+    MOBILE_SERVER_URL = "https://mobile-tableau-hs.immotors.com"
+    
+    # 确定要尝试的服务器列表
+    servers_to_try = []
+    
+    # 如果用户没有手动修改 server 参数（仍为默认值），则启用自动切换逻辑
+    # 注意：这里简单的通过字符串比较来判断。如果用户手动输入了默认值，也会触发切换逻辑，这通常是可以接受的。
+    if args.server.rstrip('/') == DEFAULT_SERVER_URL or args.server.rstrip('/') == DEFAULT_SERVER_URL + "/":
+        if args.mobile:
+            # 移动端优先：Mobile -> Default
+            servers_to_try = [MOBILE_SERVER_URL, DEFAULT_SERVER_URL]
+        else:
+            # 默认情况：Default -> Mobile
+            servers_to_try = [DEFAULT_SERVER_URL, MOBILE_SERVER_URL]
+    else:
+        # 用户指定了特定的其他服务器，只尝试这一个
+        servers_to_try = [args.server]
+
     # 执行导出流程
     try:
         start_time = datetime.now()
@@ -351,28 +423,46 @@ def main():
         if show_progress:
             print(f"=== Tableau 数据导出工具 ===")
             print(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            print(f"服务器: {args.server}")
             print(f"视图: {args.view}")
             print(f"输出文件: {args.output}")
             print("="*30)
         
-        # 登录 - 优先使用个人访问令牌
-        if args.token_name and args.token_value:
+        login_success = False
+        active_server = None
+        
+        # 循环尝试登录
+        for server in servers_to_try:
             if show_progress:
-                print("正在使用个人访问令牌(PAT)登录...")
-            login_success = login_tableau(args.server, token_name=args.token_name, token_value=args.token_value)
-        else:
-            if show_progress:
-                print(f"正在使用用户名 {args.username} 登录...")
-            login_success = login_tableau(args.server, args.username, args.password)
+                print(f"正在尝试连接服务器: {server}")
+            
+            # 登录 - 优先使用个人访问令牌
+            if args.token_name and args.token_value:
+                if show_progress:
+                    print("正在使用个人访问令牌(PAT)登录...")
+                success = login_tableau(server, token_name=args.token_name, token_value=args.token_value)
+            else:
+                if show_progress:
+                    print(f"正在使用用户名 {args.username} 登录...")
+                success = login_tableau(server, args.username, args.password)
+            
+            if success:
+                login_success = True
+                active_server = server
+                args.server = server # 更新当前使用的 server
+                if show_progress:
+                    print(f"✅ 成功登录到: {server}")
+                break
+            else:
+                if show_progress:
+                    print(f"❌ 连接 {server} 失败")
+                if server != servers_to_try[-1]:
+                    if show_progress:
+                        print("尝试下一个服务器地址...")
         
         if not login_success:
             if show_progress:
-                print("❌ 登录失败，无法继续")
+                print("❌ 所有服务器连接均失败，无法继续")
             return 1
-        
-        if show_progress:
-            print("✅ 登录成功")
         
         # 导出
         export_success = export_view(
