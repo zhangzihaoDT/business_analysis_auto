@@ -438,6 +438,147 @@ def build_period_comparison_figure(df_full: pd.DataFrame, filter_info: str) -> g
     
     return fig
 
+def build_ls6_launch_price_figure(df: pd.DataFrame, business_def: dict) -> go.Figure:
+    """
+    Plot 5: LS6 Invoice Price vs Days Since Launch (End Day) by Series Group.
+    """
+    # 1. Filter LS6
+    if "series_derived" not in df.columns:
+        return None
+        
+    df_ls6 = df[df["series_derived"] == "LS6"].copy()
+    if df_ls6.empty:
+        return None
+        
+    # 2. Get Launch Dates
+    time_periods = business_def.get("time_periods", {})
+    
+    # 3. Calculate Days Since Launch
+    def get_launch_date(group):
+        period_info = time_periods.get(group)
+        if period_info and "end" in period_info:
+             return pd.Timestamp(period_info["end"])
+        return pd.NaT
+        
+    unique_groups = df_ls6["series_group"].unique()
+    group_launch_map = {g: get_launch_date(g) for g in unique_groups}
+    
+    # Remove groups without launch date
+    valid_groups = {g: d for g, d in group_launch_map.items() if pd.notnull(d)}
+    df_ls6 = df_ls6[df_ls6["series_group"].isin(valid_groups)].copy()
+    
+    if df_ls6.empty:
+        return None
+
+    df_ls6["launch_date"] = df_ls6["series_group"].map(valid_groups)
+    df_ls6["days_since_launch"] = (df_ls6["invoice_upload_time"] - df_ls6["launch_date"]).dt.days
+    
+    # Filter range: -60 to +365 days to focus on launch period
+    df_ls6 = df_ls6[(df_ls6["days_since_launch"] >= -60) & (df_ls6["days_since_launch"] <= 365)]
+    
+    # 4. Aggregate (Daily Mean & Count)
+    agg_df = df_ls6.groupby(["series_group", "days_since_launch"]).agg(
+        invoice_amount=("invoice_amount", "mean"),
+        order_count=("invoice_amount", "count")
+    ).reset_index()
+    
+    # 5. Plot
+    fig = go.Figure()
+    
+    # Color mapping for LS6 generations
+    # CM2 (Newest) -> Contrast (Orange)
+    # CM1 (Previous) -> Main (Blue)
+    # CM0 (Oldest) -> Text Color (Grey/Blueish Grey)
+    color_map = {
+        "CM2": COLOR_CONTRAST,
+        "CM1": COLOR_MAIN,
+        "CM0": COLOR_TEXT 
+    }
+    
+    # Sort groups by launch date
+    sorted_groups = sorted(valid_groups.keys(), key=lambda g: valid_groups[g])
+    
+    for g in sorted_groups:
+        sub = agg_df[agg_df["series_group"] == g].sort_values("days_since_launch")
+        if sub.empty:
+            continue
+            
+        # Smoothing (7-day rolling)
+        sub["smooth_price"] = sub["invoice_amount"].rolling(window=7, min_periods=1).mean()
+        sub["smooth_count"] = sub["order_count"].rolling(window=7, min_periods=1).mean()
+        
+        launch_date_str = valid_groups[g].strftime("%Y-%m-%d")
+        
+        # Determine color
+        line_color = color_map.get(g, COLOR_DARK) # Default to dark if unknown
+        
+        fig.add_trace(go.Scatter(
+            x=sub["days_since_launch"],
+            y=sub["smooth_price"],
+            mode='lines',
+            name=f"{g} (Launch: {launch_date_str})",
+            line=dict(color=line_color, width=3),
+            customdata=sub[["smooth_count"]],
+            hovertemplate=(
+                "<b>%{y:,.0f}</b><br>" +
+                "Day: %{x}<br>" +
+                "Count (7d Avg): %{customdata[0]:.1f}<br>" +
+                "<extra>%{fullData.name}</extra>"
+            )
+        ))
+
+        # Add annotation at the end of the line
+        last_point = sub.iloc[-1]
+        fig.add_annotation(
+            x=last_point["days_since_launch"],
+            y=last_point["smooth_price"],
+            text=f"¥{last_point['smooth_price']:,.0f}",
+            showarrow=False,
+            xanchor="left",
+            yanchor="middle",
+            font=dict(size=11, color=line_color, family="Arial, sans-serif"),
+            xshift=8
+        )
+        
+    fig.update_layout(
+        title=dict(
+            text="LS6 Invoice Price Trends vs Launch Time (Aligned by End Day)",
+            font=dict(color=COLOR_DARK, size=16),
+            x=0.01,
+            xanchor='left'
+        ),
+        xaxis=dict(
+            title="Days Since Launch (0 = Period End Date)",
+            gridcolor=COLOR_GRID,
+            zerolinecolor=COLOR_GRID,
+            tickfont=dict(color=COLOR_TEXT),
+            title_font=dict(color=COLOR_TEXT),
+            showline=True,
+            linecolor=COLOR_GRID
+        ),
+        yaxis=dict(
+            title="Average Invoice Price (7-day Smoothed)",
+            gridcolor=COLOR_GRID,
+            zerolinecolor=COLOR_GRID,
+            tickfont=dict(color=COLOR_TEXT),
+            title_font=dict(color=COLOR_TEXT),
+            showline=True,
+            linecolor=COLOR_GRID
+        ),
+        legend=dict(
+            bordercolor=COLOR_TEXT,
+            borderwidth=1,
+            font=dict(color=COLOR_TEXT)
+        ),
+        plot_bgcolor=COLOR_BG,
+        paper_bgcolor=COLOR_BG,
+        hovermode="x unified",
+        height=600,
+        margin=dict(l=20, r=60, t=60, b=20) # Increase right margin for labels
+    )
+    
+    return fig
+
 def main():
     args = parse_args()
 
@@ -453,8 +594,30 @@ def main():
 
     # Convert to datetime
     df["invoice_upload_time"] = pd.to_datetime(df["invoice_upload_time"], errors='coerce')
+
+    # Load Business Def
+    print(f"Loading business definitions from {BUSINESS_DEF_FILE}...")
+    business_def = load_business_definition(BUSINESS_DEF_FILE)
     
-    # 3. Global Filter: Lock Time Not Null & Invoice Time >= 2025-01-01
+    # --- Branch for Plot 5 (Full History) ---
+    # Filter: Lock Time Not Null (but keep historical dates for Launch Analysis)
+    df_history = df[df["lock_time"].notnull()].copy()
+    
+    # Apply Order Type Filter (Global arg) to history
+    target_types = args.order_types
+    if "order_type" in df_history.columns:
+        df_history["order_type"] = df_history["order_type"].fillna("Unknown").astype(str)
+        if target_types:
+            df_history = df_history[df_history["order_type"].isin(target_types)].copy()
+            
+    # Apply Business Logic to history
+    df_history_processed = apply_business_logic(df_history, business_def)
+    
+    # Generate Plot 5
+    fig5 = build_ls6_launch_price_figure(df_history_processed, business_def)
+    # ----------------------------------------
+    
+    # 3. Global Filter: Lock Time Not Null & Invoice Time >= 2025-01-01 (Standard Logic)
     start_global = pd.Timestamp("2025-01-01")
     df_clean = df[
         (df["lock_time"].notnull()) & 
@@ -489,7 +652,6 @@ def main():
         print(summary_df_2026.to_string(index=False))
 
     # 5. Apply Order Type Filter (Global for Analysis Plots)
-    target_types = args.order_types
     df_filtered_full = df_clean.copy()
     
     if "order_type" in df_filtered_full.columns:
@@ -497,11 +659,10 @@ def main():
         if target_types:
             print(f"Filtering by order_type: {target_types}")
             df_filtered_full = df_filtered_full[df_filtered_full["order_type"].isin(target_types)].copy()
-            print(f"Data after order_type filter (Full Time Range): {len(df_filtered_full)} rows.")
+            print(f"Data after order_type filter (Full Time Range 2025+): {len(df_filtered_full)} rows.")
     
-    # 6. Apply Business Logic (Full Time Range)
-    print(f"Loading business definitions from {BUSINESS_DEF_FILE}...")
-    business_def = load_business_definition(BUSINESS_DEF_FILE)
+    # 6. Apply Business Logic (Full Time Range 2025+)
+    # Note: business_def already loaded
     df_processed_full = apply_business_logic(df_filtered_full, business_def)
     
     # 7. Prepare Processed Data for Plots 2 & 3 (2025 & 2026)
@@ -538,7 +699,7 @@ def main():
     fig2_2025 = build_analysis_figure(agg_df_2025, filter_info, "2025", COLOR_MAIN)
     fig2_2026 = build_analysis_figure(agg_df_2026, filter_info, "2026", COLOR_CONTRAST)
     
-    # Fig 3: Indicator (Using 2025 data as primary, or maybe should be global? Sticking to 2025 as per typical reporting)
+    # Fig 3: Indicator
     fig3_2025 = build_metric_figure(df_2025_processed, "2025", COLOR_MAIN)
     fig3_2026 = build_metric_figure(df_2026_processed, "2026", COLOR_CONTRAST)
     
@@ -585,6 +746,12 @@ def main():
         if fig4:
              include_js = False if (fig1_2025 or fig1_2026 or fig2_2025 or fig2_2026 or fig3_2025 or fig3_2026) else 'cdn'
              f.write(fig4.to_html(full_html=False, include_plotlyjs=include_js))
+             f.write("<br><hr><br>")
+             
+        # Plot 5: LS6 Launch Trends
+        if fig5:
+             include_js = False if (fig1_2025 or fig1_2026 or fig2_2025 or fig2_2026 or fig3_2025 or fig3_2026 or fig4) else 'cdn'
+             f.write(fig5.to_html(full_html=False, include_plotlyjs=include_js))
              
         f.write("</body></html>")
 
