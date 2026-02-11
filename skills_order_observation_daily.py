@@ -35,6 +35,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='每日锁单数据观察脚本')
     parser.add_argument('--start', type=str, help='开始日期 (YYYY-MM-DD)')
     parser.add_argument('--end', type=str, help='结束日期 (YYYY-MM-DD)')
+    parser.add_argument('--mtd', action='store_true', help='当月1日累计至今')
     
     # 预处理 sys.argv 以支持 -N 这种非标准参数
     days_back = 1  # 默认昨天
@@ -62,6 +63,10 @@ def parse_arguments():
         except ValueError:
             print("❌ 日期格式错误，请使用 YYYY-MM-DD")
             sys.exit(1)
+    elif args.mtd:
+        # 如果使用了 --mtd 参数
+        end_date = datetime.now().date() - timedelta(days=1)
+        start_date = end_date.replace(day=1)
     elif args_to_remove:
         # 如果使用了 -N 参数
         start_date = datetime.now().date() - timedelta(days=days_back)
@@ -174,7 +179,7 @@ def analyze_daily_invoice_orders(df, start_date, end_date):
     
     # 确保必要的列存在
     # 更新为新数据集的列名
-    required_columns = ['invoice_upload_time', 'lock_time', 'order_number', 'series', 'invoice_amount']
+    required_columns = ['invoice_upload_time', 'lock_time', 'order_number', 'series', 'invoice_amount', 'order_type']
     for col in required_columns:
         if col not in df.columns:
             print(f"❌ 错误: 数据缺失列 {col}")
@@ -196,21 +201,30 @@ def analyze_daily_invoice_orders(df, start_date, end_date):
     # 1. 计算总开票数 (基于 order_number 去重)
     total_invoice_count = invoice_orders['order_number'].nunique()
     
+    # 计算用户车开票数
+    user_car_orders = invoice_orders[invoice_orders['order_type'] == '用户车']
+    total_user_car_count = user_car_orders['order_number'].nunique()
+    
     # 2. 分车型统计
     model_invoice_stats = {}
     for model in TARGET_MODELS:
         model_df = invoice_orders[invoice_orders['series'] == model]
         count = model_df['order_number'].nunique()
         
-        # 计算该车型的平均开票价格
-        model_valid_prices = model_df[
-            (model_df['invoice_amount'].notna()) & 
-            (model_df['invoice_amount'] > 0)
+        # 用户车数量
+        model_user_car_df = model_df[model_df['order_type'] == '用户车']
+        user_car_count = model_user_car_df['order_number'].nunique()
+        
+        # 计算该车型的平均开票价格 (仅计算用户车)
+        model_valid_prices = model_user_car_df[
+            (model_user_car_df['invoice_amount'].notna()) & 
+            (model_user_car_df['invoice_amount'] > 0)
         ]['invoice_amount']
         avg_price = model_valid_prices.mean() if not model_valid_prices.empty else 0
         
         model_invoice_stats[model] = {
             "count": count,
+            "user_car_count": user_car_count,
             "avg_price": avg_price
         }
         
@@ -218,6 +232,7 @@ def analyze_daily_invoice_orders(df, start_date, end_date):
         "start_date": start_date,
         "end_date": end_date,
         "total": total_invoice_count,
+        "total_user_car": total_user_car_count,
         "models": model_invoice_stats
     }
 
@@ -262,7 +277,8 @@ def send_feishu_notification(lock_stats, invoice_stats):
     invoice_model_details = []
     for model, info in invoice_stats['models'].items():
         price_str = f"{info['avg_price']/10000:.1f}w" if info['avg_price'] > 0 else "N/A"
-        invoice_model_details.append(f"- {model}: {info['count']} 台｜平均开票价格：{price_str}")
+        # 格式：- Model: Total (User) 台｜平均开票价格：XXw
+        invoice_model_details.append(f"- {model}: {info['count']} ({info['user_car_count']}) 台｜平均开票价格：{price_str}")
     invoice_model_text = "\n".join(invoice_model_details)
 
     # 构建卡片内容
@@ -291,7 +307,7 @@ def send_feishu_notification(lock_stats, invoice_stats):
                     "tag": "div",
                     "text": {
                         "tag": "lark_md",
-                        "content": f"**{invoice_label}：** {invoice_stats['total']} 台\n{invoice_model_text}"
+                        "content": f"**{invoice_label}：** {invoice_stats['total']} ({invoice_stats['total_user_car']}) 台\n{invoice_model_text}"
                     }
                 },
                 {
@@ -380,11 +396,11 @@ def main():
             
         print("-" * 30)
         
-        print(f"🚚 总开票数: {invoice_stats['total']} 台")
+        print(f"🚚 总开票数: {invoice_stats['total']} ({invoice_stats['total_user_car']}) 台")
         print("   车型分布 (开票):")
         for model, info in invoice_stats['models'].items():
             price_display = f"{info['avg_price']/10000:.1f}w" if info['avg_price'] > 0 else "N/A"
-            print(f"   - {model}: {info['count']} 台｜平均开票价格：{price_display}")
+            print(f"   - {model}: {info['count']} ({info['user_car_count']}) 台｜平均开票价格：{price_display}")
         print("="*30 + "\n")
 
         # 3. 发送飞书通知
