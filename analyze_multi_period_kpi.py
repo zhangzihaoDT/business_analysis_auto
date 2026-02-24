@@ -749,9 +749,9 @@ def make_figure(df_comparison: pd.DataFrame, start1: str, end1: str, start2: str
         vertical_spacing=0.08,
         specs=[[{"type": "table"}], [{"type": "table"}], [{"type": "table"}]],
         subplot_titles=(
-            f"流量侧",
-            f"转化侧",
-            f"结构侧",
+            f"<b>流量侧</b>",
+            f"<b>转化侧</b>",
+            f"<b>结构侧</b>",
         ),
     )
     metric_order_map = {
@@ -829,22 +829,23 @@ def make_figure(df_comparison: pd.DataFrame, start1: str, end1: str, start2: str
                 sigma_w2_vals.append(f"{s2*100:.1f}%" if pd.notna(s2) else "")
                 sigma_diff_vals.append(f"{sd*100:.1f}%" if pd.notna(sd) else "")
             elif m == "order_atp_overall":
-                w1_vals.append(f"{v1:.1f}" if pd.notna(v1) else "")
-                w2_vals.append(f"{v2:.1f}" if pd.notna(v2) else "")
-                diff_vals.append(f"{dv:.1f}" if pd.notna(dv) else "")
-                sigma_w1_vals.append(f"{s1:.1f}" if pd.notna(s1) else "")
-                sigma_w2_vals.append(f"{s2:.1f}" if pd.notna(s2) else "")
-                sigma_diff_vals.append(f"{sd:.1f}" if pd.notna(sd) else "")
+                w1_vals.append(f"{v1:,.1f}" if pd.notna(v1) else "")
+                w2_vals.append(f"{v2:,.1f}" if pd.notna(v2) else "")
+                diff_vals.append(f"{dv:,.1f}" if pd.notna(dv) else "")
+                sigma_w1_vals.append(f"{s1:,.1f}" if pd.notna(s1) else "")
+                sigma_w2_vals.append(f"{s2:,.1f}" if pd.notna(s2) else "")
+                sigma_diff_vals.append(f"{sd:,.1f}" if pd.notna(sd) else "")
             else:
-                w1_vals.append(f"{v1:.1f}" if pd.notna(v1) else "")
-                w2_vals.append(f"{v2:.1f}" if pd.notna(v2) else "")
-                diff_vals.append(f"{dv:.1f}" if pd.notna(dv) else "")
-                sigma_w1_vals.append(f"{s1:.1f}" if pd.notna(s1) else "")
-                sigma_w2_vals.append(f"{s2:.1f}" if pd.notna(s2) else "")
-                sigma_diff_vals.append(f"{sd:.1f}" if pd.notna(sd) else "")
+                w1_vals.append(f"{v1:,.1f}" if pd.notna(v1) else "")
+                w2_vals.append(f"{v2:,.1f}" if pd.notna(v2) else "")
+                diff_vals.append(f"{dv:,.1f}" if pd.notna(dv) else "")
+                sigma_w1_vals.append(f"{s1:,.1f}" if pd.notna(s1) else "")
+                sigma_w2_vals.append(f"{s2:,.1f}" if pd.notna(s2) else "")
+                sigma_diff_vals.append(f"{sd:,.1f}" if pd.notna(sd) else "")
         diff_pct_vals = []
         diff_pct_colors = []
-        for v in sub["Diff_Pct"].tolist():
+        inverse_metrics = {"cr5_store_conc", "cr5_city_conc"}
+        for m, v in zip(metrics, sub["Diff_Pct"].tolist()):
             if pd.isna(v):
                 diff_pct_vals.append("")
                 diff_pct_colors.append(COLOR_DARK)
@@ -853,7 +854,14 @@ def make_figure(df_comparison: pd.DataFrame, start1: str, end1: str, start2: str
                 abs_pct = f"{abs(v)*100:.1f}%"
                 text = f"{sign}{abs_pct}" if sign else abs_pct
                 diff_pct_vals.append(text)
-                diff_pct_colors.append("#2ECC71" if v > 0 else "#E74C3C" if v < 0 else "#7B848F")
+                is_inverse = m in inverse_metrics
+                is_red = (v > 0) if is_inverse else (v < 0)
+                diff_pct_colors.append("#E74C3C" if is_red else COLOR_DARK)
+        diff_colors = []
+        for m, v in zip(metrics, sub["Diff"].tolist()):
+            is_inverse = m in inverse_metrics
+            is_red = (v > 0) if is_inverse else (v < 0)
+            diff_colors.append("#E74C3C" if pd.notna(v) and is_red else COLOR_DARK)
         sigma_w1_colors = []
         sigma_w2_colors = []
         sigma_diff_colors = []
@@ -868,7 +876,7 @@ def make_figure(df_comparison: pd.DataFrame, start1: str, end1: str, start2: str
             dark_column,
             dark_column,
             dark_column,
-            dark_column,
+            diff_colors,
             diff_pct_colors,
             sigma_w1_colors,
             sigma_w2_colors,
@@ -888,10 +896,21 @@ def make_figure(df_comparison: pd.DataFrame, start1: str, end1: str, start2: str
                     "σ差(W2-W1)",
                 ],
                 fill_color="#f8f9fa",
-                font=dict(color="#555555", size=12),
-                align="center",
-                height=30,
+                font=dict(color="#555555", size=14, family="Helvetica"),
+                align=[
+                    "left",
+                    "left",
+                    "right",
+                    "right",
+                    "right",
+                    "right",
+                    "right",
+                    "right",
+                    "right",
+                ],
+                height=34,
             ),
+            columnwidth=[1.5, 1.5, 1, 1, 1, 1, 1, 1, 1],
             cells=dict(
                 values=[
                     metrics,
@@ -916,7 +935,8 @@ def make_figure(df_comparison: pd.DataFrame, start1: str, end1: str, start2: str
                     "right",
                 ],
                 fill_color=COLOR_BG,
-                font=dict(color=font_colors, size=11),
+                font=dict(color=font_colors, size=12),
+                height=32,
             ),
             row=idx,
             col=1,
