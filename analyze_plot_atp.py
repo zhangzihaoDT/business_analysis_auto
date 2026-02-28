@@ -579,6 +579,128 @@ def build_ls6_launch_price_figure(df: pd.DataFrame, business_def: dict) -> go.Fi
     
     return fig
 
+def build_reev_price_trend_figure(df: pd.DataFrame) -> go.Figure:
+    """
+    Plot 6: REEV Main Selling Models Price Trend.
+    Models: '智己LS9 66 Ultra', '智己LS9 52 Ultra', '新一代智己LS6 52 Max', '新一代智己LS6 66 Max'
+    """
+    target_models = ['智己LS9 66 Ultra', '智己LS9 52 Ultra', '新一代智己LS6 52 Max', '新一代智己LS6 66 Max']
+    
+    # Filter for target models
+    df_filtered = df[df["product_name"].isin(target_models)].copy()
+    
+    if df_filtered.empty:
+        return None
+
+    # Aggregate by Date
+    if "invoice_upload_time" not in df_filtered.columns:
+        return None
+
+    df_filtered["date"] = df_filtered["invoice_upload_time"].dt.date
+    agg_df = df_filtered.groupby(["product_name", "date"]).agg(
+        avg_price=("invoice_amount", "mean"),
+        count=("invoice_amount", "count")
+    ).reset_index()
+    
+    agg_df["date"] = pd.to_datetime(agg_df["date"])
+    
+    fig = go.Figure()
+    
+    # Use consistent colors from the file
+    colors = {
+        '新一代智己LS6 52 Max': COLOR_CONTRAST,  # Orange (Key Model)
+        '新一代智己LS6 66 Max': COLOR_TEXT,      # Grey (Secondary LS6)
+        '智己LS9 52 Ultra': COLOR_MAIN,        # Blue (Key LS9)
+        '智己LS9 66 Ultra': COLOR_DARK         # Dark Grey (Secondary LS9)
+    }
+    
+    # Sort dates
+    agg_df = agg_df.sort_values("date")
+    
+    for model in target_models:
+        sub = agg_df[agg_df["product_name"] == model].copy()
+        if sub.empty:
+            continue
+            
+        # Reindex to full date range for better smoothing
+        sub = sub.set_index("date").sort_index()
+        idx = pd.date_range(sub.index.min(), sub.index.max())
+        sub = sub.reindex(idx)
+        
+        # Smoothing (7-day rolling)
+        sub["smooth_price"] = sub["avg_price"].rolling(window=7, min_periods=1).mean()
+        sub["smooth_count"] = sub["count"].rolling(window=7, min_periods=1).mean()
+        
+        # Reset index for plotting and drop NaNs
+        sub = sub.reset_index().rename(columns={"index": "date"})
+        sub = sub.dropna(subset=["smooth_price"])
+        
+        if sub.empty:
+            continue
+            
+        line_color = colors.get(model, COLOR_DARK)
+        
+        fig.add_trace(go.Scatter(
+            x=sub["date"],
+            y=sub["smooth_price"],
+            mode='lines',
+            name=model,
+            line=dict(color=line_color, width=3),
+            customdata=sub[["smooth_count"]],
+            hovertemplate=(
+                "<b>%{y:,.0f}</b><br>" +
+                "Date: %{x|%Y-%m-%d}<br>" +
+                "Count (7d Avg): %{customdata[0]:.1f}<br>" +
+                "<extra>%{fullData.name}</extra>"
+            )
+        ))
+
+        # Add annotation at the end of the line
+        last_point = sub.iloc[-1]
+        fig.add_annotation(
+            x=last_point["date"],
+            y=last_point["smooth_price"],
+            text=f"¥{last_point['smooth_price']:,.0f}",
+            showarrow=False,
+            xanchor="left",
+            yanchor="middle",
+            font=dict(size=11, color=line_color, family="Arial, sans-serif"),
+            xshift=8
+        )
+        
+    fig.update_layout(
+        title=dict(
+            text="REEV Main Selling Models Price Trend (7-day Smoothed)",
+            font=dict(color=COLOR_DARK, size=16),
+            x=0.01,
+            xanchor='left'
+        ),
+        xaxis=dict(
+            title="Date",
+            gridcolor=COLOR_GRID,
+            showline=True,
+            linecolor=COLOR_GRID
+        ),
+        yaxis=dict(
+            title="Average Invoice Price",
+            gridcolor=COLOR_GRID,
+            showline=True,
+            linecolor=COLOR_GRID
+        ),
+        legend=dict(
+            bordercolor=COLOR_TEXT,
+            borderwidth=1,
+            font=dict(color=COLOR_TEXT)
+        ),
+        plot_bgcolor=COLOR_BG,
+        paper_bgcolor=COLOR_BG,
+        hovermode="x unified",
+        height=600,
+        margin=dict(l=20, r=60, t=60, b=20)
+    )
+    
+    return fig
+
 def main():
     args = parse_args()
 
@@ -615,6 +737,9 @@ def main():
     
     # Generate Plot 5
     fig5 = build_ls6_launch_price_figure(df_history_processed, business_def)
+    
+    # Generate Plot 6
+    fig6 = build_reev_price_trend_figure(df_history_processed)
     # ----------------------------------------
     
     # 3. Global Filter: Lock Time Not Null & Invoice Time >= 2025-01-01 (Standard Logic)
@@ -752,6 +877,12 @@ def main():
         if fig5:
              include_js = False if (fig1_2025 or fig1_2026 or fig2_2025 or fig2_2026 or fig3_2025 or fig3_2026 or fig4) else 'cdn'
              f.write(fig5.to_html(full_html=False, include_plotlyjs=include_js))
+             f.write("<br><hr><br>")
+             
+        # Plot 6: REEV Price Trend
+        if fig6:
+             include_js = False if (fig1_2025 or fig1_2026 or fig2_2025 or fig2_2026 or fig3_2025 or fig3_2026 or fig4 or fig5) else 'cdn'
+             f.write(fig6.to_html(full_html=False, include_plotlyjs=include_js))
              
         f.write("</body></html>")
 
