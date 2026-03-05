@@ -790,8 +790,12 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
         # Filter for valid dates and sum amount
         daily_invoice_sum = df.groupby(df['invoice_upload_time'].dt.floor('D'))['invoice_amount'].sum()
         metrics['daily_invoice_sum'] = daily_invoice_sum
+        
+        # Daily Invoice Count
+        daily_invoice_count = df.groupby(df['invoice_upload_time'].dt.floor('D')).size()
+        metrics['daily_invoice_count'] = daily_invoice_count
     except Exception as e:
-        print(f"Error calculating daily invoice sum: {e}")
+        print(f"Error calculating daily invoice sum/count: {e}")
 
     # 14. Daily Invoice Price Trend (for Module 1.4)
     try:
@@ -1511,15 +1515,66 @@ def generate_html(metrics: dict, output_file: Path):
             chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
             html_content.append(chart_html)
 
-    # 1.4 开票价格趋势 (Invoice Price Trends)
-    html_content.append("<h2>1.4 开票价格趋势 (Invoice Price Trends)</h2>")
+    # 1.4 开票量趋势 (Invoice Volume Trends)
+    html_content.append("<h2>1.4 开票量趋势 (Invoice Volume Trends)</h2>")
+    html_content.append("<p>X轴: Invoice Upload Time (Day of Year), Y轴: 日开票量 (MA7 Smoothed)</p>")
+    html_content.append("<p>注：数据已进行 7天移动平均 (MA7) 平滑处理。</p>")
+
+    # 1.4.0 Summary
+    if 'daily_invoice_count' in metrics:
+        html_content.append("<h3>1.4.0 整体开票量趋势 (Overall Invoice Volume Trends - MA7)</h3>")
+        daily_count = metrics['daily_invoice_count']
+        
+        fig = go.Figure()
+        for year in [2025, 2026]:
+            # Filter
+            data_year = daily_count[daily_count.index.year == year]
+            if data_year.empty: continue
+            
+            # Apply MA7 Smoothing
+            min_date = data_year.index.min()
+            max_date = data_year.index.max()
+            full_idx = pd.date_range(min_date, max_date, freq='D')
+            # For volume, fill missing days with 0
+            data_year = data_year.reindex(full_idx, fill_value=0)
+            
+            # Calculate MA7
+            ma7_data = data_year.rolling(window=7, min_periods=1).mean()
+            
+            # X = Day of Year
+            x_days = ma7_data.index.dayofyear
+            dates_str = ma7_data.index.strftime('%Y-%m-%d')
+            color = '#3498DB' if year == 2025 else '#E67E22'
+            
+            fig.add_trace(go.Scatter(
+                x=x_days,
+                y=ma7_data.values,
+                mode='lines',
+                name=f'{year} (MA7)',
+                line=dict(color=color, width=2),
+                hovertemplate="Day %{x} (%{customdata})<br>MA7 Volume: %{y:.1f}<extra></extra>",
+                customdata=dates_str
+            ))
+            
+        layout = get_common_layout(
+            title="整体开票量趋势对比 (Overall Daily Invoice Volume - MA7)",
+            xaxis_title="年份天数 (Day of Year)",
+            yaxis_title="日开票量 (Count)"
+        )
+        layout['xaxis']['range'] = [1, 366]
+        fig.update_layout(layout)
+        chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+        html_content.append(chart_html)
+
+    # 1.5 开票价格趋势 (Invoice Price Trends)
+    html_content.append("<h2>1.5 开票价格趋势 (Invoice Price Trends)</h2>")
     html_content.append("<p>X轴: Invoice Upload Time (Day of Year), Y轴: 平均开票价格 (MA7 Smoothed)</p>")
     html_content.append("<p>筛选条件: 含有 delivery_date 的已交付订单。</p>")
     html_content.append("<p>注：数据已进行 7天移动平均 (MA7) 平滑处理。</p>")
 
-    # 1.4.0 Summary
+    # 1.5.0 Summary
     if 'daily_invoice_price' in metrics:
-        html_content.append("<h3>1.4.0 整体开票价格趋势 (Overall Invoice Price Trends - MA7)</h3>")
+        html_content.append("<h3>1.5.0 整体开票价格趋势 (Overall Invoice Price Trends - MA7)</h3>")
         daily_price = metrics['daily_invoice_price']
         
         fig = go.Figure()
@@ -1564,7 +1619,7 @@ def generate_html(metrics: dict, output_file: Path):
         chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
         html_content.append(chart_html)
 
-    # 1.4.1 - 1.4.3 Series Breakdown
+    # 1.5.1 - 1.5.3 Series Breakdown
     if 'daily_invoice_price_series' in metrics:
         df_price_series = metrics['daily_invoice_price_series']
         target_series = ['LS6', 'L6', 'LS9']
@@ -1572,7 +1627,7 @@ def generate_html(metrics: dict, output_file: Path):
         for ser_name in target_series:
             if ser_name not in df_price_series.columns: continue
             
-            html_content.append(f"<h3>1.4.{target_series.index(ser_name)+1} {ser_name} 开票价格趋势 (MA7)</h3>")
+            html_content.append(f"<h3>1.5.{target_series.index(ser_name)+1} {ser_name} 开票价格趋势 (MA7)</h3>")
             s_price_ser = df_price_series[ser_name]
             
             fig = go.Figure()
