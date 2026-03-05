@@ -368,7 +368,7 @@ def generate_html(output_path, csv_name, start_date, fig_groups):
     <html>
     <head><meta charset='utf-8'><title>Product Trend Analysis</title>{css}</head>
     <body>
-        <h1>CM2 车型趋势分析报告</h1>
+        <h1>CM2 & LS9 关键配置趋势分析报告</h1>
         <div>生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
         <div class="download-link"><a href="{csv_name}" download>📥 下载完整数据 (CSV)</a></div>
         

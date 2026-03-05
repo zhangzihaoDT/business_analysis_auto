@@ -10,7 +10,9 @@ import statsmodels.api as sm
 
 PARQUET_FILE = Path("/Users/zihao_/Documents/coding/dataset/formatted/order_full_data.parquet")
 BUSINESS_DEF_FILE = Path("/Users/zihao_/Documents/github/W52_reasoning/world/business_definition.json")
-DEFAULT_OUTPUT = Path("reports/review_2025.html")
+# Use script directory to determine output path
+SCRIPT_DIR = Path(__file__).parent
+DEFAULT_OUTPUT = SCRIPT_DIR / "reports/review_2025.html"
 
 def load_business_definition(file_path: Path) -> dict:
     """加载业务定义文件"""

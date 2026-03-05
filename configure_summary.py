@@ -360,6 +360,87 @@ def analyze_configuration(model):
         report_lines.append("⚠️ 数据中缺少 'WHEEL' 列，无法分析轮毂配置。")
 
     # ---------------------------------------------------------
+    # 模块四：拖钩 (OP-Hitch) 配置情况
+    # ---------------------------------------------------------
+    print("\n" + "="*50)
+    print(f"模块四：{model} 拖钩 (OP-Hitch) 配置情况")
+    print("="*50)
+
+    if 'OP-Hitch' in df.columns:
+        # 1. 整体分布
+        print(f"\n--- {model} 整体 OP-Hitch 分布 (基于锁单) ---")
+        hitch_counts = locked_df['OP-Hitch'].value_counts(dropna=False)
+        hitch_percentages = locked_df['OP-Hitch'].value_counts(normalize=True, dropna=False) * 100
+        
+        df_hitch_summary = pd.DataFrame({
+            'OP-Hitch': hitch_counts.index,
+            'Count': hitch_counts.values,
+            'Percentage': hitch_percentages.values
+        })
+        # 格式化百分比
+        df_hitch_summary['Percentage'] = df_hitch_summary['Percentage'].apply(lambda x: f"{x:.1f}%")
+        
+        print(df_hitch_summary.to_string(index=False))
+        
+        # 添加到报告
+        report_lines.append("## 拖钩 (OP-Hitch) 整体分布")
+        report_lines.append(df_hitch_summary.to_markdown(index=False))
+        report_lines.append("")
+
+        # 2. 分 Is Staff 的 OP-Hitch 分布
+        if has_staff_info:
+            print(f"\n--- 分 [Is Staff] 的 OP-Hitch 分布 ---")
+            
+            # 使用 pivot table 展示
+            hitch_staff_pivot = pd.pivot_table(
+                locked_df, 
+                index=['OP-Hitch'], 
+                columns='Is Staff', 
+                values='order_number', 
+                aggfunc='count', 
+                fill_value=0,
+                margins=True,
+                margins_name='Total'
+            )
+            print(hitch_staff_pivot)
+            
+            # 添加到报告
+            report_lines.append("## 分员工单 (Is Staff) 拖钩分布")
+            # 重置索引以便在 markdown 中显示 OP-Hitch 列
+            hitch_staff_pivot_md = hitch_staff_pivot.reset_index()
+            report_lines.append(hitch_staff_pivot_md.to_markdown(index=False))
+            report_lines.append("")
+
+        # 3. 分 Product Name 的 OP-Hitch 分布
+        if 'Product Name' in df.columns:
+            print(f"\n--- 分 [Product Name] 的 OP-Hitch 分布 ---")
+            
+            hitch_product_pivot = pd.pivot_table(
+                locked_df,
+                index=['OP-Hitch'],
+                columns='Product Name',
+                values='order_number',
+                aggfunc='count',
+                fill_value=0,
+                margins=True,
+                margins_name='Total'
+            )
+            print(hitch_product_pivot)
+
+            # 添加到报告
+            report_lines.append("## 分车型 (Product Name) 拖钩分布")
+            hitch_product_pivot_md = hitch_product_pivot.reset_index()
+            report_lines.append(hitch_product_pivot_md.to_markdown(index=False))
+            report_lines.append("")
+
+    else:
+        print("⚠️ 数据中缺少 'OP-Hitch' 列，无法分析拖钩配置。")
+        # report_lines.append("⚠️ 数据中缺少 'OP-Hitch' 列，无法分析拖钩配置。") # Optional: decide if we want this in report if missing. 
+        # Actually, for consistency with WHEEL block, let's keep it but maybe not clutter report if column is totally absent for models that don't have it.
+        # But user asked for it, so let's include the message if it's missing so they know why.
+        report_lines.append("⚠️ 数据中缺少 'OP-Hitch' 列，无法分析拖钩配置。")
+
+    # ---------------------------------------------------------
     # 保存报告
     # ---------------------------------------------------------
     ensure_dir(ANALYSIS_RESULTS_DIR)
