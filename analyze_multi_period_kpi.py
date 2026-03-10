@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end2", required=True, help="时间窗2结束日期 YYYY-MM-DD")
     parser.add_argument(
         "--out",
-        default=str(BASE_DIR / "reports" / "multi_period_kpi.html"),
+        default=str(BASE_DIR / "scripts" / "reports" / "multi_period_kpi.html"),
         help="输出 HTML 报告路径",
     )
     return parser.parse_args()
@@ -984,6 +984,7 @@ def main():
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.write_html(str(out_path), include_plotlyjs="cdn")
+    print(f"Report generated: {out_path}")
 
 
 if __name__ == "__main__":

@@ -217,6 +217,40 @@ python automated_data_pipeline.py --skip-export
 | 🔍 **历史分析** | `python automated_data_pipeline.py --date 2025-09-28 --skip-export --flomo` | 分析特定日期数据         |
 | 🧪 **测试调试** | `python automated_data_pipeline.py --skip-export --skip-processing`         | 测试流水线逻辑           |
 
+## ⏰ 定时任务配置 (Cron)
+
+为了实现完全自动化运行，我们使用 `crontab` 配合包装脚本 `run_pipeline_cron.sh` 来定时执行任务。
+
+### 1. 包装脚本 (`run_pipeline_cron.sh`)
+
+为了解决环境变量加载、路径依赖和重复运行等问题，我们提供了一个专用的包装脚本：
+
+- 🛠️ **环境准备**: 自动激活 Python 虚拟环境，设置 `PYTHONUNBUFFERED=1` 确保实时输出。
+- 🔒 **单例锁**: 防止脚本重复运行（如果上一次运行未结束，新任务会自动跳过）。
+- 📝 **日志记录**: 将运行日志同时输出到屏幕和 `logs/cron_pipeline.log` 文件。
+- 📺 **可视化**: 使用 `open` 命令调用 Terminal.app 运行，提供可视化的进度窗口。
+
+### 2. 配置定时任务
+
+由于 macOS 权限限制 (TCC)，直接运行 cron 可能会遇到权限问题。推荐使用以下命令配置定时任务，它会每天早上 08:46 弹出一个终端窗口自动运行脚本：
+
+```bash
+# 每天 08:46 运行流水线
+(crontab -l 2>/dev/null | grep -v "run_pipeline_cron.sh"; echo "46 8 * * * /usr/bin/open /Users/zihao_/Documents/coding/dataset/scripts/run_pipeline_cron.sh") | crontab -
+```
+
+### 3. 常见问题排查
+
+- **Q: 为什么没有自动运行？**
+  - A: 请检查 `pmset -g sched` 确保已设置唤醒计划（脚本依赖电脑唤醒）。
+  - A: 运行 `crontab -l` 确保任务已添加。
+
+- **Q: 提示 "Operation not permitted"？**
+  - A: 这是因为 cron 没有磁盘访问权限。请使用上述 `/usr/bin/open` 方案，它利用 Terminal.app 的权限来绕过限制。
+
+- **Q: 脚本运行了一半卡住？**
+  - A: 检查日志文件 `logs/cron_pipeline.log` 查看详细错误。脚本自带单例锁，如果是重复运行会被自动拦截。
+
 ## 🔧 流水线步骤详解
 
 ### 📥 步骤 1: Tableau 数据导出

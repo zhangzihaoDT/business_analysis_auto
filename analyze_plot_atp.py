@@ -307,6 +307,8 @@ def build_period_comparison_figure(df_full: pd.DataFrame, filter_info: str) -> g
       - 2025 Full Year
       - 2025 Dec
       - 2026 Jan
+      - 2026 Feb
+      - 2026 1~2 Month
     Segments:
       - All Series
       - Sedan (L6+L7)
@@ -318,7 +320,9 @@ def build_period_comparison_figure(df_full: pd.DataFrame, filter_info: str) -> g
     periods = [
         ("2025 Full Year", lambda df: df[df["invoice_upload_time"].dt.year == 2025]),
         ("2025 Dec", lambda df: df[(df["invoice_upload_time"].dt.year == 2025) & (df["invoice_upload_time"].dt.month == 12)]),
-        ("2026 Jan", lambda df: df[(df["invoice_upload_time"].dt.year == 2026) & (df["invoice_upload_time"].dt.month == 1)])
+        ("2026 Jan", lambda df: df[(df["invoice_upload_time"].dt.year == 2026) & (df["invoice_upload_time"].dt.month == 1)]),
+        ("2026 Feb", lambda df: df[(df["invoice_upload_time"].dt.year == 2026) & (df["invoice_upload_time"].dt.month == 2)]),
+        ("2026 1～2月", lambda df: df[(df["invoice_upload_time"].dt.year == 2026) & (df["invoice_upload_time"].dt.month.isin([1, 2]))])
     ]
     
     # Define Segments
