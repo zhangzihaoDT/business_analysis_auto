@@ -16,6 +16,7 @@ Order 完整数据处理脚本
 import pandas as pd
 import numpy as np
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
 
@@ -25,6 +26,29 @@ ORIGINAL_DIR = BASE_DIR / "original"
 FORMATTED_DIR = BASE_DIR / "formatted"
 OUTPUT_FILE = FORMATTED_DIR / "order_full_data.parquet"
 
+def normalize_owner_cell_phone(series: pd.Series) -> pd.Series:
+    s_raw = series.astype("string").str.strip()
+    num = pd.to_numeric(s_raw, errors="coerce").round(0)
+    num_int = num.astype("Int64")
+    s_num = num_int.astype("string")
+    s = s_raw.where(num.isna(), s_num)
+    s = s.str.strip().str.lower()
+    s = s.replace(
+        {
+            "nan": pd.NA,
+            "none": pd.NA,
+            "null": pd.NA,
+            "": pd.NA,
+            "-": pd.NA,
+            "无": pd.NA,
+        }
+    )
+    digits = s.str.replace(r"\D", "", regex=True)
+    digits = digits.str.replace(r"^0086", "", regex=True)
+    digits = digits.str.replace(r"^86", "", regex=True)
+    valid = digits.str.match(r"^1\d{10}$", na=False)
+    return digits.where(valid, pd.NA).astype("string")
+
 def read_csv_smart(file_path: Path) -> pd.DataFrame:
     """
     智能读取 CSV 文件，尝试多种编码和分隔符
@@ -32,6 +56,13 @@ def read_csv_smart(file_path: Path) -> pd.DataFrame:
     if not file_path.exists():
         print(f"⚠️ 文件不存在: {file_path}")
         return pd.DataFrame()
+
+    try:
+        if file_path.stat().st_size == 0:
+            print(f"❌ 文件为空(0字节): {file_path}")
+            return pd.DataFrame()
+    except Exception:
+        pass
 
     print(f"📖 正在读取: {file_path.name} ...")
     
@@ -133,14 +164,12 @@ def convert_types(df: pd.DataFrame) -> pd.DataFrame:
             s = s.replace({'nan': None, 'None': None, '': None})
             
             df[col] = pd.to_datetime(s, errors='coerce')
-            print(f"   - 日期列转换: {col}")
 
     # 2. 数值列转换
     numeric_cols = ['age', 'invoice_amount', 'td_countd']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-            print(f"   - 数值列转换: {col}")
 
     # 3. 分类列转换 (优化存储)
     cat_cols = [
@@ -156,7 +185,6 @@ def convert_types(df: pd.DataFrame) -> pd.DataFrame:
             # 如果唯一值数量较少，转为 category
             if df[col].nunique() < df.shape[0] * 0.5:
                 df[col] = df[col].astype('category')
-                print(f"   - 分类列转换: {col}")
             else:
                 df[col] = df[col].astype('string')
 
@@ -164,10 +192,13 @@ def convert_types(df: pd.DataFrame) -> pd.DataFrame:
     if 'order_number' in df.columns:
         df['order_number'] = df['order_number'].astype('string')
 
+    if "owner_cell_phone" in df.columns:
+        df["owner_cell_phone"] = normalize_owner_cell_phone(df["owner_cell_phone"])
+
     return df
 
 def main():
-    # 1. 按要求收集输入文件：基础文件 + 2024年度 + 最新的当前年度文件
+    # 1. 按要求收集输入文件：基础文件 + 2024年度 + 2024~当年各年度文件（每年取最新）
     csv_files = []
     
     base_files = [
@@ -179,11 +210,30 @@ def main():
             csv_files.append(bf)
     
     current_year = datetime.now().strftime("%Y")
-    year_pattern = f"Order_完整数据_data_{current_year}*.csv"
-    year_files = list(ORIGINAL_DIR.glob(year_pattern))
-    if year_files:
-        latest_year_file = max(year_files, key=lambda p: p.stat().st_mtime)
-        csv_files.append(latest_year_file)
+    try:
+        current_year_int = int(current_year)
+    except Exception:
+        current_year_int = datetime.now().year
+
+    year_files = list(ORIGINAL_DIR.glob("Order_完整数据_data_20*.csv"))
+    latest_by_year: dict[int, Path] = {}
+    for p in year_files:
+        name = p.name
+        year_part = name.replace("Order_完整数据_data_", "").split(".csv")[0]
+        year_str = year_part.split("_")[0]
+        if not year_str.isdigit():
+            continue
+        y = int(year_str)
+        if y < 2024 or y > current_year_int:
+            continue
+        prev = latest_by_year.get(y)
+        if prev is None or p.stat().st_mtime > prev.stat().st_mtime:
+            latest_by_year[y] = p
+
+    for y in sorted(latest_by_year.keys()):
+        p = latest_by_year[y]
+        if p not in csv_files:
+            csv_files.append(p)
     
     if not csv_files:
         print(f"❌ 未在 {ORIGINAL_DIR} 找到所需的输入文件（基础、2024或当年最新）")
@@ -195,6 +245,7 @@ def main():
     
     # 2. 读取并合并所有新数据
     dfs = []
+    failed_files = []
     for file_path in csv_files:
         df = read_csv_smart(file_path)
         if not df.empty:
@@ -203,10 +254,18 @@ def main():
             df = clean_column_names(df)
             df = convert_types(df)
             dfs.append(df)
+        else:
+            failed_files.append(file_path.name)
         
     if not dfs:
         print("❌ 没有成功读取到任何数据，退出。")
-        return
+        return 1
+    
+    if failed_files:
+        print("❌ 以下文件读取失败或为空，已终止更新以避免静默缺数:")
+        for n in failed_files:
+            print(f"   - {n}")
+        return 1
         
     df_new = pd.concat(dfs, ignore_index=True)
     print(f"✅ 所有新数据合并完成: {df_new.shape[0]} 行")
@@ -283,6 +342,33 @@ def main():
         after_count = len(df_final)
         print(f"   去重前: {before_count}, 去重后: {after_count}, 移除: {before_count - after_count}")
 
+    if "owner_cell_phone" in df_final.columns:
+        s0 = df_final["owner_cell_phone"].astype("string")
+        s0_norm = s0.str.strip().str.lower()
+        present_before = int(
+            (
+                s0_norm.notna()
+                & s0_norm.ne("")
+                & ~s0_norm.isin(["nan", "none", "null", "-", "无"])
+            ).sum()
+        )
+        cleaned = normalize_owner_cell_phone(s0)
+        present_after = int(cleaned.notna().sum())
+        removed = present_before - present_after if present_before >= present_after else 0
+        df_final["owner_cell_phone"] = cleaned
+        print(
+            f"📱 owner_cell_phone 清洗汇总: 原始非空 {present_before}, 标准化有效 {present_after}, 剔除 {removed}"
+        )
+        invalid_mask = cleaned.notna() & cleaned.str.len().ne(11)
+        invalid_count = int(invalid_mask.sum())
+        if invalid_count > 0:
+            examples = cleaned[invalid_mask].dropna().value_counts().head(5)
+            print(f"⚠️ owner_cell_phone 非11位: {invalid_count}")
+            for v, c in examples.items():
+                print(f"   - {v}: {int(c)}")
+        else:
+            print("✅ owner_cell_phone 均为11位或为空")
+
     # 6. 保存
     if not FORMATTED_DIR.exists():
         FORMATTED_DIR.mkdir(parents=True)
@@ -295,8 +381,10 @@ def main():
         size_mb = OUTPUT_FILE.stat().st_size / (1024 * 1024)
         print(f"✅ 保存成功! 文件大小: {size_mb:.2f} MB")
         print(f"   最终行数: {df_final.shape[0]}")
+        return 0
     else:
         print("❌ 保存失败")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

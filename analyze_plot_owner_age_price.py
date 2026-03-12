@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 import numpy as np
 
 DEFAULT_INPUT = Path(
-    "/Users/zihao_/Documents/coding/dataset/formatted/intention_order_analysis.parquet"
+    "/Users/zihao_/Documents/coding/dataset/formatted/order_full_data.parquet"
 )
 OUT_DIR = Path(
     "/Users/zihao_/Documents/coding/dataset/processed/analysis_results"
@@ -32,7 +32,7 @@ def resolve_column(df: pd.DataFrame, candidates: List[str]) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="分车型的车主年龄 vs 开票价格散点图（Plotly）")
+    parser = argparse.ArgumentParser(description="基于 order_full_data 的分车型车主年龄 vs 开票价格散点图（Plotly）")
     parser.add_argument(
         "--input",
         default=str(DEFAULT_INPUT),
@@ -170,31 +170,57 @@ def main() -> None:
 
     model_group_col = resolve_column(
         df,
-        ["车型分组", "Model Group", "Vehicle Group", "Car Group", "车型", "model_group"],
+        [
+            "series",
+            "Series",
+            "车型分类",
+            "车型分组",
+            "Model Group",
+            "Vehicle Group",
+            "Car Group",
+            "车型",
+            "model_group",
+        ],
     )
     product_name_col = None
     try:
         product_name_col = resolve_column(
             df,
-            ["productname", "ProductName", "Product Name", "产品名称", "商品名称"],
+            ["product_name", "productname", "ProductName", "Product Name", "产品名称", "商品名称"],
         )
     except Exception:
         product_name_col = None
 
     owner_age_col = resolve_column(
         df,
-        ["owner_age", "Owner Age", "车主年龄", "年龄"],
+        ["age", "owner_age", "Owner Age", "车主年龄", "年龄"],
     )
     price_col = resolve_column(
         df,
-        ["开票价格", "Invoice Price", "invoice_price", "price", "开票 价格"],
+        [
+            "invoice_amount",
+            "Invoice Amount",
+            "开票金额",
+            "开票价格",
+            "Invoice Price",
+            "invoice_price",
+            "price",
+            "开票 价格",
+        ],
     )
 
     # 解析 Parent Region Name 列
     try:
         region_col = resolve_column(
             df,
-            ["Parent Region Name", "Parent_Region_Name", "Parent Region", "大区", "区域"]
+            [
+                "parent_region_name",
+                "Parent Region Name",
+                "Parent_Region_Name",
+                "Parent Region",
+                "大区",
+                "区域",
+            ]
         )
     except KeyError:
         region_col = None
@@ -337,7 +363,7 @@ def main() -> None:
                 )
 
     fig.update_layout(
-        title="分区域 x 分车型的车主年龄 vs 开票价格",
+        title="分区域 x 分车型的车主年龄 vs 开票价格（order_full_data）",
         plot_bgcolor="#FFFFFF",
         paper_bgcolor="#FFFFFF",
         legend=dict(bordercolor="#7B848F", borderwidth=1, font=dict(color="#7B848F")),
