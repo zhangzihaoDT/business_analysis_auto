@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.zihao.dataset.lock-attribution-to-parquet</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/zihao_/Documents/coding/dataset</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/bash</string>
+      <string>-lc</string>
+      <string>LOCKFILE="/tmp/lock_attribution_to_parquet.lock"; if [ -e "${LOCKFILE}" ] &amp;&amp; kill -0 "$(cat "${LOCKFILE}")" 2&gt;/dev/null; then pid="$(cat "${LOCKFILE}")"; echo "already running (PID: ${pid})"; exit 0; fi; trap "rm -f ${LOCKFILE}" INT TERM EXIT; echo $$ &gt; ${LOCKFILE}; source /Users/zihao_/Documents/coding/dataset/venv/bin/activate; cd /Users/zihao_/Documents/coding/dataset; if command -v caffeinate &gt;/dev/null 2&gt;&amp;1; then caffeinate -dimsu -w $$ &amp; fi; export PYTHONUNBUFFERED=1; python -u scripts/lock_attribution_data_to_parquet.py</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+      <key>Hour</key>
+      <integer>8</integer>
+      <key>Minute</key>
+      <integer>15</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/zihao_/Documents/coding/dataset/logs/launchd_lock_attribution.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/zihao_/Documents/coding/dataset/logs/launchd_lock_attribution.stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+  </dict>
+</plist>
