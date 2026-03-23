@@ -17,6 +17,7 @@
 import os
 import sys
 import argparse
+import json
 import pandas as pd
 from datetime import datetime
 
@@ -27,10 +28,22 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 PROCESSED_DIR = os.path.join(PROJECT_DIR, 'processed')
 ANALYSIS_RESULTS_DIR = os.path.join(PROCESSED_DIR, 'analysis_results')
+BUSINESS_DEFINITION_PATH = '/Users/zihao_/Documents/github/26W06_Tool_calls/schema/business_definition.json'
 
 def ensure_dir(directory):
     if not os.path.exists(directory):
         os.makedirs(directory)
+
+def load_time_periods(json_path):
+    if not os.path.exists(json_path):
+        return {}
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        time_periods = data.get('time_periods', {})
+        return time_periods if isinstance(time_periods, dict) else {}
+    except Exception:
+        return {}
 
 def analyze_configuration(model):
     """分析指定车型的配置数据"""
@@ -218,7 +231,7 @@ def analyze_configuration(model):
 
         # 2. 分 Is Staff 的 OP-LASER 分布
         if has_staff_info:
-            print(f"\n--- 分 [Is Staff] 的 OP-LASER 分布 ---")
+            print("\n--- 分 [Is Staff] 的 OP-LASER 分布 ---")
             
             # 使用 pivot table 展示
             staff_pivot = pd.pivot_table(
@@ -310,7 +323,7 @@ def analyze_configuration(model):
 
         # 2. 分 Is Staff 的 WHEEL 分布
         if has_staff_info:
-            print(f"\n--- 分 [Is Staff] 的 WHEEL 分布 ---")
+            print("\n--- 分 [Is Staff] 的 WHEEL 分布 ---")
             
             # 使用 pivot table 展示
             wheel_staff_pivot = pd.pivot_table(
@@ -334,7 +347,7 @@ def analyze_configuration(model):
 
         # 3. 分 Product Name 的 WHEEL 分布
         if 'Product Name' in df.columns:
-            print(f"\n--- 分 [Product Name] 的 WHEEL 分布 ---")
+            print("\n--- 分 [Product Name] 的 WHEEL 分布 ---")
             
             wheel_product_pivot = pd.pivot_table(
                 locked_df,
@@ -389,7 +402,7 @@ def analyze_configuration(model):
 
         # 2. 分 Is Staff 的 OP-Hitch 分布
         if has_staff_info:
-            print(f"\n--- 分 [Is Staff] 的 OP-Hitch 分布 ---")
+            print("\n--- 分 [Is Staff] 的 OP-Hitch 分布 ---")
             
             # 使用 pivot table 展示
             hitch_staff_pivot = pd.pivot_table(
@@ -413,7 +426,7 @@ def analyze_configuration(model):
 
         # 3. 分 Product Name 的 OP-Hitch 分布
         if 'Product Name' in df.columns:
-            print(f"\n--- 分 [Product Name] 的 OP-Hitch 分布 ---")
+            print("\n--- 分 [Product Name] 的 OP-Hitch 分布 ---")
             
             hitch_product_pivot = pd.pivot_table(
                 locked_df,
@@ -439,6 +452,65 @@ def analyze_configuration(model):
         # Actually, for consistency with WHEEL block, let's keep it but maybe not clutter report if column is totally absent for models that don't have it.
         # But user asked for it, so let's include the message if it's missing so they know why.
         report_lines.append("⚠️ 数据中缺少 'OP-Hitch' 列，无法分析拖钩配置。")
+
+    print("\n" + "="*50)
+    print(f"模块五：{model} 冰箱 (OP-FRIDGE) 月度占比（分 Product_Types）")
+    print("="*50)
+
+    if 'OP-FRIDGE' in df.columns and 'Product_Types' in df.columns:
+        time_periods = load_time_periods(BUSINESS_DEFINITION_PATH)
+        listing_start = pd.to_datetime(time_periods.get(model, {}).get('end'), errors='coerce')
+        if pd.isna(listing_start):
+            listing_start = locked_df['lock_time_dt'].min()
+
+        analysis_df = locked_df[locked_df['lock_time_dt'].notna()].copy()
+        if not pd.isna(listing_start):
+            analysis_df = analysis_df[analysis_df['lock_time_dt'] >= listing_start]
+
+        if analysis_df.empty:
+            print("⚠️ 上市时间过滤后无数据，跳过 OP-FRIDGE 月度分析。")
+            report_lines.append("## 冰箱 (OP-FRIDGE) 月度占比（分 Product_Types，自上市以来）")
+            report_lines.append("⚠️ 上市时间过滤后无数据，跳过 OP-FRIDGE 月度分析。")
+            report_lines.append("")
+        else:
+            analysis_df['lock_month'] = analysis_df['lock_time_dt'].dt.to_period('M').astype(str)
+
+            print(f"- 上市时间(End Day): {listing_start.strftime('%Y-%m-%d') if not pd.isna(listing_start) else 'Unknown'}")
+            report_lines.append("## 冰箱 (OP-FRIDGE) 月度占比（分 Product_Types，自上市以来）")
+            report_lines.append(f"- 上市时间(End Day): `{listing_start.strftime('%Y-%m-%d') if not pd.isna(listing_start) else 'Unknown'}`")
+            report_lines.append("")
+
+            analysis_df['Product_Types_str'] = analysis_df['Product_Types'].astype(str)
+            product_types = sorted(analysis_df['Product_Types_str'].dropna().unique())
+            for product_type in product_types:
+                pt_df = analysis_df[analysis_df['Product_Types_str'] == product_type].copy()
+                if pt_df.empty:
+                    continue
+
+                fridge_v = pt_df['OP-FRIDGE'].astype(str).str.strip().str.lower()
+                yes_mask = fridge_v.isin({'是', 'y', 'yes', 'true', '1', '1.0'})
+
+                total_by_month = pt_df.groupby('lock_month')['order_number'].nunique().rename('Total Orders')
+                yes_by_month = pt_df[yes_mask].groupby('lock_month')['order_number'].nunique().rename('OP-FRIDGE=是 Orders')
+
+                summary_df = pd.concat([total_by_month, yes_by_month], axis=1).fillna(0).reset_index()
+                summary_df = summary_df.rename(columns={'lock_month': 'Month'})
+                summary_df['OP-FRIDGE=是 Orders'] = summary_df['OP-FRIDGE=是 Orders'].astype(int)
+                summary_df['Take Rate'] = (summary_df['OP-FRIDGE=是 Orders'] / summary_df['Total Orders'] * 100).round(1).map(lambda x: f"{x:.1f}%")
+                summary_df = summary_df.sort_values('Month', ascending=True)
+
+                print(f"\n--- Product_Types={product_type} ---")
+                print(summary_df.to_string(index=False))
+
+                report_lines.append(f"### {product_type}")
+                report_lines.append(summary_df.to_markdown(index=False))
+                report_lines.append("")
+
+    else:
+        print("⚠️ 数据中缺少 'OP-FRIDGE' 或 'Product_Types' 列，无法分析冰箱配置。")
+        report_lines.append("## 冰箱 (OP-FRIDGE) 月度占比（分 Product_Types，自上市以来）")
+        report_lines.append("⚠️ 数据中缺少 'OP-FRIDGE' 或 'Product_Types' 列，无法分析冰箱配置。")
+        report_lines.append("")
 
     # ---------------------------------------------------------
     # 保存报告

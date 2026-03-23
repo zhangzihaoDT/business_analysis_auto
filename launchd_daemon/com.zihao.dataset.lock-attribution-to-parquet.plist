@@ -11,8 +11,7 @@
     <key>ProgramArguments</key>
     <array>
       <string>/bin/bash</string>
-      <string>-lc</string>
-      <string>LOCKFILE="/tmp/lock_attribution_to_parquet.lock"; if [ -e "${LOCKFILE}" ] &amp;&amp; kill -0 "$(cat "${LOCKFILE}")" 2&gt;/dev/null; then pid="$(cat "${LOCKFILE}")"; echo "already running (PID: ${pid})"; exit 0; fi; trap "rm -f ${LOCKFILE}" INT TERM EXIT; echo $$ &gt; ${LOCKFILE}; source /Users/zihao_/Documents/coding/dataset/venv/bin/activate; cd /Users/zihao_/Documents/coding/dataset; if command -v caffeinate &gt;/dev/null 2&gt;&amp;1; then caffeinate -dimsu -w $$ &amp; fi; export PYTHONUNBUFFERED=1; python -u scripts/lock_attribution_data_to_parquet.py</string>
+      <string>/Users/zihao_/Documents/coding/dataset/scripts/run_lock_attribution_to_parquet.sh</string>
     </array>
 
     <key>StartCalendarInterval</key>
@@ -23,12 +22,15 @@
       <integer>15</integer>
     </dict>
 
+    <key>StartInterval</key>
+    <integer>300</integer>
+
     <key>StandardOutPath</key>
     <string>/Users/zihao_/Documents/coding/dataset/logs/launchd_lock_attribution.stdout.log</string>
     <key>StandardErrorPath</key>
     <string>/Users/zihao_/Documents/coding/dataset/logs/launchd_lock_attribution.stderr.log</string>
 
     <key>RunAtLoad</key>
-    <false/>
+    <true/>
   </dict>
 </plist>
