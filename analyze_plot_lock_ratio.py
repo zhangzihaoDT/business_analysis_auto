@@ -246,110 +246,36 @@ def compute_yoy_metrics(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 def compute_ls6_reev_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """计算 LS6 增程占比数据 (2025 vs 2026) - 日销量占比 MA7。
-    注意：仅统计 lock_time >= 2025-09-10 的数据。
-    """
     if "lock_time" not in df.columns or "series" not in df.columns:
         raise KeyError("缺少 lock_time 或 series 列")
-        
-    # 1. 预处理：筛选 LS6 并派生 product_type
     df_ls6 = df[df["series"] == "LS6"].copy()
     df_ls6["lock_time"] = pd.to_datetime(df_ls6["lock_time"], errors="coerce")
     df_ls6 = df_ls6[df_ls6["lock_time"].notna()]
-    
-    # 筛选 2025-09-10 之后的数据
-    start_date_filter = pd.Timestamp("2025-09-10")
-    df_ls6 = df_ls6[df_ls6["lock_time"] >= start_date_filter]
-    
+    start_date = pd.Timestamp("2025-09-10")
+    df_ls6 = df_ls6[df_ls6["lock_time"] >= start_date]
     if df_ls6.empty:
-        print("⚠️ 警告: 未找到 LS6 数据 (>= 2025-09-10)")
         return pd.DataFrame()
-        
     df_ls6["product_type"] = df_ls6["product_name"].apply(get_product_type_from_name)
     df_ls6["is_reev"] = (df_ls6["product_type"] == "增程").astype(int)
-    
-    # 2. 计算 2025 和 2026 的每日数据
-    results = {}
-    years = [2025, 2026]
-    today = date.today()
-    
-    for year in years:
-        df_year = df_ls6[df_ls6["lock_time"].dt.year == year]
-        
-        # 构造全年日期索引以正确计算 MA7
-        start_date = date(year, 1, 1)
-        if year < today.year:
-            end_date = date(year, 12, 31)
-        elif year == today.year:
-            end_date = today
-        else:
-            end_date = date(year, 12, 31)
-
-        # 每日聚合
-        daily_total = df_year.groupby(df_year["lock_time"].dt.date).size()
-        daily_reev = df_year.groupby(df_year["lock_time"].dt.date)["is_reev"].sum()
-        
-        # Reindex to continuous range
-        full_idx = pd.date_range(start_date, end_date, freq='D').date
-        s_total = daily_total.reindex(full_idx, fill_value=0)
-        s_reev = daily_reev.reindex(full_idx, fill_value=0)
-        
-        # 计算日占比
-        with np.errstate(divide='ignore', invalid='ignore'):
-            s_ratio = (s_reev / s_total) * 100.0
-        s_ratio = s_ratio.replace([np.inf, -np.inf], np.nan)
-        
-        # 计算 MA7
-        s_ma7 = s_ratio.rolling(window=7, min_periods=1).mean()
-        
-        # 对齐到 2025 轴
-        aligned_total = align_to_2025_axis(s_total, year)
-        aligned_reev = align_to_2025_axis(s_reev, year)
-        aligned_ma7 = align_to_2025_axis(s_ma7, year)
-        
-        # 处理未来数据
-        if year == today.year:
-            cutoff_date_2025 = date(2025, today.month, today.day)
-            mask_future = aligned_ma7.index > cutoff_date_2025
-            aligned_ma7.loc[mask_future, "count"] = np.nan
-            aligned_total.loc[mask_future, "count"] = np.nan
-            aligned_reev.loc[mask_future, "count"] = np.nan
-
-        # 处理缺失数据 (无销量日)
-        mask_missing = aligned_ma7["real_date"].isna()
-        aligned_ma7.loc[mask_missing, "count"] = np.nan
-        
-        # 计算该年整体均值 (Weighted Average)
-        total_count = len(df_year)
-        reev_count = df_year["is_reev"].sum()
-        avg_ratio = (reev_count / total_count * 100.0) if total_count > 0 else 0.0
-
-        results[year] = {
-            "real_date": aligned_total["real_date"],
-            "daily_total": aligned_total["count"],
-            "daily_reev": aligned_reev["count"],
-            "ma7_ratio": aligned_ma7["count"],
-            "avg_ratio": avg_ratio
-        }
-        
-    # 3. 整合结果
-    result = pd.DataFrame({
-        "axis_date": results[2025]["real_date"].index,
-        
-        "date_2025": results[2025]["real_date"],
-        "total_2025": results[2025]["daily_total"],
-        "reev_2025": results[2025]["daily_reev"],
-        "ratio_ma7_2025": results[2025]["ma7_ratio"],
-        "avg_2025": results[2025]["avg_ratio"],
-        
-        "date_2026": results[2026]["real_date"],
-        "total_2026": results[2026]["daily_total"],
-        "reev_2026": results[2026]["daily_reev"],
-        "ratio_ma7_2026": results[2026]["ma7_ratio"],
-        "avg_2026": results[2026]["avg_ratio"]
+    end_date = pd.Timestamp(date.today())
+    idx = pd.date_range(start_date.date(), end_date.date(), freq="D").date
+    daily_total = df_ls6.groupby(df_ls6["lock_time"].dt.date).size().reindex(idx, fill_value=0)
+    daily_reev = df_ls6.groupby(df_ls6["lock_time"].dt.date)["is_reev"].sum().reindex(idx, fill_value=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = (daily_reev / daily_total) * 100.0
+    ratio = ratio.replace([np.inf, -np.inf], np.nan)
+    ratio_ma7 = ratio.rolling(window=7, min_periods=1).mean()
+    total_count = int(daily_total.sum())
+    reev_count = int(daily_reev.sum())
+    avg_ratio = (reev_count / total_count * 100.0) if total_count > 0 else 0.0
+    return pd.DataFrame({
+        "axis_date": idx,
+        "daily_total": daily_total.values,
+        "daily_reev": daily_reev.values,
+        "ratio_raw": ratio.values,
+        "ratio_ma7": ratio_ma7.values,
+        "avg_ratio": [avg_ratio] * len(idx)
     })
-    
-    return result
 
 def compute_reev_product_breakdown(df: pd.DataFrame) -> dict:
     """计算所有增程车型各配置内部占比 (2025 vs 2026) - 日销量占比 MA7。
@@ -610,116 +536,75 @@ def build_figure(df: pd.DataFrame) -> go.Figure:
     return fig
 
 def build_ls6_reev_figure(df: pd.DataFrame) -> go.Figure:
-    """绘制 LS6 增程占比图表 (日销量 MA7)。"""
     fig = go.Figure()
-    
     if df.empty:
         return fig
-
-    # --- Helper: Create end label ---
     def create_end_label(series, color):
-        text_list = [""] * len(series)
-        last_valid_idx = series.last_valid_index()
-        if last_valid_idx is not None:
-            val = series[last_valid_idx]
-            loc = series.index.get_loc(last_valid_idx)
-            text_list[loc] = f"<b>{val:.1f}%</b>"
-        return text_list
-
-    # --- Trace 1: 2025 占比 (MA7) ---
-    custom_data_2025 = np.stack((
-        df["date_2025"].astype(str),
-        df["total_2025"].fillna(0),
-        df["reev_2025"].fillna(0),
-        df["ratio_ma7_2025"].fillna(0)
+        text = [""] * len(series)
+        last_idx = pd.Series(series).last_valid_index()
+        if last_idx is not None:
+            val = series[last_idx]
+            pos = list(range(len(series)))[-1]
+            text[pos] = f"<b>{val:.1f}%</b>"
+        return text
+    custom_data = np.stack((
+        pd.Series(df["daily_total"]).fillna(0),
+        pd.Series(df["daily_reev"]).fillna(0),
+        pd.Series(df["ratio_ma7"]).fillna(0)
     ), axis=-1)
-    
-    text_2025 = create_end_label(df["ratio_ma7_2025"], COLOR_MAIN)
-    
+    text_end = create_end_label(pd.Series(df["ratio_ma7"]), COLOR_CONTRAST)
     fig.add_trace(go.Scatter(
         x=df["axis_date"],
-        y=df["ratio_ma7_2025"],
-        name="2025 日增程占比 (MA7)",
-        mode="lines+text",
-        text=text_2025,
-        textposition="middle right",
-        textfont=dict(color=COLOR_MAIN, size=12),
-        cliponaxis=False,
-        line=dict(color=COLOR_MAIN, width=2),
-        customdata=custom_data_2025,
+        y=df["ratio_raw"],
+        name="每日占比 (Raw)",
+        mode="markers",
+        marker=dict(color=COLOR_DARK, size=5, opacity=0.5),
+        customdata=np.stack((
+            pd.Series(df["daily_total"]).fillna(0),
+            pd.Series(df["daily_reev"]).fillna(0),
+            pd.Series(df["ratio_raw"]).fillna(0)
+        ), axis=-1),
         hovertemplate=(
-            "<b>%{customdata[0]}</b><br>" +
-            "MA7 占比: %{y:.1f}%<br>" +
-            "当日总量: %{customdata[1]:.0f}<br>" +
-            "当日增程: %{customdata[2]:.0f}" +
-            "<extra>2025</extra>"
+            "Raw 占比: %{customdata[2]:.1f}%<br>" +
+            "当日总量: %{customdata[0]:.0f}<br>" +
+            "当日增程: %{customdata[1]:.0f}" +
+            "<extra></extra>"
         )
     ))
-    
-    # --- Trace 2: 2026 占比 (MA7) ---
-    custom_data_2026 = np.stack((
-        df["date_2026"].apply(lambda x: str(x) if pd.notnull(x) else ""),
-        df["total_2026"].fillna(0),
-        df["reev_2026"].fillna(0),
-        df["ratio_ma7_2026"].fillna(0)
-    ), axis=-1)
-    
-    text_2026 = create_end_label(df["ratio_ma7_2026"], COLOR_CONTRAST)
-    
     fig.add_trace(go.Scatter(
         x=df["axis_date"],
-        y=df["ratio_ma7_2026"],
-        name="2026 日增程占比 (MA7)",
+        y=df["ratio_ma7"],
+        name="LS6 日增程占比 (MA7)",
         mode="lines+text",
-        text=text_2026,
+        text=text_end,
         textposition="middle right",
-        textfont=dict(color=COLOR_CONTRAST, size=13),
+        textfont=dict(color=COLOR_CONTRAST, size=12),
         cliponaxis=False,
         line=dict(color=COLOR_CONTRAST, width=3),
-        customdata=custom_data_2026,
+        customdata=custom_data,
         hovertemplate=(
-            "<b>%{customdata[0]}</b><br>" +
             "MA7 占比: %{y:.1f}%<br>" +
-            "当日总量: %{customdata[1]:.0f}<br>" +
-            "当日增程: %{customdata[2]:.0f}" +
-            "<extra>2026</extra>"
+            "当日总量: %{customdata[0]:.0f}<br>" +
+            "当日增程: %{customdata[1]:.0f}" +
+            "<extra></extra>"
         )
     ))
-    
-    # --- Trace 3 & 4: Average Lines ---
-    # Get averages
-    avg_2025 = df["avg_2025"].iloc[0] if "avg_2025" in df.columns else 0
-    avg_2026 = df["avg_2026"].iloc[0] if "avg_2026" in df.columns else 0
-    
-    # 2025 Average
+    avg_ratio = float(df["avg_ratio"].iloc[0]) if "avg_ratio" in df.columns else 0.0
     fig.add_trace(go.Scatter(
         x=[df["axis_date"].min(), df["axis_date"].max()],
-        y=[avg_2025, avg_2025],
-        name=f"2025 均值 ({avg_2025:.1f}%)",
+        y=[avg_ratio, avg_ratio],
+        name=f"整体均值 ({avg_ratio:.1f}%)",
         mode="lines",
         line=dict(color=COLOR_MAIN, width=1.5, dash="dash"),
-        opacity=0.5,
+        opacity=0.6,
         hoverinfo="skip"
     ))
-    
-    # 2026 Average
-    fig.add_trace(go.Scatter(
-        x=[df["axis_date"].min(), df["axis_date"].max()],
-        y=[avg_2026, avg_2026],
-        name=f"2026 均值 ({avg_2026:.1f}%)",
-        mode="lines",
-        line=dict(color=COLOR_CONTRAST, width=1.5, dash="dash"),
-        opacity=0.8,
-        hoverinfo="skip"
-    ))
-    
-    # --- Layout ---
     fig.update_layout(
-        title="LS6 车型日增程占比趋势 (MA7 Smoothed, 2025 vs 2026)",
+        title="LS6 车型日增程占比趋势 (MA7, 2025-09-10 至今)",
         plot_bgcolor=COLOR_BG,
         paper_bgcolor=COLOR_BG,
         xaxis=dict(
-            title="日期 (对齐到 2025 年)",
+            title="日期",
             gridcolor=COLOR_GRID,
             zerolinecolor=COLOR_GRID,
             tickfont=dict(color=COLOR_TEXT),
@@ -727,7 +612,7 @@ def build_ls6_reev_figure(df: pd.DataFrame) -> go.Figure:
             showline=True,
             linecolor=COLOR_GRID,
             dtick="M1",
-            tickformat="%m-%d"
+            tickformat="%Y-%m-%d"
         ),
         yaxis=dict(
             title="日增程占比 (MA7, %)",
@@ -743,17 +628,16 @@ def build_ls6_reev_figure(df: pd.DataFrame) -> go.Figure:
             bordercolor=COLOR_TEXT,
             borderwidth=1,
             font=dict(color=COLOR_TEXT),
-            orientation="v",       # 垂直排列
+            orientation="v",
             yanchor="top",
             y=1,
             xanchor="left",
-            x=1.02                 # 放置在图表右侧
+            x=1.02
         ),
         hovermode="x unified",
         margin=dict(l=60, r=80, t=80, b=60),
         height=600
     )
-    
     return fig
 
 def build_reev_product_breakdown_figure(metrics_dict: dict) -> go.Figure:

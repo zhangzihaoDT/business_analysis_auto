@@ -13,6 +13,8 @@ import logging
 import sys
 import warnings
 from datetime import datetime
+import shutil
+from pathlib import Path
 
 # 忽略 pkg_resources 的废弃警告
 warnings.filterwarnings("ignore", category=UserWarning, module='pkg_resources')
@@ -28,6 +30,24 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+def resolve_tabcmd() -> str:
+    p = shutil.which("tabcmd")
+    if p:
+        return p
+
+    base = Path(__file__).resolve().parent.parent
+    candidates = [
+        base / "venv" / "bin" / "tabcmd",
+        base / ".venv" / "bin" / "tabcmd",
+        Path("/usr/local/bin/tabcmd"),
+        Path("/opt/homebrew/bin/tabcmd"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return "tabcmd"
+
 
 def run_command(command, timeout=300, show_progress=True):
     """
@@ -146,14 +166,16 @@ def login_tableau(server, username=None, password=None, token_name=None, token_v
     # 移除URL中的#/home部分，因为tabcmd不需要这部分
     server = server.split('#')[0] if '#' in server else server
     
+    tabcmd = resolve_tabcmd()
+
     # 使用个人访问令牌登录
     if token_name and token_value:
         logger.info("使用个人访问令牌(PAT)登录")
-        command = ["tabcmd", "login", "-s", server, "--token-name", token_name, "--token-value", token_value]
+        command = [tabcmd, "login", "-s", server, "--token-name", token_name, "--token-value", token_value]
     # 使用用户名密码登录
     else:
         logger.info(f"使用用户名密码登录: {username}")
-        command = ["tabcmd", "login", "-s", server, "-u", username, "-p", password]
+        command = [tabcmd, "login", "-s", server, "-u", username, "-p", password]
     
     returncode, stdout, stderr = run_command(command)
     
@@ -179,6 +201,7 @@ def export_view(view_path, output_file, format="csv", timeout=600, show_progress
         bool: 是否导出成功
     """
     logger.info(f"正在导出视图: {view_path} 到 {output_file}")
+    tabcmd = resolve_tabcmd()
     
     if show_progress:
         print(f"开始导出 Tableau 视图: {view_path}")
@@ -249,7 +272,7 @@ def export_view(view_path, output_file, format="csv", timeout=600, show_progress
     if show_progress:
         print(f"正在尝试导出视图: {tableau_path}")
     
-    command = ["tabcmd", "export", tableau_path, f"--{format}", "-f", output_file]
+    command = [tabcmd, "export", tableau_path, f"--{format}", "-f", output_file]
     
     for attempt in range(max_retries + 1):
         if attempt > 0:
@@ -275,7 +298,7 @@ def export_view(view_path, output_file, format="csv", timeout=600, show_progress
                 print(f"\n尝试替代路径 {i}: {path}")
             logger.info(f"尝试替代路径 {i}: {path}")
             
-            command = ["tabcmd", "export", path, f"--{format}", "-f", output_file]
+            command = [tabcmd, "export", path, f"--{format}", "-f", output_file]
             
             # 替代路径也支持一次重试
             for attempt in range(2): 
@@ -317,7 +340,8 @@ def logout_tableau():
     """
     logger.info("正在登出Tableau服务器")
     
-    command = ["tabcmd", "logout"]
+    tabcmd = resolve_tabcmd()
+    command = [tabcmd, "logout"]
     returncode, stdout, stderr = run_command(command)
     
     if returncode == 0:
