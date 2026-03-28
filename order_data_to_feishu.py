@@ -90,6 +90,12 @@ def compute_presale_metrics(df: pd.DataFrame, business_def: dict, today: pd.Time
         raise KeyError("数据缺少列: series_group_logic")
     if "intention_refund_time" not in df.columns:
         raise KeyError("数据缺少列: intention_refund_time")
+    if "product_name" not in df.columns:
+        raise KeyError("数据缺少列: product_name")
+    if "parent_region_name" not in df.columns:
+        raise KeyError("数据缺少列: parent_region_name")
+    if "buyer_identity_no" not in df.columns:
+        raise KeyError("数据缺少列: buyer_identity_no")
 
     if not pd.api.types.is_datetime64_any_dtype(df["intention_payment_time"]):
         df["intention_payment_time"] = pd.to_datetime(df["intention_payment_time"], errors="coerce")
@@ -101,23 +107,29 @@ def compute_presale_metrics(df: pd.DataFrame, business_def: dict, today: pd.Time
     ls8_start = pd.Timestamp(ls8_tp.get("start")) if ls8_tp.get("start") else None
     ls8_end = pd.Timestamp(ls8_tp.get("end")) if ls8_tp.get("end") else None
 
-    n_raw = None
-    if ls8_end is not None:
-        n_raw = int((today.normalize() - ls8_end.normalize()).days + 1)
-    n = max(1, int(n_raw) if n_raw is not None else 1)
+    # 计算N：LS8预售已进行的天数（当前日期 - LS8 startday + 1）
+    n = 1
+    if ls8_start is not None:
+        n_raw = int((today.normalize() - ls8_start.normalize()).days + 1)
+        n = max(1, n_raw)
 
     base = df.loc[
         df["intention_payment_time"].notna(), 
-        ["order_number", "intention_payment_time", "intention_refund_time", "series_group_logic"]
+        ["order_number", "intention_payment_time", "intention_refund_time", "series_group_logic", "product_name", "parent_region_name", "buyer_identity_no"]
     ].copy()
 
     ls8_cum = 0
     ls8_retention = 0
+    ls8_retention_users = 0
+    ls8_retention_by_product: List[dict] = []
+    ls8_retention_by_region: List[dict] = []
     ls8_peak_hour = None
     ls8_peak_count = 0
     ls8_next_hour_count = 0
     ls8_start_day_total = 0
     ls8_n_day_cum = 0
+    cm2_n_day_retention = 0
+    ls9_n_day_retention = 0
 
     if ls8_start is not None:
         # 当前累计小订数（预售至今累计）
@@ -135,9 +147,39 @@ def compute_presale_metrics(df: pd.DataFrame, business_def: dict, today: pd.Time
             & (base["intention_payment_time"] >= ls8_start)
             & (base["intention_payment_time"] < (today + pd.Timedelta(days=1)))
             & (base["intention_refund_time"].isna()),
-            "order_number",
+            ["order_number", "product_name", "parent_region_name", "buyer_identity_no"],
         ]
-        ls8_retention = int(ls8_retention_slice.nunique())
+        ls8_retention = int(ls8_retention_slice["order_number"].nunique())
+        
+        # 累计留存用户数（有且只有一个小订订单的buyer_identity_no）
+        if not ls8_retention_slice.empty:
+            order_counts_per_user = ls8_retention_slice.groupby("buyer_identity_no")["order_number"].nunique()
+            ls8_retention_users = int((order_counts_per_user == 1).sum())
+        else:
+            ls8_retention_users = 0
+        
+        # 按product_name分组的留存统计
+        if ls8_retention > 0 and not ls8_retention_slice.empty:
+            product_counts = ls8_retention_slice.groupby("product_name")["order_number"].nunique()
+            for product_name, count in product_counts.items():
+                share = count / ls8_retention * 100 if ls8_retention > 0 else 0
+                ls8_retention_by_product.append({
+                    "product_name": product_name,
+                    "count": int(count),
+                    "share": round(share, 1),
+                })
+            ls8_retention_by_product = sorted(ls8_retention_by_product, key=lambda x: x["count"], reverse=True)
+            
+            # 按parent_region_name分组的留存统计
+            region_counts = ls8_retention_slice.groupby("parent_region_name")["order_number"].nunique()
+            for region_name, count in region_counts.items():
+                share = count / ls8_retention * 100 if ls8_retention > 0 else 0
+                ls8_retention_by_region.append({
+                    "region_name": region_name,
+                    "count": int(count),
+                    "share": round(share, 1),
+                })
+            ls8_retention_by_region = sorted(ls8_retention_by_region, key=lambda x: x["count"], reverse=True)
 
         # 预售当日指标
         start_excl = ls8_start + pd.Timedelta(days=1)
@@ -171,6 +213,38 @@ def compute_presale_metrics(df: pd.DataFrame, business_def: dict, today: pd.Time
         ]
         ls8_n_day_cum = int(window_slice.nunique())
 
+        # 计算CM2和LS9的历史预售至N日累计
+        # N的定义：当前日期 - LS8 startday + 1
+        if ls8_start is not None:
+            # 获取CM2和LS9的startday
+            cm2_start = pd.to_datetime(business_def["time_periods"]["CM2"]["start"])
+            ls9_start = pd.to_datetime(business_def["time_periods"]["LS9"]["start"])
+            
+            # 计算N：LS8预售已进行的天数
+            n_days = (today - ls8_start).days + 1
+            
+            # 计算CM2的历史预售至N日累计
+            cm2_window_end = cm2_start + pd.Timedelta(days=n_days)
+            cm2_slice = base.loc[
+                base["series_group_logic"].eq("CM2")
+                & (base["intention_payment_time"] >= cm2_start)
+                & (base["intention_payment_time"] < cm2_window_end)
+                & ((base["intention_refund_time"] > cm2_window_end) | base["intention_refund_time"].isna()),
+                "order_number",
+            ]
+            cm2_n_day_retention = int(cm2_slice.nunique())
+            
+            # 计算LS9的历史预售至N日累计
+            ls9_window_end = ls9_start + pd.Timedelta(days=n_days)
+            ls9_slice = base.loc[
+                base["series_group_logic"].eq("LS9")
+                & (base["intention_payment_time"] >= ls9_start)
+                & (base["intention_payment_time"] < ls9_window_end)
+                & ((base["intention_refund_time"] > ls9_window_end) | base["intention_refund_time"].isna()),
+                "order_number",
+            ]
+            ls9_n_day_retention = int(ls9_slice.nunique())
+
     return {
         "today": today.date().isoformat(),
         "ls8_start": ls8_start.date().isoformat() if ls8_start is not None else None,
@@ -179,11 +253,16 @@ def compute_presale_metrics(df: pd.DataFrame, business_def: dict, today: pd.Time
         "n_raw": n_raw,
         "ls8_cum": ls8_cum,
         "ls8_retention": ls8_retention,
+        "ls8_retention_users": ls8_retention_users,
+        "ls8_retention_by_product": ls8_retention_by_product,
+        "ls8_retention_by_region": ls8_retention_by_region,
         "ls8_peak_hour": ls8_peak_hour,
         "ls8_peak_count": ls8_peak_count,
         "ls8_next_hour_count": ls8_next_hour_count,
         "ls8_start_day_total": ls8_start_day_total,
         "ls8_n_day_cum": ls8_n_day_cum,
+        "cm2_n_day_retention": cm2_n_day_retention,
+        "ls9_n_day_retention": ls9_n_day_retention,
     }
 
 
@@ -199,14 +278,29 @@ def build_feishu_card(metrics: dict) -> dict:
     lines.append(f"- 峰值小时小订数：{metrics['ls8_peak_count']}（{peak_hour_str}）")
     lines.append(f"- 峰值后1h：{metrics['ls8_next_hour_count']}")
     lines.append(f"- 预售当日累计：{metrics['ls8_start_day_total']}")
-    lines.append(f"- 预售至今累计：{metrics['ls8_n_day_cum']}")
     lines.append(f"- 预售至今累计留存：{metrics['ls8_retention']}")
+    lines.append(f"- 累计留存唯一订单用户数：{metrics['ls8_retention_users']}")
+    lines.append(f"- 历史预售至N日累计：CM2（{metrics['cm2_n_day_retention']}）｜LS9（{metrics['ls9_n_day_retention']}）")
+    
+    # 按product_name分组的留存统计
+    if metrics.get("ls8_retention_by_product"):
+        lines.append("")
+        lines.append("**累计留存分 product_name：**")
+        for item in metrics["ls8_retention_by_product"]:
+            lines.append(f"  - {item['product_name']}：{item['count']}（{item['share']}%）")
+    
+    # 按parent_region_name分组的留存统计
+    if metrics.get("ls8_retention_by_region"):
+        lines.append("")
+        lines.append("**累计留存分 parent_region_name：**")
+        for item in metrics["ls8_retention_by_region"]:
+            lines.append(f"  - {item['region_name']}：{item['count']}（{item['share']}%）")
     
     # 添加预售期信息
     if metrics.get("ls8_start") and metrics.get("ls8_end"):
         lines.append("")
         lines.append(f"**预售期：** {metrics['ls8_start']} ~ {metrics['ls8_end']}")
-        lines.append(f"**N（日）：** {metrics['n']}（定义：当前日期 - LS8 endday + 1）")
+        lines.append(f"**N（日）：** {metrics['n']}（定义：当前日期 - LS8 startday + 1）")
 
     body_md = "\n".join(lines)
     return {
