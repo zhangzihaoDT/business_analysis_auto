@@ -115,7 +115,7 @@ def compute_presale_metrics(df: pd.DataFrame, business_def: dict, today: pd.Time
 
     base = df.loc[
         df["intention_payment_time"].notna(), 
-        ["order_number", "intention_payment_time", "intention_refund_time", "series_group_logic", "product_name", "parent_region_name", "buyer_identity_no"]
+        ["order_number", "intention_payment_time", "intention_refund_time", "series_group_logic", "product_name", "parent_region_name", "buyer_identity_no", "store_name"]
     ].copy()
 
     ls8_cum = 0
@@ -147,7 +147,7 @@ def compute_presale_metrics(df: pd.DataFrame, business_def: dict, today: pd.Time
             & (base["intention_payment_time"] >= ls8_start)
             & (base["intention_payment_time"] < (today + pd.Timedelta(days=1)))
             & (base["intention_refund_time"].isna()),
-            ["order_number", "product_name", "parent_region_name", "buyer_identity_no"],
+            ["order_number", "product_name", "parent_region_name", "buyer_identity_no", "store_name"],
         ]
         ls8_retention = int(ls8_retention_slice["order_number"].nunique())
         
@@ -174,10 +174,27 @@ def compute_presale_metrics(df: pd.DataFrame, business_def: dict, today: pd.Time
             region_counts = ls8_retention_slice.groupby("parent_region_name")["order_number"].nunique()
             for region_name, count in region_counts.items():
                 share = count / ls8_retention * 100 if ls8_retention > 0 else 0
+                
+                # 计算该大区的门店集中度CR5
+                cr5 = None
+                if "store_name" in ls8_retention_slice.columns:
+                    region_slice = ls8_retention_slice[ls8_retention_slice["parent_region_name"] == region_name]
+                    if not region_slice.empty:
+                        store_counts = (
+                            region_slice.dropna(subset=["store_name"])
+                            .groupby("store_name")["order_number"]
+                            .nunique()
+                        )
+                        total = float(store_counts.sum())
+                        if total > 0:
+                            top5 = float(store_counts.nlargest(5).sum())
+                            cr5 = round(top5 / total * 100, 1)
+                
                 ls8_retention_by_region.append({
                     "region_name": region_name,
                     "count": int(count),
                     "share": round(share, 1),
+                    "cr5": cr5,
                 })
             ls8_retention_by_region = sorted(ls8_retention_by_region, key=lambda x: x["count"], reverse=True)
 
@@ -294,7 +311,8 @@ def build_feishu_card(metrics: dict) -> dict:
         lines.append("")
         lines.append("**累计留存分 parent_region_name：**")
         for item in metrics["ls8_retention_by_region"]:
-            lines.append(f"  - {item['region_name']}：{item['count']}（{item['share']}%）")
+            cr5_str = f"｜CR5（{item['cr5']}%）" if item.get("cr5") is not None else ""
+            lines.append(f"  - {item['region_name']}：{item['count']}（{item['share']}%）{cr5_str}")
     
     # 添加预售期信息
     if metrics.get("ls8_start") and metrics.get("ls8_end"):
