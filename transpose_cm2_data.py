@@ -75,7 +75,9 @@ def load_data(file_path):
             # 锁单时间
             'DATE([Order Lock Time])': 'lock_time',
             # 发票上传时间
-            'DATE([invoice_upload_time])': 'invoice_time'
+            'DATE([invoice_upload_time])': 'invoice_time',
+            # 小订支付时间
+            'DATE([Order Intent Pay Time])': 'intention_pay_time'
         }
         
         # 执行重命名
@@ -159,6 +161,15 @@ def clean_and_convert_data(df):
             logging.info(f"invoice_time非空值数量: {df_cleaned['invoice_time'].notna().sum()}")
         except Exception as e:
             logging.warning(f"invoice_time转换失败，保持原格式: {e}")
+    
+    # 处理DATE([Order Intent Pay Time])字段
+    if 'DATE([Order Intent Pay Time])' in df_cleaned.columns:
+        df_cleaned = df_cleaned.rename(columns={'DATE([Order Intent Pay Time])': 'intention_pay_time'})
+        try:
+            df_cleaned['intention_pay_time'] = pd.to_datetime(df_cleaned['intention_pay_time'], format='%Y/%m/%d')
+            logging.info(f"intention_pay_time字段转换成功，格式: {df_cleaned['intention_pay_time'].dtype}")
+        except Exception as e:
+            logging.warning(f"intention_pay_time转换失败，保持原格式: {e}")
     
     # 2. 开票价格字段转换
     if '开票价格' in df_cleaned.columns:
@@ -250,6 +261,9 @@ def transpose_data(df, include_all_meta=False):
         if 'DATE([Order Lock Time])' in df.columns and 'lock_time' not in df.columns:
             df = df.rename(columns={'DATE([Order Lock Time])': 'lock_time'})
             logging.info("已将 'DATE([Order Lock Time])' 重命名为 'lock_time'（兜底处理）")
+        if 'DATE([Order Intent Pay Time])' in df.columns and 'intention_pay_time' not in df.columns:
+            df = df.rename(columns={'DATE([Order Intent Pay Time])': 'intention_pay_time'})
+            logging.info("已将 'DATE([Order Intent Pay Time])' 重命名为 'intention_pay_time'（兜底处理）")
     except Exception as e:
         logging.warning(f"日期字段兜底重命名时发生警告: {e}")
     

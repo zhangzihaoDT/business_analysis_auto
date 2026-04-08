@@ -38,6 +38,7 @@
    1.5 明细表（series_group_logic × order_gender）
    1.6 明细表（series_group_logic × parent_region_name：含在营门店数）
    1.7 可视化（series_group_logic × buyer_age：年龄占比折线图）
+   1.8 IMADS 配置分布（Attribute Name × Value Dispaly Name × parent_region_name）
 
 2. 上市期分析
    2.1 汇总表（上市日期锁单数统计）
@@ -52,9 +53,18 @@ import json
 import re
 import argparse
 import importlib.util
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+_missing = [m for m in ["numpy", "pandas", "plotly"] if importlib.util.find_spec(m) is None]
+if _missing:
+    print("💥 缺少依赖模块，无法运行 analyze_order.py")
+    print(f"缺少模块: {', '.join(_missing)}")
+    print("请先安装依赖后重试，例如：")
+    print(f"{sys.executable} -m pip install numpy pandas plotly")
+    raise SystemExit(1)
 
 import numpy as np
 import pandas as pd
@@ -70,6 +80,7 @@ BUSINESS_DEF_FILE = Path(
 ACTIVE_STORE_OPERATOR_FILE = Path(
     "/Users/zihao_/Documents/github/26W06_Tool_calls/operators/active_store.py"
 )
+OP_STEER_TRANSPOSED_FILE = Path("/Users/zihao_/Documents/coding/dataset/processed/LS8_Configuration_Details_transposed.csv")
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_OUTPUT = SCRIPT_DIR / "reports" / "analyze_order.html"
 ALL_TARGET_GROUPS = ["CM0","DM0","CM1","DM1","CM2","LS9","LS8"]
@@ -81,6 +92,66 @@ def load_business_definition(file_path: Path) -> dict:
     with open(file_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
+def load_imads_data(file_path: Path) -> pd.DataFrame:
+    if not file_path.exists():
+        return pd.DataFrame()
+    bom = b""
+    try:
+        with open(file_path, "rb") as f:
+            bom = f.read(4) or b""
+    except Exception:
+        bom = b""
+
+    encodings = []
+    if bom.startswith(b"\xff\xfe") or bom.startswith(b"\xfe\xff"):
+        encodings.extend(["utf-16"])
+    if bom.startswith(b"\xef\xbb\xbf"):
+        encodings.extend(["utf-8-sig"])
+    encodings.extend(["utf-8", "gb18030"])
+
+    last_err = None
+    for enc in encodings:
+        try:
+            return pd.read_csv(file_path, sep="\t", dtype="string", encoding=enc)
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err is not None:
+        raise last_err
+    return pd.DataFrame()
+
+def load_op_steer_from_transposed(file_path: Path) -> pd.DataFrame:
+    if not file_path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(file_path, dtype="string", encoding="utf-8-sig")
+    except Exception:
+        df = pd.read_csv(file_path, dtype="string")
+    if "order_number" not in df.columns:
+        return pd.DataFrame()
+    if "OP-Steer" not in df.columns:
+        return pd.DataFrame()
+    out = pd.DataFrame({
+        "Order Number": df["order_number"],
+        "Attribute Code": "OP-Steer",
+        "Value Dispaly Name": df["OP-Steer"]
+    })
+    out = out.dropna(subset=["Order Number"])
+    return out
+
+
+def load_transposed_configuration_data(file_path: Path) -> pd.DataFrame:
+    if not file_path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(file_path, dtype="string", encoding="utf-8-sig")
+    except Exception:
+        df = pd.read_csv(file_path, dtype="string")
+    if "order_number" not in df.columns:
+        return pd.DataFrame()
+    df["order_number"] = df["order_number"].astype("string")
+    return df
 
 _ACTIVE_STORE_OPERATOR = None
 
@@ -1035,6 +1106,358 @@ def build_presale_retention_category_detail(
     return out
 
 
+def build_imads_attribute_region_distribution(
+    df_orders: pd.DataFrame, business_def: dict, target_groups: List[str], df_imads: pd.DataFrame
+) -> pd.DataFrame:
+    if df_imads is None or df_imads.empty:
+        return pd.DataFrame()
+    if "Order Number" not in df_imads.columns:
+        raise KeyError("IMADS数据缺少列: Order Number")
+    if "Attribute Name" not in df_imads.columns:
+        raise KeyError("IMADS数据缺少列: Attribute Name")
+    if "Value Dispaly Name" not in df_imads.columns:
+        raise KeyError("IMADS数据缺少列: Value Dispaly Name")
+
+    required_cols = ["order_number", "parent_region_name", "series_group_logic", "intention_payment_time", "intention_refund_time"]
+    missing = [c for c in required_cols if c not in df_orders.columns]
+    if missing:
+        raise KeyError(f"订单数据缺少列: {', '.join(missing)}")
+
+    if not pd.api.types.is_datetime64_any_dtype(df_orders["intention_payment_time"]):
+        df_orders["intention_payment_time"] = pd.to_datetime(df_orders["intention_payment_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df_orders["intention_refund_time"]):
+        df_orders["intention_refund_time"] = pd.to_datetime(df_orders["intention_refund_time"], errors="coerce")
+
+    time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
+    retained_rows: List[pd.DataFrame] = []
+    for g in target_groups:
+        tp = time_periods.get(g, {}) or {}
+        start_str = tp.get("start")
+        end_str = tp.get("end")
+        if not start_str or not end_str:
+            continue
+        start_day = pd.Timestamp(start_str)
+        end_day = pd.Timestamp(end_str)
+        n_days = int((end_day.normalize() - start_day.normalize()).days + 1)
+        n_days = max(1, n_days)
+
+        end_excl = end_day + pd.Timedelta(days=1)
+        window_end_excl = min(start_day + pd.Timedelta(days=int(n_days)), end_excl)
+        m_retention = (
+            df_orders["series_group_logic"].eq(g)
+            & df_orders["intention_payment_time"].notna()
+            & (df_orders["intention_payment_time"] >= start_day)
+            & (df_orders["intention_payment_time"] < window_end_excl)
+            & ((df_orders["intention_refund_time"] > window_end_excl) | df_orders["intention_refund_time"].isna())
+        )
+        retained = df_orders.loc[m_retention, ["order_number", "series_group_logic", "parent_region_name"]].dropna(
+            subset=["order_number"]
+        )
+        if retained.empty:
+            continue
+        retained["parent_region_name"] = retained["parent_region_name"].fillna("NA").astype("string")
+        retained = retained.drop_duplicates(subset=["order_number"])
+        retained_rows.append(retained)
+
+    if not retained_rows:
+        return pd.DataFrame()
+    retained_all = pd.concat(retained_rows, ignore_index=True)
+
+    imads = df_imads.loc[:, ["Order Number", "Attribute Name", "Value Dispaly Name"]].copy()
+    imads = imads.dropna(subset=["Order Number", "Attribute Name", "Value Dispaly Name"])
+    imads = imads.rename(
+        columns={
+            "Order Number": "order_number",
+            "Attribute Name": "attribute_name",
+            "Value Dispaly Name": "value_display_name",
+        }
+    )
+    imads["order_number"] = imads["order_number"].astype("string")
+
+    matched = retained_all.merge(imads, on="order_number", how="inner")
+    if matched.empty:
+        return pd.DataFrame()
+
+    grp = (
+        matched.groupby(
+            ["series_group_logic", "attribute_name", "value_display_name", "parent_region_name"], as_index=False
+        )["order_number"]
+        .nunique()
+        .rename(columns={"order_number": "order_cnt"})
+    )
+    value_totals = grp.groupby(["series_group_logic", "attribute_name", "value_display_name"])["order_cnt"].sum().rename(
+        "value_total"
+    )
+    grp = grp.merge(value_totals, on=["series_group_logic", "attribute_name", "value_display_name"], how="left")
+    grp["share_in_value"] = grp.apply(
+        lambda r: round(r["order_cnt"] / r["value_total"] * 100, 1) if r["value_total"] > 0 else 0.0, axis=1
+    )
+    grp = grp.drop(columns=["value_total"])
+    return grp
+
+
+def build_imads_op_steer_region_summary(
+    df_orders: pd.DataFrame, business_def: dict, target_groups: List[str], df_imads: pd.DataFrame
+) -> pd.DataFrame:
+    if df_imads is None or df_imads.empty:
+        return pd.DataFrame()
+    required_imads_cols = ["Order Number", "Attribute Code", "Value Dispaly Name"]
+    missing_imads = [c for c in required_imads_cols if c not in df_imads.columns]
+    if missing_imads:
+        raise KeyError(f"IMADS数据缺少列: {', '.join(missing_imads)}")
+
+    required_order_cols = [
+        "order_number",
+        "parent_region_name",
+        "product_name",
+        "series_group_logic",
+        "intention_payment_time",
+        "intention_refund_time",
+    ]
+    missing_orders = [c for c in required_order_cols if c not in df_orders.columns]
+    if missing_orders:
+        raise KeyError(f"订单数据缺少列: {', '.join(missing_orders)}")
+
+    if not pd.api.types.is_datetime64_any_dtype(df_orders["intention_payment_time"]):
+        df_orders["intention_payment_time"] = pd.to_datetime(df_orders["intention_payment_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df_orders["intention_refund_time"]):
+        df_orders["intention_refund_time"] = pd.to_datetime(df_orders["intention_refund_time"], errors="coerce")
+
+    imads = df_imads.loc[:, ["Order Number", "Attribute Code", "Value Dispaly Name"]].copy()
+    imads = imads.dropna(subset=["Order Number", "Attribute Code", "Value Dispaly Name"])
+    imads = imads.rename(
+        columns={
+            "Order Number": "order_number",
+            "Attribute Code": "attribute_code",
+            "Value Dispaly Name": "value_display_name",
+        }
+    )
+    imads["order_number"] = imads["order_number"].astype("string")
+    imads["attribute_code"] = imads["attribute_code"].astype("string")
+    imads["value_display_name"] = imads["value_display_name"].astype("string")
+
+    imads = imads[imads["attribute_code"].eq("OP-Steer")].copy()
+    if imads.empty:
+        return pd.DataFrame()
+
+    time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
+    rows: List[Dict[str, object]] = []
+
+    for g in target_groups:
+        tp = time_periods.get(g, {}) or {}
+        start_str = tp.get("start")
+        end_str = tp.get("end")
+        if not start_str or not end_str:
+            continue
+
+        start_day = pd.Timestamp(start_str)
+        end_day = pd.Timestamp(end_str)
+        n_days = int((end_day.normalize() - start_day.normalize()).days + 1)
+        n_days = max(1, n_days)
+
+        end_excl = end_day + pd.Timedelta(days=1)
+        window_end_excl = min(start_day + pd.Timedelta(days=int(n_days)), end_excl)
+        m_retention = (
+            df_orders["series_group_logic"].eq(g)
+            & df_orders["intention_payment_time"].notna()
+            & (df_orders["intention_payment_time"] >= start_day)
+            & (df_orders["intention_payment_time"] < window_end_excl)
+            & ((df_orders["intention_refund_time"] > window_end_excl) | df_orders["intention_refund_time"].isna())
+        )
+
+        retained = df_orders.loc[m_retention, ["order_number", "parent_region_name", "product_name"]].dropna(
+            subset=["order_number"]
+        ).copy()
+        if retained.empty:
+            continue
+
+        retained["order_number"] = retained["order_number"].astype("string")
+        retained["parent_region_name"] = retained["parent_region_name"].fillna("NA").astype("string")
+        retained["product_name"] = retained["product_name"].fillna("").astype("string")
+        retained = retained.drop_duplicates(subset=["order_number"])
+
+        pre_total = retained[retained["product_name"].ne("")].groupby("parent_region_name")["order_number"].nunique()
+        high66 = retained[retained["product_name"].str.contains("66 Ultra", na=False, regex=False)]
+        high66_total = high66.groupby("parent_region_name")["order_number"].nunique()
+
+        matched = retained[["order_number", "parent_region_name", "product_name"]].merge(
+            imads[["order_number", "value_display_name"]],
+            on="order_number",
+            how="left",
+        )
+
+        v = matched["value_display_name"].fillna("").astype("string")
+        yes_mask = v.eq("是").fillna(False)
+        no_mask = v.eq("否").fillna(False)
+
+        yes_cnt = matched[yes_mask].groupby("parent_region_name")["order_number"].nunique()
+        no_cnt = matched[no_mask].groupby("parent_region_name")["order_number"].nunique()
+
+        yes66_mask = matched["product_name"].str.contains("66 Ultra", na=False, regex=False) & yes_mask
+        yes66_cnt = matched[yes66_mask].groupby("parent_region_name")["order_number"].nunique()
+
+        regions = pd.Index(pre_total.index.union(yes_cnt.index).union(no_cnt.index).union(high66_total.index)).astype("string")
+        for region in regions.tolist():
+            base_total = int(pre_total.get(region, 0))
+            base66_total = int(high66_total.get(region, 0))
+            y_yes = int(yes_cnt.get(region, 0))
+            y_no = int(no_cnt.get(region, 0))
+            y_yes66 = int(yes66_cnt.get(region, 0))
+            rate = (y_yes / base_total * 100) if base_total > 0 else 0.0
+            rate66 = (y_yes66 / base66_total * 100) if base66_total > 0 else 0.0
+            rows.append(
+                {
+                    "series_group_logic": g,
+                    "parent_region_name": str(region),
+                    "Value Dispaly Name=是": y_yes,
+                    "Value Dispaly Name=否": y_no,
+                    "小订总数": base_total,
+                    "高配（66ultra）总数": base66_total,
+                    "线控选装率": f"{rate:.1f}%",
+                    "线控在（66ultra）选装率": f"{rate66:.1f}%",
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        group_order = {g: i for i, g in enumerate(target_groups)}
+        out["__group_order"] = out["series_group_logic"].map(group_order).fillna(len(group_order))
+        out = out.sort_values(
+            ["__group_order", "小订总数"],
+            ascending=[True, False],
+        ).drop(columns="__group_order").reset_index(drop=True)
+    return out
+
+
+def build_transposed_configuration_option_summary(
+    df_orders: pd.DataFrame,
+    business_def: dict,
+    target_groups: List[str],
+    df_transposed: pd.DataFrame,
+) -> pd.DataFrame:
+    if df_transposed is None or df_transposed.empty:
+        return pd.DataFrame()
+
+    if "order_number" not in df_transposed.columns:
+        raise KeyError("转置配置数据缺少列: order_number")
+
+    required_order_cols = [
+        "order_number",
+        "series_group_logic",
+        "intention_payment_time",
+        "intention_refund_time",
+    ]
+    missing_orders = [c for c in required_order_cols if c not in df_orders.columns]
+    if missing_orders:
+        raise KeyError(f"订单数据缺少列: {', '.join(missing_orders)}")
+
+    if not pd.api.types.is_datetime64_any_dtype(df_orders["intention_payment_time"]):
+        df_orders["intention_payment_time"] = pd.to_datetime(df_orders["intention_payment_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df_orders["intention_refund_time"]):
+        df_orders["intention_refund_time"] = pd.to_datetime(df_orders["intention_refund_time"], errors="coerce")
+
+    time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
+    configuration_name_map = business_def.get("configuration", {}) or {}
+    if not isinstance(configuration_name_map, dict):
+        configuration_name_map = {}
+    configuration_name_map = {str(k): str(v) for k, v in configuration_name_map.items()}
+    if "DATE([Order Intent Pay Time])" in configuration_name_map and "intention_pay_time" not in configuration_name_map:
+        configuration_name_map["intention_pay_time"] = configuration_name_map["DATE([Order Intent Pay Time])"]
+
+    exclude_cols = {
+        "order_number",
+        "DATE([Order Intent Pay Time])",
+        "intention_pay_time",
+        "lock_time",
+        "Is Staff",
+        "Product Name",
+        "Product_Types",
+    }
+
+    rows: List[Dict[str, object]] = []
+    df_transposed = df_transposed.copy()
+    df_transposed["order_number"] = df_transposed["order_number"].astype("string")
+
+    for g in target_groups:
+        tp = time_periods.get(g, {}) or {}
+        start_str = tp.get("start")
+        end_str = tp.get("end")
+        if not start_str or not end_str:
+            continue
+
+        start_day = pd.Timestamp(start_str)
+        presale_end_day = pd.Timestamp(end_str)
+        n_days = int((presale_end_day.normalize() - start_day.normalize()).days + 1)
+        n_days = max(1, n_days)
+
+        presale_end_excl = presale_end_day + pd.Timedelta(days=1)
+        window_end_excl = start_day + pd.Timedelta(days=int(n_days))
+        window_end_excl = min(window_end_excl, presale_end_excl)
+
+        m_retention = (
+            df_orders["series_group_logic"].eq(g)
+            & df_orders["intention_payment_time"].notna()
+            & (df_orders["intention_payment_time"] >= start_day)
+            & (df_orders["intention_payment_time"] < window_end_excl)
+            & ((df_orders["intention_refund_time"] > window_end_excl) | df_orders["intention_refund_time"].isna())
+        )
+        retained_orders = (
+            df_orders.loc[m_retention, ["order_number"]]
+            .dropna(subset=["order_number"])
+            .drop_duplicates(subset=["order_number"])
+            .copy()
+        )
+        retained_orders["order_number"] = retained_orders["order_number"].astype("string")
+        retention_total = int(retained_orders["order_number"].nunique())
+        if retention_total <= 0:
+            continue
+
+        matched = df_transposed.merge(retained_orders, on="order_number", how="inner")
+        if matched.empty:
+            continue
+
+        attr_cols = [c for c in matched.columns if c not in exclude_cols]
+        if not attr_cols:
+            continue
+
+        long_df = matched.melt(
+            id_vars=["order_number"],
+            value_vars=attr_cols,
+            var_name="Attribute",
+            value_name="Value Dispaly Name",
+        )
+        v = long_df["Value Dispaly Name"].astype("string").fillna("").str.strip()
+        long_df["Value Dispaly Name"] = v
+        long_df = long_df[long_df["Value Dispaly Name"].ne("")]
+        if long_df.empty:
+            continue
+
+        agg = (
+            long_df.groupby(["Attribute", "Value Dispaly Name"], as_index=False)
+            .agg(订单数=("order_number", "nunique"))
+            .sort_values(["Attribute", "订单数"], ascending=[True, False])
+            .reset_index(drop=True)
+        )
+        agg["选配比例"] = agg["订单数"].apply(
+            lambda x: f"{(float(x) / retention_total * 100) if retention_total > 0 else 0.0:.1f}%"
+        )
+        agg.insert(0, "series_group_logic", g)
+        agg.insert(2, "中文名称", agg["Attribute"].map(lambda x: configuration_name_map.get(str(x), "")).astype("string"))
+
+        rows.append(agg)
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.concat(rows, ignore_index=True)
+    group_order = {g: i for i, g in enumerate(target_groups)}
+    out["__group_order"] = out["series_group_logic"].map(group_order).fillna(len(group_order))
+    out = out.sort_values(["__group_order", "Attribute", "订单数"], ascending=[True, True, False]).drop(
+        columns="__group_order"
+    )
+    return out.reset_index(drop=True)
+
+
 def _render_age_share_line_figure(
     age_df: pd.DataFrame,
     target_groups: List[str],
@@ -1336,6 +1759,8 @@ def render_report(
     presale_retention_order_gender_df: pd.DataFrame,
     presale_retention_parent_region_df: pd.DataFrame,
     presale_retention_buyer_age_df: pd.DataFrame,
+    imads_dist_df: pd.DataFrame,
+    config_option_df: pd.DataFrame,
     listing_hourly_df: pd.DataFrame,
     listing_summary_df: pd.DataFrame,
     target_groups: List[str],
@@ -1561,6 +1986,62 @@ def render_report(
             )
             html_content.append(pio.to_html(fig_buyer_age, full_html=False, include_plotlyjs="cdn"))
 
+        html_content.append("<h4>1.8 IMADS（线控转向 OP-Steer）分区域选装率</h4>")
+        html_content.append("<div class='summary-box'>")
+        html_content.append("<p>口径：加载 processed/LS8_Configuration_Details_transposed.csv，以 order_number 与目标订单数据集的 order_number 匹配；读取列 OP-Steer 的“是/否”，按 parent_region_name 汇总并计算选装率（是/预选配总数；是/高配66总数）。</p>")
+        html_content.append("</div>")
+        if imads_dist_df is None or imads_dist_df.empty:
+            html_content.append("<p>⚠️ 无数据（可能缺少 OP-Steer 列或匹配不到订单）。</p>")
+        else:
+            cols = [
+                "parent_region_name",
+                "Value Dispaly Name=是",
+                "Value Dispaly Name=否",
+                "小订总数",
+                "高配（66ultra）总数",
+                "线控选装率",
+                "线控在（66ultra）选装率",
+            ]
+            for g in target_groups:
+                df_g = imads_dist_df[imads_dist_df["series_group_logic"].eq(g)].copy()
+                if df_g.empty:
+                    continue
+                html_content.append(f"<h5>{g}</h5>")
+                show = df_g.loc[:, [c for c in cols if c in df_g.columns]].copy()
+                html_content.append(
+                    show.to_html(
+                        index=False,
+                        classes="table",
+                        escape=False,
+                        float_format=lambda x: "{:,.0f}".format(x) if isinstance(x, (int, float)) else x,
+                    )
+                )
+
+        html_content.append("<h4>1.9 配置选配情况（转置配置表）</h4>")
+        html_content.append("<div class='summary-box'>")
+        html_content.append(
+            "<p>口径：加载 processed/LS8_Configuration_Details_transposed.csv；以 order_number 与“预售至N日累计留存小订数”的订单集合匹配；对各 Attribute（列名）下不同 Value Dispaly Name（字段值）统计订单数与选配比例（订单数/预售至N日累计留存小订数）；中文名称来自 business_definition.json 的 configuration 映射。</p>"
+        )
+        html_content.append("</div>")
+        if config_option_df is None or config_option_df.empty:
+            html_content.append("<p>⚠️ 无数据（可能缺少转置配置文件、列名不一致或匹配不到留存订单）。</p>")
+        else:
+            cols = ["Attribute", "中文名称", "Value Dispaly Name", "订单数", "选配比例"]
+            for g in target_groups:
+                df_g = config_option_df[config_option_df["series_group_logic"].eq(g)].copy()
+                if df_g.empty:
+                    continue
+                html_content.append(f"<h5>{g}</h5>")
+                show = df_g.loc[:, [c for c in cols if c in df_g.columns]].copy()
+                html_content.append(
+                    show.to_html(
+                        index=False,
+                        classes="table",
+                        escape=False,
+                        float_format=lambda x: "{:,.0f}".format(x) if isinstance(x, (int, float)) else x,
+                    )
+                )
+
     html_content.append("<h2>2. 上市期每小时锁单数（按 series_group_logic）</h2>")
     html_content.append("<div class='summary-box'>")
     html_content.append(
@@ -1652,6 +2133,10 @@ def main() -> int:
     presale_retention_buyer_age_df = build_presale_retention_age_detail(
         df, business_def, target_groups, age_col="buyer_age", age_label="buyer_age"
     )
+    df_imads = load_op_steer_from_transposed(OP_STEER_TRANSPOSED_FILE)
+    imads_dist_df = build_imads_op_steer_region_summary(df, business_def, target_groups, df_imads)
+    df_transposed = load_transposed_configuration_data(OP_STEER_TRANSPOSED_FILE)
+    config_option_df = build_transposed_configuration_option_summary(df, business_def, target_groups, df_transposed)
     listing_hourly_df = build_hourly_lock_counts(df, business_def, target_groups)
     listing_summary_df = build_listing_summary(df, business_def, target_groups)
 
@@ -1665,6 +2150,8 @@ def main() -> int:
         presale_retention_order_gender_df,
         presale_retention_parent_region_df,
         presale_retention_buyer_age_df,
+        imads_dist_df,
+        config_option_df,
         listing_hourly_df,
         listing_summary_df,
         target_groups,
