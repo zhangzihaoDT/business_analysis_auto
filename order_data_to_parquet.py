@@ -242,6 +242,7 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
         "Order Number": "order_number",
         "Store City": "store_city",
         "Vin": "vin",
+        "Invoice Amount": "invoice_amount",
         "Actual Refund Time 年/月/日": "actual_refund_time",
         "Apply Refund Time 年/月/日": "apply_refund_time",
         "Approve Refund Time 年/月/日": "approve_refund_time",
@@ -288,10 +289,14 @@ def convert_types(df: pd.DataFrame) -> pd.DataFrame:
             s = s.replace({"nan": None, "None": None, "": None})
             df[col] = pd.to_datetime(s, errors="coerce")
 
-    numeric_cols = ["age", "invoice_amount", "td_countd", "buyer_age", "owner_age"]
+    numeric_cols = ["age", "invoice_amount", "Invoice_Amount", "td_countd", "buyer_age", "owner_age"]
     for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            if pd.api.types.is_string_dtype(df[col]) or pd.api.types.is_object_dtype(df[col]):
+                s = df[col].astype(str).str.replace(",", "", regex=False).str.replace("￥", "", regex=False).str.replace("¥", "", regex=False)
+                df[col] = pd.to_numeric(s, errors="coerce")
+            else:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
     for col in ["buyer_age", "owner_age"]:
         if col in df.columns:
