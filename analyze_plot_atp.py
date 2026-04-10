@@ -20,7 +20,7 @@ import plotly.graph_objects as go
 
 # --- Constants ---
 PARQUET_FILE = Path("/Users/zihao_/Documents/coding/dataset/formatted/order_full_data.parquet")
-BUSINESS_DEF_FILE = Path("/Users/zihao_/Documents/github/W52_reasoning/world/business_definition.json")
+BUSINESS_DEF_FILE = Path("/Users/zihao_/Documents/github/26W06_Tool_calls/schema/business_definition.json")
 OUTPUT_HTML = Path("/Users/zihao_/Documents/coding/dataset/reports/atp_analysis.html")
 
 # --- Visualization Style Constants ---
@@ -299,10 +299,11 @@ def build_metric_figure(df: pd.DataFrame, year_label: str, color: str = COLOR_DA
     )
     return fig
 
-def build_period_comparison_figure(df_full: pd.DataFrame, filter_info: str) -> go.Figure:
+def build_period_comparison_html(df_full: pd.DataFrame, filter_info: str) -> str:
     """
     Build Comparison Table (Plot 4): Weighted Average Invoice Price by Period & Segment.
     Expanded to show Series breakdown, Share, Count, and Price.
+    Returns an HTML string instead of a Plotly figure so that cells can be copied.
     Periods:
       - 2025 Full Year
       - 2025 Dec
@@ -312,24 +313,31 @@ def build_period_comparison_figure(df_full: pd.DataFrame, filter_info: str) -> g
     Segments:
       - All Series
       - Sedan (L6+L7)
-      - SUV (LS6+LS7+LS9)
+      - SUV (LS6+LS7+LS8+LS9)
     """
     
     # Define Periods
+    # Dynamically calculate target month (max locktime month - 1)
+    max_lock_time = pd.to_datetime(df_full["lock_time"]).max()
+    target_date = max_lock_time - pd.DateOffset(months=1)
+    target_year = target_date.year
+    target_month = target_date.month
+    target_month_name = target_date.strftime('%b')
+
     # (Label, Filter Function, Color Logic handled later)
     periods = [
         ("2025 Full Year", lambda df: df[df["invoice_upload_time"].dt.year == 2025]),
         ("2025 Dec", lambda df: df[(df["invoice_upload_time"].dt.year == 2025) & (df["invoice_upload_time"].dt.month == 12)]),
-        ("2026 Jan", lambda df: df[(df["invoice_upload_time"].dt.year == 2026) & (df["invoice_upload_time"].dt.month == 1)]),
-        ("2026 Feb", lambda df: df[(df["invoice_upload_time"].dt.year == 2026) & (df["invoice_upload_time"].dt.month == 2)]),
-        ("2026 1～2月", lambda df: df[(df["invoice_upload_time"].dt.year == 2026) & (df["invoice_upload_time"].dt.month.isin([1, 2]))])
+        (f"{target_year} Jan", lambda df: df[(df["invoice_upload_time"].dt.year == target_year) & (df["invoice_upload_time"].dt.month == 1)]),
+        (f"{target_year} {target_month_name}", lambda df: df[(df["invoice_upload_time"].dt.year == target_year) & (df["invoice_upload_time"].dt.month == target_month)]),
+        (f"{target_year} 1～{target_month}月", lambda df: df[(df["invoice_upload_time"].dt.year == target_year) & (df["invoice_upload_time"].dt.month.isin(list(range(1, target_month + 1))))])
     ]
     
     # Define Segments
     segments = {
         "All Series": lambda df: df,
         "Sedan (L6+L7)": lambda df: df[df["series_derived"].isin(["L6", "L7"])],
-        "SUV (LS6+LS7+LS9)": lambda df: df[df["series_derived"].isin(["LS6", "LS7", "LS9"])]
+        "SUV (LS6+LS7+LS8+LS9)": lambda df: df[df["series_derived"].isin(["LS6", "LS7", "LS8", "LS9"])]
     }
     
     rows = []
@@ -395,7 +403,7 @@ def build_period_comparison_figure(df_full: pd.DataFrame, filter_info: str) -> g
         final_cols.extend([f"{p_name}_Count", f"{p_name}_Share", f"{p_name}_Price"])
         
         # Color
-        c = COLOR_CONTRAST if "2026" in p_name else COLOR_MAIN
+        c = COLOR_CONTRAST if str(target_year) in p_name else COLOR_MAIN
         header_colors.extend([c, c, c])
         
     res_df = res_df[final_cols]
@@ -410,37 +418,39 @@ def build_period_comparison_figure(df_full: pd.DataFrame, filter_info: str) -> g
         display_cols.append(f"{p_name}<br>Share")
         display_cols.append(f"{p_name}<br>Avg Price")
         
-    # Build Table
-    fig = go.Figure(data=[go.Table(
-        header=dict(
-            values=display_cols,
-            fill_color=header_colors,
-            font=dict(color='white', size=11),
-            align='center',
-            line_color=COLOR_GRID,
-            height=40
-        ),
-        cells=dict(
-            values=[res_df[k].tolist() for k in res_df.columns],
-            fill_color=COLOR_BG,
-            font=dict(color='black', size=11),
-            align='center',
-            line_color=COLOR_GRID,
-            height=30
-        )
-    )])
+    # Build HTML Table instead of Plotly Figure
+    html = f'''
+    <div style="margin: 20px;">
+        <h2 style="color: {COLOR_DARK}; font-family: Arial, sans-serif; font-size: 16px; margin-left: 20px;">Weighted Average Invoice Price by Period & Segment (Detailed)</h2>
+        <div style="overflow-x: auto; margin-left: 20px; margin-right: 20px;">
+            <table style="width: 100%; border-collapse: collapse; font-family: Arial, sans-serif; font-size: 11px; text-align: center; background-color: {COLOR_BG};">
+                <thead>
+                    <tr>
+    '''
     
-    fig.update_layout(
-        title=dict(
-            text="Weighted Average Invoice Price by Period & Segment (Detailed)",
-            x=0.01,
-            xanchor='left'
-        ),
-        margin=dict(l=20, r=20, t=60, b=20),
-        height=len(res_df) * 30 + 150
-    )
+    # Add Headers
+    for col, bg_color in zip(display_cols, header_colors):
+        html += f'                        <th style="background-color: {bg_color}; color: white; padding: 10px 5px; border: 1px solid {COLOR_GRID}; font-weight: normal;">{col}</th>\n'
+        
+    html += '''                    </tr>
+                </thead>
+                <tbody>
+    '''
     
-    return fig
+    # Add Rows
+    for _, row in res_df.iterrows():
+        html += "                    <tr>\n"
+        for val in row:
+            html += f'                        <td style="padding: 8px 5px; border: 1px solid {COLOR_GRID}; color: black;">{val}</td>\n'
+        html += "                    </tr>\n"
+        
+    html += '''                </tbody>
+            </table>
+        </div>
+    </div>
+    '''
+    
+    return html
 
 def build_ls6_launch_price_figure(df: pd.DataFrame, business_def: dict) -> go.Figure:
     """
@@ -833,7 +843,7 @@ def main():
     fig3_2026 = build_metric_figure(df_2026_processed, "2026", COLOR_CONTRAST)
     
     # Fig 4: Comparison
-    fig4 = build_period_comparison_figure(df_processed_full, filter_info)
+    html4 = build_period_comparison_html(df_processed_full, filter_info)
     
     # 8. Save to HTML
     print(f"Saving HTML report to {OUTPUT_HTML}...")
@@ -872,20 +882,19 @@ def main():
              f.write("<br><hr><br>")
 
         # Comparison
-        if fig4:
-             include_js = False if (fig1_2025 or fig1_2026 or fig2_2025 or fig2_2026 or fig3_2025 or fig3_2026) else 'cdn'
-             f.write(fig4.to_html(full_html=False, include_plotlyjs=include_js))
+        if html4:
+             f.write(html4)
              f.write("<br><hr><br>")
              
         # Plot 5: LS6 Launch Trends
         if fig5:
-             include_js = False if (fig1_2025 or fig1_2026 or fig2_2025 or fig2_2026 or fig3_2025 or fig3_2026 or fig4) else 'cdn'
+             include_js = False if (fig1_2025 or fig1_2026 or fig2_2025 or fig2_2026 or fig3_2025 or fig3_2026) else 'cdn'
              f.write(fig5.to_html(full_html=False, include_plotlyjs=include_js))
              f.write("<br><hr><br>")
              
         # Plot 6: REEV Price Trend
         if fig6:
-             include_js = False if (fig1_2025 or fig1_2026 or fig2_2025 or fig2_2026 or fig3_2025 or fig3_2026 or fig4 or fig5) else 'cdn'
+             include_js = False if (fig1_2025 or fig1_2026 or fig2_2025 or fig2_2026 or fig3_2025 or fig3_2026 or fig5) else 'cdn'
              f.write(fig6.to_html(full_html=False, include_plotlyjs=include_js))
              
         f.write("</body></html>")

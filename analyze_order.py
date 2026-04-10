@@ -669,15 +669,25 @@ def build_presale_retention_by_product(
         lock_orders = df.loc[m_lock_30d, ["order_number"]].dropna(subset=["order_number"]).drop_duplicates()
         lock_orders = lock_orders.assign(_locked_30d=1)
 
+        m_lock_to_date = (
+            df["series_group_logic"].eq(g)
+            & df["lock_time"].notna()
+            & (df["lock_time"] >= listing_day)
+            & (df["lock_time"] < finish_excl)
+        )
+        lock_to_date_orders = df.loc[m_lock_to_date, ["order_number"]].dropna(subset=["order_number"]).drop_duplicates()
+
         if retention_orders.empty:
             summary_rows.append(
                 {
                     "series_group_logic": g,
                     "预售期": f"{start_day.date().isoformat()} ~ {presale_end_day.date().isoformat()}",
-                    "N（日）": int(n_days),
+                    "预售周期（日）": int(n_days),
                     "预售至N日累计留存小订数": 0,
-                    "上市后30日锁单数（预售至N日留存口径）": 0,
-                    "锁单转化率": "0.0%",
+                    "上市后30日锁单数": 0,
+                    "上市后30日转化率": "0.0%",
+                    "上市至今留存小订锁单数": 0,
+                    "留存小订转化率": "0.0%",
                 }
             )
             continue
@@ -705,14 +715,18 @@ def build_presale_retention_by_product(
         )
 
         locked_total = int(merged.loc[merged["_locked_30d"].eq(1), "order_number"].nunique())
+        retention_order_numbers = retention_orders["order_number"].dropna().drop_duplicates()
+        locked_to_date_total = int(retention_order_numbers.isin(lock_to_date_orders["order_number"]).sum())
         summary_rows.append(
             {
                 "series_group_logic": g,
                 "预售期": f"{start_day.date().isoformat()} ~ {presale_end_day.date().isoformat()}",
-                "N（日）": int(n_days),
+                "预售周期（日）": int(n_days),
                 "预售至N日累计留存小订数": retention_total,
-                "上市后30日锁单数（预售至N日留存口径）": locked_total,
-                "锁单转化率": f"{(locked_total / retention_total * 100) if retention_total > 0 else 0.0:.1f}%",
+                "上市后30日锁单数": locked_total,
+                "上市后30日转化率": f"{(locked_total / retention_total * 100) if retention_total > 0 else 0.0:.1f}%",
+                "上市至今留存小订锁单数": locked_to_date_total,
+                "留存小订转化率": f"{(locked_to_date_total / retention_total * 100) if retention_total > 0 else 0.0:.1f}%",
             }
         )
 
@@ -721,11 +735,11 @@ def build_presale_retention_by_product(
                 {
                     "series_group_logic": g,
                     "product_name": str(r["product_name"]),
-                    "N（日）": int(n_days),
+                    "预售周期（日）": int(n_days),
                     "预售至N日累计留存小订数": int(r["retention_intention_orders"]),
                     "预售至N日累计留存占比": f"{float(r['retention_share']):.1f}%",
                     "上市后30日锁单数": int(r["lock_30d_orders"]),
-                    "锁单转化率": f"{float(r['lock_30d_rate']):.1f}%",
+                    "上市后30日转化率": f"{float(r['lock_30d_rate']):.1f}%",
                 }
             )
 
@@ -819,7 +833,7 @@ def build_presale_retention_region_detail(
                     "series_group_logic": g,
                     "product_name": str(r["product_name"]),
                     "parent_region_name": str(r["parent_region_name"]),
-                    "N（日）": int(n_days),
+                    "预售周期（日）": int(n_days),
                     "预售至N日累计留存小订数": int(r["cnt"]),
                     "产品占比（该region内）": float(r["share_in_region"]),
                 }
@@ -920,7 +934,7 @@ def build_presale_retention_region_summary_with_active_stores(
             rows.append(
                 {
                     "series_group_logic": g,
-                    "N（日）": int(n_days),
+                    "预售周期（日）": int(n_days),
                     "上市日(d)": listing_day.date().isoformat(),
                     "parent_region_name": str(region_name),
                     "预售至N日累计留存小订数": int(cnt),
@@ -1007,7 +1021,7 @@ def build_presale_retention_age_detail(
             rows.append(
                 {
                     "series_group_logic": g,
-                    "N（日）": int(n_days),
+                    "预售周期（日）": int(n_days),
                     age_label: int(age_val) if pd.notna(age_val) else None,
                     "预售至N日累计留存小订数": int(cnt),
                     "占比": share,
@@ -1089,7 +1103,7 @@ def build_presale_retention_category_detail(
             rows.append(
                 {
                     "series_group_logic": g,
-                    "N（日）": int(n_days),
+                    "预售周期（日）": int(n_days),
                     category_label: str(cat_val),
                     "预售至N日累计留存小订数": int(cnt),
                     "占比": share,
@@ -1896,8 +1910,8 @@ def render_report(
                 dfg = presale_retention_region_df[presale_retention_region_df["series_group_logic"].eq(g)].copy()
                 if dfg.empty:
                     continue
-                n_val = int(dfg["N（日）"].iloc[0]) if "N（日）" in dfg.columns else None
-                title = f"{g}（N={n_val}）" if n_val is not None else g
+                n_val = int(dfg["预售周期（日）"].iloc[0]) if "预售周期（日）" in dfg.columns else None
+                title = f"{g}（预售周期={n_val}）" if n_val is not None else g
                 html_content.append(f"<h5>{title}</h5>")
 
                 product_totals = (
