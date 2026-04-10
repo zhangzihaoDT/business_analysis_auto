@@ -59,11 +59,21 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 _missing = [m for m in ["numpy", "pandas", "plotly"] if importlib.util.find_spec(m) is None]
+_has_parquet_engine = (
+    importlib.util.find_spec("pyarrow") is not None
+    or importlib.util.find_spec("fastparquet") is not None
+)
 if _missing:
     print("💥 缺少依赖模块，无法运行 analyze_order.py")
     print(f"缺少模块: {', '.join(_missing)}")
     print("请先安装依赖后重试，例如：")
     print(f"{sys.executable} -m pip install numpy pandas plotly")
+    raise SystemExit(1)
+if not _has_parquet_engine:
+    print("💥 缺少 Parquet 读取引擎，无法运行 analyze_order.py")
+    print("缺少模块: pyarrow 或 fastparquet")
+    print("请先安装依赖后重试，例如：")
+    print(f"{sys.executable} -m pip install pyarrow")
     raise SystemExit(1)
 
 import numpy as np
@@ -80,7 +90,7 @@ BUSINESS_DEF_FILE = Path(
 ACTIVE_STORE_OPERATOR_FILE = Path(
     "/Users/zihao_/Documents/github/26W06_Tool_calls/operators/active_store.py"
 )
-OP_STEER_TRANSPOSED_FILE = Path("/Users/zihao_/Documents/coding/dataset/processed/LS8_Configuration_Details_transposed.csv")
+CONFIG_ATTRIBUTE_FILE = Path("/Users/zihao_/Documents/coding/dataset/formatted/config_attribute.parquet")
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_OUTPUT = SCRIPT_DIR / "reports" / "analyze_order.html"
 ALL_TARGET_GROUPS = ["CM0","DM0","CM1","DM1","CM2","LS9","LS8"]
@@ -121,22 +131,58 @@ def load_imads_data(file_path: Path) -> pd.DataFrame:
         raise last_err
     return pd.DataFrame()
 
+def _standardize_config_attribute_long(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    rename_map = {}
+    if "Order Number" in df.columns:
+        rename_map["Order Number"] = "order_number"
+    elif "order_number" in df.columns:
+        rename_map["order_number"] = "order_number"
+
+    if "Attribute" in df.columns:
+        rename_map["Attribute"] = "Attribute"
+    elif "Attribute Code" in df.columns:
+        rename_map["Attribute Code"] = "Attribute"
+
+    if "Value Dispaly Name" in df.columns:
+        rename_map["Value Dispaly Name"] = "Value Dispaly Name"
+    elif "value" in df.columns:
+        rename_map["value"] = "Value Dispaly Name"
+
+    df = df.rename(columns=rename_map)
+    required = {"order_number", "Attribute", "Value Dispaly Name"}
+    if not required.issubset(set(df.columns)):
+        return pd.DataFrame()
+
+    out = df.loc[:, ["order_number", "Attribute", "Value Dispaly Name"]].copy()
+    out["order_number"] = out["order_number"].astype("string")
+    out["Attribute"] = out["Attribute"].astype("string").str.strip()
+    out["Value Dispaly Name"] = out["Value Dispaly Name"].astype("string").str.strip()
+    out = out.dropna(subset=["order_number"])
+    return out
+
+
 def load_op_steer_from_transposed(file_path: Path) -> pd.DataFrame:
     if not file_path.exists():
         return pd.DataFrame()
     try:
-        df = pd.read_csv(file_path, dtype="string", encoding="utf-8-sig")
+        df = pd.read_parquet(file_path)
     except Exception:
-        df = pd.read_csv(file_path, dtype="string")
-    if "order_number" not in df.columns:
         return pd.DataFrame()
-    if "OP-Steer" not in df.columns:
+    long_df = _standardize_config_attribute_long(df)
+    if long_df.empty:
         return pd.DataFrame()
-    out = pd.DataFrame({
-        "Order Number": df["order_number"],
-        "Attribute Code": "OP-Steer",
-        "Value Dispaly Name": df["OP-Steer"]
-    })
+    op = long_df[long_df["Attribute"].isin(["OP-Steer", "线控转向", "全线控转向系统"])].copy()
+    if op.empty:
+        return pd.DataFrame()
+    out = pd.DataFrame(
+        {
+            "Order Number": op["order_number"],
+            "Attribute Code": "OP-Steer",
+            "Value Dispaly Name": op["Value Dispaly Name"],
+        }
+    )
     out = out.dropna(subset=["Order Number"])
     return out
 
@@ -145,13 +191,13 @@ def load_transposed_configuration_data(file_path: Path) -> pd.DataFrame:
     if not file_path.exists():
         return pd.DataFrame()
     try:
-        df = pd.read_csv(file_path, dtype="string", encoding="utf-8-sig")
+        df = pd.read_parquet(file_path)
     except Exception:
-        df = pd.read_csv(file_path, dtype="string")
-    if "order_number" not in df.columns:
         return pd.DataFrame()
-    df["order_number"] = df["order_number"].astype("string")
-    return df
+    long_df = _standardize_config_attribute_long(df)
+    if long_df.empty:
+        return pd.DataFrame()
+    return long_df
 
 _ACTIVE_STORE_OPERATOR = None
 
@@ -1144,6 +1190,7 @@ def build_imads_attribute_region_distribution(
 
     time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
     retained_rows: List[pd.DataFrame] = []
+
     for g in target_groups:
         tp = time_periods.get(g, {}) or {}
         start_str = tp.get("start")
@@ -1352,12 +1399,25 @@ def build_transposed_configuration_option_summary(
     if df_transposed is None or df_transposed.empty:
         return pd.DataFrame()
 
+    df_transposed = df_transposed.copy()
+    if "order_number" not in df_transposed.columns and "Order Number" in df_transposed.columns:
+        df_transposed = df_transposed.rename(columns={"Order Number": "order_number"})
+
+    has_long = (
+        "order_number" in df_transposed.columns
+        and "Attribute" in df_transposed.columns
+        and ("Value Dispaly Name" in df_transposed.columns or "value" in df_transposed.columns)
+    )
+    if has_long and "Value Dispaly Name" not in df_transposed.columns and "value" in df_transposed.columns:
+        df_transposed = df_transposed.rename(columns={"value": "Value Dispaly Name"})
+
     if "order_number" not in df_transposed.columns:
-        raise KeyError("转置配置数据缺少列: order_number")
+        raise KeyError("配置数据缺少列: order_number")
 
     required_order_cols = [
         "order_number",
         "series_group_logic",
+        "order_type",
         "intention_payment_time",
         "intention_refund_time",
     ]
@@ -1371,13 +1431,7 @@ def build_transposed_configuration_option_summary(
         df_orders["intention_refund_time"] = pd.to_datetime(df_orders["intention_refund_time"], errors="coerce")
 
     time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
-    configuration_name_map = business_def.get("configuration", {}) or {}
-    if not isinstance(configuration_name_map, dict):
-        configuration_name_map = {}
-    configuration_name_map = {str(k): str(v) for k, v in configuration_name_map.items()}
-    if "DATE([Order Intent Pay Time])" in configuration_name_map and "intention_pay_time" not in configuration_name_map:
-        configuration_name_map["intention_pay_time"] = configuration_name_map["DATE([Order Intent Pay Time])"]
-
+    
     exclude_cols = {
         "order_number",
         "DATE([Order Intent Pay Time])",
@@ -1389,8 +1443,23 @@ def build_transposed_configuration_option_summary(
     }
 
     rows: List[Dict[str, object]] = []
-    df_transposed = df_transposed.copy()
     df_transposed["order_number"] = df_transposed["order_number"].astype("string")
+
+    staff_orders = set()
+    if has_long:
+        staff_mask = df_transposed["Attribute"].astype("string").eq("Is Staff") & df_transposed[
+            "Value Dispaly Name"
+        ].astype("string").eq("Y")
+        if staff_mask.any():
+            staff_orders = set(df_transposed.loc[staff_mask, "order_number"].dropna().astype("string"))
+    else:
+        if "Is Staff" in df_transposed.columns:
+            staff_orders = set(df_transposed[df_transposed["Is Staff"].eq("Y")]["order_number"])
+
+    m_user_car = (
+        (df_orders["order_type"].eq("用户车") & ~df_orders["order_number"].isin(staff_orders))
+        | (df_orders["order_type"].isna() & ~df_orders["order_number"].isin(staff_orders))
+    )
 
     for g in target_groups:
         tp = time_periods.get(g, {}) or {}
@@ -1408,55 +1477,77 @@ def build_transposed_configuration_option_summary(
         window_end_excl = start_day + pd.Timedelta(days=int(n_days))
         window_end_excl = min(window_end_excl, presale_end_excl)
 
-        m_retention = (
+        m_retention_all = (
             df_orders["series_group_logic"].eq(g)
             & df_orders["intention_payment_time"].notna()
             & (df_orders["intention_payment_time"] >= start_day)
             & (df_orders["intention_payment_time"] < window_end_excl)
             & ((df_orders["intention_refund_time"] > window_end_excl) | df_orders["intention_refund_time"].isna())
         )
-        retained_orders = (
-            df_orders.loc[m_retention, ["order_number"]]
+        retained_orders_all = (
+            df_orders.loc[m_retention_all, ["order_number"]]
             .dropna(subset=["order_number"])
             .drop_duplicates(subset=["order_number"])
             .copy()
         )
-        retained_orders["order_number"] = retained_orders["order_number"].astype("string")
-        retention_total = int(retained_orders["order_number"].nunique())
-        if retention_total <= 0:
+        retained_orders_all["order_number"] = retained_orders_all["order_number"].astype("string")
+        retention_total_all = int(retained_orders_all["order_number"].nunique())
+        if retention_total_all <= 0:
             continue
 
-        matched = df_transposed.merge(retained_orders, on="order_number", how="inner")
-        if matched.empty:
+        retained_orders_user = retained_orders_all.loc[m_user_car.reindex(retained_orders_all.index).fillna(False), ["order_number"]].copy()
+        retained_orders_user = retained_orders_user.drop_duplicates(subset=["order_number"])
+        retention_total_user = int(retained_orders_user["order_number"].nunique())
+        if retention_total_user <= 0:
             continue
 
-        attr_cols = [c for c in matched.columns if c not in exclude_cols]
-        if not attr_cols:
-            continue
+        if has_long:
+            matched = df_transposed.merge(retained_orders_user, on="order_number", how="inner")
+            if matched.empty:
+                continue
+            matched["Attribute"] = matched["Attribute"].astype("string").str.strip()
+            v = matched["Value Dispaly Name"].astype("string").fillna("").str.strip()
+            matched["Value Dispaly Name"] = v
+            long_df = matched.loc[:, ["order_number", "Attribute", "Value Dispaly Name"]].copy()
+            long_df = long_df[~long_df["Attribute"].isin(exclude_cols) & long_df["Value Dispaly Name"].ne("")]
+            if long_df.empty:
+                continue
+        else:
+            matched = df_transposed.merge(retained_orders_user, on="order_number", how="inner")
+            if matched.empty:
+                continue
 
-        long_df = matched.melt(
-            id_vars=["order_number"],
-            value_vars=attr_cols,
-            var_name="Attribute",
-            value_name="Value Dispaly Name",
-        )
-        v = long_df["Value Dispaly Name"].astype("string").fillna("").str.strip()
-        long_df["Value Dispaly Name"] = v
-        long_df = long_df[long_df["Value Dispaly Name"].ne("")]
-        if long_df.empty:
-            continue
+            attr_cols = [c for c in matched.columns if c not in exclude_cols]
+            if not attr_cols:
+                continue
+
+            long_df = matched.melt(
+                id_vars=["order_number"],
+                value_vars=attr_cols,
+                var_name="Attribute",
+                value_name="Value Dispaly Name",
+            )
+            v = long_df["Value Dispaly Name"].astype("string").fillna("").str.strip()
+            long_df["Value Dispaly Name"] = v
+            long_df = long_df[long_df["Value Dispaly Name"].ne("")]
+            if long_df.empty:
+                continue
 
         agg = (
             long_df.groupby(["Attribute", "Value Dispaly Name"], as_index=False)
-            .agg(订单数=("order_number", "nunique"))
-            .sort_values(["Attribute", "订单数"], ascending=[True, False])
+            .agg(用户车订单数=("order_number", "nunique"))
+            .sort_values(["Attribute", "用户车订单数"], ascending=[True, False])
             .reset_index(drop=True)
         )
-        agg["选配比例"] = agg["订单数"].apply(
-            lambda x: f"{(float(x) / retention_total * 100) if retention_total > 0 else 0.0:.1f}%"
+        agg["选配比例（用户车）"] = agg["用户车订单数"].apply(
+            lambda x: f"{(float(x) / retention_total_user * 100) if retention_total_user > 0 else 0.0:.1f}%"
         )
+        user_share = (retention_total_user / retention_total_all * 100) if retention_total_all > 0 else 0.0
+        agg["留存小订选配数"] = long_df["order_number"].nunique()
+        agg["留存小订用户车数"] = retention_total_user
+        agg["留存小订总数"] = retention_total_all
+        agg["用户车占比"] = f"{user_share:.1f}%"
         agg.insert(0, "series_group_logic", g)
-        agg.insert(2, "中文名称", agg["Attribute"].map(lambda x: configuration_name_map.get(str(x), "")).astype("string"))
 
         rows.append(agg)
 
@@ -1466,7 +1557,7 @@ def build_transposed_configuration_option_summary(
     out = pd.concat(rows, ignore_index=True)
     group_order = {g: i for i, g in enumerate(target_groups)}
     out["__group_order"] = out["series_group_logic"].map(group_order).fillna(len(group_order))
-    out = out.sort_values(["__group_order", "Attribute", "订单数"], ascending=[True, True, False]).drop(
+    out = out.sort_values(["__group_order", "Attribute", "用户车订单数"], ascending=[True, True, False]).drop(
         columns="__group_order"
     )
     return out.reset_index(drop=True)
@@ -2002,7 +2093,7 @@ def render_report(
 
         html_content.append("<h4>1.8 IMADS（线控转向 OP-Steer）分区域选装率</h4>")
         html_content.append("<div class='summary-box'>")
-        html_content.append("<p>口径：加载 processed/LS8_Configuration_Details_transposed.csv，以 order_number 与目标订单数据集的 order_number 匹配；读取列 OP-Steer 的“是/否”，按 parent_region_name 汇总并计算选装率（是/预选配总数；是/高配66总数）。</p>")
+        html_content.append("<p>口径：加载 formatted/config_attribute.parquet，以 order_number 与目标订单数据集的 order_number 匹配；筛选线控转向相关 Attribute（例如：线控转向/全线控转向系统）的“是/否”，按 parent_region_name 汇总并计算选装率（是/预选配总数；是/高配66总数）。</p>")
         html_content.append("</div>")
         if imads_dist_df is None or imads_dist_df.empty:
             html_content.append("<p>⚠️ 无数据（可能缺少 OP-Steer 列或匹配不到订单）。</p>")
@@ -2031,16 +2122,30 @@ def render_report(
                     )
                 )
 
-        html_content.append("<h4>1.9 配置选配情况（转置配置表）</h4>")
+        html_content.append("<h4>1.9 配置选配情况（配置长表）</h4>")
         html_content.append("<div class='summary-box'>")
+        user_cnt_total = 0
+        retained_cnt_total = 0
+        configured_cnt_total = 0
+        if config_option_df is not None and not config_option_df.empty:
+            if "留存小订用户车数" in config_option_df.columns and "留存小订总数" in config_option_df.columns and "留存小订选配数" in config_option_df.columns:
+                for g in target_groups:
+                    df_g = config_option_df[config_option_df["series_group_logic"].eq(g)].copy()
+                    if df_g.empty:
+                        continue
+                    user_cnt_total += int(df_g["留存小订用户车数"].iloc[0])
+                    retained_cnt_total += int(df_g["留存小订总数"].iloc[0])
+                    configured_cnt_total += int(df_g["留存小订选配数"].iloc[0])
+        user_share_total = (user_cnt_total / retained_cnt_total * 100) if retained_cnt_total > 0 else 0.0
         html_content.append(
-            "<p>口径：加载 processed/LS8_Configuration_Details_transposed.csv；以 order_number 与“预售至N日累计留存小订数”的订单集合匹配；对各 Attribute（列名）下不同 Value Dispaly Name（字段值）统计订单数与选配比例（订单数/预售至N日累计留存小订数）；中文名称来自 business_definition.json 的 configuration 映射。</p>"
+            "<p>口径：仅计算“用户车”订单。加载 formatted/config_attribute.parquet；以 order_number 与“预售至N日累计留存小订数”的订单集合（仅限用户车）匹配；对各 Attribute 下不同 Value Dispaly Name 统计用户车订单数与选配比例（用户车订单数 / 预售至N日累计留存小订用户车数）。"
+            f" 留存小订总数={retained_cnt_total:,} ｜ 留存小订选配数={configured_cnt_total:,} ｜ 用户车留存小订数={user_cnt_total:,}。</p>"
         )
         html_content.append("</div>")
         if config_option_df is None or config_option_df.empty:
-            html_content.append("<p>⚠️ 无数据（可能缺少转置配置文件、列名不一致或匹配不到留存订单）。</p>")
+            html_content.append("<p>⚠️ 无数据（可能缺少配置文件、列名不一致或匹配不到留存订单）。</p>")
         else:
-            cols = ["Attribute", "中文名称", "Value Dispaly Name", "订单数", "选配比例"]
+            cols = ["Attribute", "Value Dispaly Name", "用户车订单数", "选配比例（用户车）"]
             for g in target_groups:
                 df_g = config_option_df[config_option_df["series_group_logic"].eq(g)].copy()
                 if df_g.empty:
@@ -2101,8 +2206,25 @@ def render_report(
     html_content.append(pio.to_html(fig2, full_html=False, include_plotlyjs="cdn"))
     html_content.append("</body></html>")
     return "\n".join(html_content)
+import subprocess
 
-
+def run_configuration_workflow(update_data: bool):
+    """根据参数决定是否运行 order_config_to_parquet.py 更新转置数据"""
+    if update_data:
+        cmd = ["python3", str(SCRIPT_DIR / "order_config_to_parquet.py")]
+        print(f"🚀 强制执行配置工作流更新数据: {' '.join(cmd)}")
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"❌ order_config_to_parquet.py 执行失败，退出码: {e.returncode}")
+            sys.exit(1)
+        except FileNotFoundError:
+            print(f"⚠️ 未找到 python3 或 order_config_to_parquet.py 脚本。请检查环境和路径。")
+            sys.exit(1)
+    elif not CONFIG_ATTRIBUTE_FILE.exists():
+        print(f"⚠️ 未找到配置文件: {CONFIG_ATTRIBUTE_FILE}")
+        print("请运行: python3 scripts/analyze_order.py -Y 以自动更新数据源，或手动运行: python3 scripts/order_config_to_parquet.py")
+        sys.exit(1)
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="生成车型预售/上市分析报告")
@@ -2119,6 +2241,11 @@ def main() -> int:
         default=str(DEFAULT_OUTPUT),
         help=f"输出HTML文件路径（默认：{DEFAULT_OUTPUT}）"
     )
+    parser.add_argument(
+        "-Y", "--update-data",
+        action="store_true",
+        help="是否强制运行 order_config_to_parquet.py 更新配置数据源"
+    )
     args = parser.parse_args()
     
     target_groups = args.models if args.models else ALL_TARGET_GROUPS
@@ -2127,8 +2254,16 @@ def main() -> int:
     print(f"📊 分析车型: {', '.join(target_groups)}")
     print(f"📁 输出文件: {output_path}")
     
+    # 强制关联执行配置表更新脚本
+    run_configuration_workflow(args.update_data)
+
     business_def = load_business_definition(BUSINESS_DEF_FILE)
     df = load_data(PARQUET_FILE)
+    
+    if not args.update_data and CONFIG_ATTRIBUTE_FILE.exists():
+        mtime = datetime.fromtimestamp(CONFIG_ATTRIBUTE_FILE.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"📖 Loaded configuration data from {CONFIG_ATTRIBUTE_FILE} (Last modified: {mtime})")
+
     df = apply_series_group_logic(df, business_def)
 
     presale_hourly_df = build_hourly_intention_counts(df, business_def, target_groups)
@@ -2147,9 +2282,9 @@ def main() -> int:
     presale_retention_buyer_age_df = build_presale_retention_age_detail(
         df, business_def, target_groups, age_col="buyer_age", age_label="buyer_age"
     )
-    df_imads = load_op_steer_from_transposed(OP_STEER_TRANSPOSED_FILE)
+    df_imads = load_op_steer_from_transposed(CONFIG_ATTRIBUTE_FILE)
     imads_dist_df = build_imads_op_steer_region_summary(df, business_def, target_groups, df_imads)
-    df_transposed = load_transposed_configuration_data(OP_STEER_TRANSPOSED_FILE)
+    df_transposed = load_transposed_configuration_data(CONFIG_ATTRIBUTE_FILE)
     config_option_df = build_transposed_configuration_option_summary(df, business_def, target_groups, df_transposed)
     listing_hourly_df = build_hourly_lock_counts(df, business_def, target_groups)
     listing_summary_df = build_listing_summary(df, business_def, target_groups)
