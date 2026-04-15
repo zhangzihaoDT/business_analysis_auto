@@ -4,7 +4,7 @@
 """
 每日锁单数据观察脚本
 功能：
-1. 读取 order_full_data.parquet 数据
+1. 读取 order_data.parquet 数据
 2. 计算昨日（T-1）的锁单数
 3. 统计指定车型（CM2, DM1, LS9）的锁单情况
 4. 发送飞书通知
@@ -19,13 +19,14 @@ import pandas as pd
 from datetime import datetime, timedelta
 import requests
 from dotenv import load_dotenv
+from pathlib import Path
 
 # 加载环境变量
 load_dotenv()
 
 # 配置常量
-PARQUET_FILE = "/Users/zihao_/Documents/coding/dataset/formatted/order_full_data.parquet"
-BUSINESS_DEF_FILE = "/Users/zihao_/Documents/github/W52_reasoning/world/business_definition.json"
+PARQUET_FILE = "/Users/zihao_/Documents/coding/dataset/formatted/order_data.parquet"
+BUSINESS_DEF_FILE = Path("/Users/zihao_/Documents/github/26W06_Tool_calls/schema/business_definition.json")
 # 适配新数据集的 series 值：CM2->LS6, DM1->L6
 TARGET_MODELS = ["LS6", "L6", "LS9"]
 WEBHOOK_URL = os.getenv("FS_WEBHOOK_URL")

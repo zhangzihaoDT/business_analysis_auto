@@ -356,8 +356,24 @@ def process_lock_attribution_parquet() -> int:
     return 1
 
 
+def _redact_command(cmd: list[str]) -> str:
+    redacted: list[str] = []
+    skip_next = False
+    for part in cmd:
+        if skip_next:
+            redacted.append("***")
+            skip_next = False
+            continue
+        if part in {"--token-value", "--password"}:
+            redacted.append(part)
+            skip_next = True
+            continue
+        redacted.append(part)
+    return " ".join(redacted)
+
+
 def run_command_with_output(command: list[str], cwd: Path | None = None) -> int:
-    print(f"🚀 执行命令: {' '.join(command)}")
+    print(f"🚀 执行命令: {_redact_command(command)}")
     try:
         process = subprocess.Popen(
             command,
