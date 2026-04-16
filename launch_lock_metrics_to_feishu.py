@@ -94,7 +94,20 @@ def resolve_launch_date(time_periods: dict, key: str) -> pd.Timestamp | None:
 
 
 def compute_launch_lock_metrics(df: pd.DataFrame, business_def: dict, today: pd.Timestamp, target_model: str) -> dict:
-    required_cols = ["lock_time", "order_number", "approve_refund_time", "owner_identity_no", "series_group_logic"]
+    required_cols = [
+        "lock_time",
+        "order_number",
+        "approve_refund_time",
+        "owner_identity_no",
+        "series_group_logic",
+        "order_type",
+        "store_city",
+        "store_name",
+        "intention_payment_time",
+        "intention_refund_time",
+        "deposit_payment_time",
+        "deposit_refund_time",
+    ]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise KeyError(f"数据缺少列: {', '.join(missing)}")
@@ -103,6 +116,23 @@ def compute_launch_lock_metrics(df: pd.DataFrame, business_def: dict, today: pd.
         df["lock_time"] = pd.to_datetime(df["lock_time"], errors="coerce")
     if not pd.api.types.is_datetime64_any_dtype(df["approve_refund_time"]):
         df["approve_refund_time"] = pd.to_datetime(df["approve_refund_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["intention_payment_time"]):
+        df["intention_payment_time"] = pd.to_datetime(df["intention_payment_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["intention_refund_time"]):
+        df["intention_refund_time"] = pd.to_datetime(df["intention_refund_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["deposit_payment_time"]):
+        df["deposit_payment_time"] = pd.to_datetime(df["deposit_payment_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["deposit_refund_time"]):
+        df["deposit_refund_time"] = pd.to_datetime(df["deposit_refund_time"], errors="coerce")
+
+    run_date = today.normalize()
+    max_lock_time = df["lock_time"].max()
+    max_deposit_payment_time = df["deposit_payment_time"].max()
+    max_intention_payment_time = df["intention_payment_time"].max()
+    as_of_date = run_date
+    for v in [max_lock_time, max_deposit_payment_time, max_intention_payment_time]:
+        if pd.notna(v):
+            as_of_date = min(as_of_date, pd.Timestamp(v).normalize())
 
     time_periods = business_def.get("time_periods", {}) or {}
     target_launch = resolve_launch_date(time_periods, target_model)
@@ -129,6 +159,12 @@ def compute_launch_lock_metrics(df: pd.DataFrame, business_def: dict, today: pd.
     target_launch_day_total = 0
     cm2_n_day_retention = 0
     ls9_n_day_retention = 0
+    path_intention = 0
+    path_retained_deposit_conv = 0
+    path_today_deposit_conv = 0
+    path_today_deposit_unlocked = 0
+    today_lock_count = 0
+    today_user_car_lock_count = 0
 
     if target_launch is not None:
         today_excl = today + pd.Timedelta(days=1)
@@ -192,6 +228,61 @@ def compute_launch_lock_metrics(df: pd.DataFrame, business_def: dict, today: pd.
             ]
             ls9_n_day_retention = int(ls9_slice.nunique())
 
+    start = as_of_date
+    end = start + pd.Timedelta(days=1)
+    df_model = df[df["series_group_logic"].eq(target_model)].copy()
+    if not df_model.empty:
+        lock_mask = df_model["lock_time"].notna() & (df_model["lock_time"] >= start) & (df_model["lock_time"] < end)
+        user_car_mask = df_model["order_type"] == "用户车"
+        hq_mask = (df_model["store_city"].astype("string") == "拉萨市") & (
+            df_model["store_name"].astype("string") == "总部主理店"
+        )
+        hq_mask = hq_mask.fillna(False)
+        user_lock_mask = lock_mask & user_car_mask & (~hq_mask)
+        today_lock_count = int(df_model.loc[lock_mask, "order_number"].nunique())
+        today_user_car_lock_count = int(df_model.loc[user_lock_mask, "order_number"].nunique())
+        locked_user_car = df_model.loc[
+            user_lock_mask,
+            [
+                "order_number",
+                "intention_payment_time",
+                "intention_refund_time",
+                "deposit_payment_time",
+                "lock_time",
+            ],
+        ]
+        if not locked_user_car.empty:
+            cond_intention = locked_user_car["intention_payment_time"].notna() & (
+                locked_user_car["intention_refund_time"].isna()
+                | (locked_user_car["intention_refund_time"] > locked_user_car["lock_time"])
+            )
+            cond_deposit = (~cond_intention) & locked_user_car["deposit_payment_time"].notna()
+            locked_deposit = locked_user_car[cond_deposit]
+
+            path_intention = int(locked_user_car.loc[cond_intention, "order_number"].nunique())
+            path_retained_deposit_conv = int(
+                locked_deposit.loc[locked_deposit["deposit_payment_time"] < start, "order_number"].nunique()
+            )
+            path_today_deposit_conv = int(
+                locked_deposit.loc[
+                    (locked_deposit["deposit_payment_time"] >= start) & (locked_deposit["deposit_payment_time"] < end),
+                    "order_number",
+                ].nunique()
+            )
+
+        historic_deposit = (
+            user_car_mask
+            & (~hq_mask)
+            & df_model["deposit_payment_time"].notna()
+            & (df_model["deposit_payment_time"] >= start)
+            & (df_model["deposit_payment_time"] < end)
+        )
+        not_locked_yet = df_model["lock_time"].isna() | (df_model["lock_time"] >= end)
+        not_refunded_yet = df_model["deposit_refund_time"].isna() | (df_model["deposit_refund_time"] >= end)
+        path_today_deposit_unlocked = int(
+            df_model.loc[historic_deposit & not_locked_yet & not_refunded_yet, "order_number"].nunique()
+        )
+
     return {
         "target_model": target_model,
         "today": today.date().isoformat(),
@@ -207,18 +298,46 @@ def compute_launch_lock_metrics(df: pd.DataFrame, business_def: dict, today: pd.
         "target_launch_day_total": target_launch_day_total,
         "cm2_n_day_retention": cm2_n_day_retention,
         "ls9_n_day_retention": ls9_n_day_retention,
+        "as_of_date": as_of_date.date().isoformat(),
+        "run_date": run_date.date().isoformat(),
+        "max_lock_time": (pd.Timestamp(max_lock_time).isoformat(sep=" ", timespec="seconds") if pd.notna(max_lock_time) else None),
+        "max_deposit_payment_time": (
+            pd.Timestamp(max_deposit_payment_time).isoformat(sep=" ", timespec="seconds") if pd.notna(max_deposit_payment_time) else None
+        ),
+        "max_intention_payment_time": (
+            pd.Timestamp(max_intention_payment_time).isoformat(sep=" ", timespec="seconds") if pd.notna(max_intention_payment_time) else None
+        ),
+        "today_lock_count": today_lock_count,
+        "today_user_car_lock_count": today_user_car_lock_count,
+        "path_intention": path_intention,
+        "path_retained_deposit_conv": path_retained_deposit_conv,
+        "path_today_deposit_conv": path_today_deposit_conv,
+        "path_today_deposit_unlocked": path_today_deposit_unlocked,
     }
 
 
 def build_feishu_card(metrics: dict) -> dict:
     lines: List[str] = []
-    
-    target_model = metrics['target_model']
-    peak_hour_str = f"{metrics['target_peak_hour']:02d}:00" if metrics["target_peak_hour"] is not None else "NA"
 
-    lines.append(f"**{target_model} 上市锁单指标（{metrics['today']}）**")
+    target_model = metrics["target_model"]
+    peak_hour_str = f"{metrics['target_peak_hour']:02d}:00" if metrics["target_peak_hour"] is not None else "NA"
+    display_date = metrics.get("as_of_date") or metrics["today"]
+
+    lines.append(f"{target_model} 上市锁单指标（{display_date}）")
+
     lines.append("")
-    lines.append(f"{target_model} 当前累计锁单数： {metrics['target_cum']}")
+    lines.append(f"**锁单数：** {metrics['today_lock_count']}")
+    lines.append(f"**锁单数（order_type =用户车&非总部）：** {metrics['today_user_car_lock_count']}")
+
+    lines.append("")
+    lines.append("**锁单路径盘点：**")
+    lines.append(f"- 留存小订转化：{metrics['path_intention']}")
+    lines.append(f"- 留存大定转化：{metrics['path_retained_deposit_conv']}")
+    lines.append(f"- 当日大定转化：{metrics['path_today_deposit_conv']}")
+    lines.append(f"- 当日大定留存：{metrics['path_today_deposit_unlocked']}")
+
+    lines.append("")
+    lines.append(f"**{target_model} 当前累计锁单数：** {metrics['target_cum']}")
     lines.append(f"- 峰值小时锁单数：{metrics['target_peak_count']}（{peak_hour_str}）")
     lines.append(f"- 峰值后1h：{metrics['target_next_hour_count']}")
     lines.append(f"- 上市当日累计：{metrics['target_launch_day_total']}")
@@ -230,15 +349,19 @@ def build_feishu_card(metrics: dict) -> dict:
 
     if metrics.get("target_launch"):
         lines.append("")
-        lines.append(f"**上市日：** {metrics['target_launch']}")
-        lines.append(f"**N（日）：** {metrics['n']}（定义：当前日期 - {target_model} 上市日 + 1）")
+        lines.append(f"上市日： {metrics['target_launch']}")
+        lines.append(f"N（日）： {metrics['n']}（定义：当前日期 - {target_model} 上市日 + 1）")
+
+    if metrics.get("as_of_date") and metrics.get("run_date") and metrics["as_of_date"] != metrics["run_date"]:
+        lines.append("")
+        lines.append(f"当日指标日期：{metrics['as_of_date']}（运行日 {metrics['run_date']}，数据未覆盖到运行日）")
 
     body_md = "\n".join(lines)
     return {
         "msg_type": "interactive",
         "card": {
             "header": {
-                "title": {"tag": "plain_text", "content": f"📈 {target_model} 上市锁单监控（{metrics['today']}）"},
+                "title": {"tag": "plain_text", "content": f"📈 {target_model} 上市锁单监控（{display_date}）"},
                 "template": "blue",
             },
             "elements": [
