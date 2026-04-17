@@ -16,7 +16,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 _missing = [m for m in ["numpy", "pandas", "plotly"] if importlib.util.find_spec(m) is None]
 _has_parquet_engine = (
@@ -157,6 +157,491 @@ def apply_series_group_logic(df: pd.DataFrame, business_def: dict) -> pd.DataFra
 
     df["series_group_logic"] = group_col.fillna(default_group).astype("string")
     return df
+
+
+def build_presale_retention_summary(df: pd.DataFrame, business_def: dict, target_groups: List[str]) -> pd.DataFrame:
+    required_cols = ["series_group_logic", "order_number", "intention_payment_time", "intention_refund_time", "lock_time"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"数据缺少列: {', '.join(missing)}")
+    if not pd.api.types.is_datetime64_any_dtype(df["intention_payment_time"]):
+        df["intention_payment_time"] = pd.to_datetime(df["intention_payment_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["intention_refund_time"]):
+        df["intention_refund_time"] = pd.to_datetime(df["intention_refund_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["lock_time"]):
+        df["lock_time"] = pd.to_datetime(df["lock_time"], errors="coerce")
+
+    time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
+    rows: List[Dict[str, object]] = []
+
+    for g in target_groups:
+        tp = time_periods.get(g, {}) or {}
+        start_str = tp.get("start")
+        end_str = tp.get("end")
+        finish_str = tp.get("finish")
+        if not start_str or not end_str:
+            continue
+
+        start_day = pd.Timestamp(start_str)
+        presale_end_day = pd.Timestamp(end_str)
+        listing_day = presale_end_day + pd.Timedelta(days=1) if g == "CM0" else presale_end_day
+        finish_day = pd.Timestamp(finish_str) if finish_str else listing_day
+
+        presale_days = int((presale_end_day - start_day).days + 1)
+        window_end_excl = presale_end_day + pd.Timedelta(days=1)
+
+        finish_limit_excl = finish_day + pd.Timedelta(days=1)
+        lock_30d_end_excl = min(listing_day + pd.Timedelta(days=31), finish_limit_excl)
+        m_lock_total = (
+            df["series_group_logic"].eq(g)
+            & df["lock_time"].notna()
+            & (df["lock_time"] >= listing_day)
+            & (df["lock_time"] < lock_30d_end_excl)
+        )
+        total_lock_30d_cnt = int(df.loc[m_lock_total, "order_number"].dropna().nunique())
+
+        m_presale = (
+            df["series_group_logic"].eq(g)
+            & df["intention_payment_time"].notna()
+            & (df["intention_payment_time"] >= start_day)
+            & (df["intention_payment_time"] < window_end_excl)
+        )
+        df_presale = df.loc[m_presale, ["order_number", "intention_refund_time", "lock_time"]].copy()
+        if df_presale.empty:
+            rows.append(
+                {
+                    "series_group_logic": g,
+                    "预售期": f"{start_day.date().isoformat()} ~ {presale_end_day.date().isoformat()}",
+                    "预售周期（日）": presale_days,
+                    "留存小订数": 0,
+                    "上市后30日锁单数": total_lock_30d_cnt,
+                    "上市后30日留存小订转化数": 0,
+                    "留存小订转化占比": "0.0%",
+                    "转化率": "0.0%",
+                }
+            )
+            continue
+
+        df_presale["order_number"] = df_presale["order_number"].astype("string")
+        df_presale = df_presale.dropna(subset=["order_number"]).drop_duplicates(subset=["order_number"])
+
+        m_retained = df_presale["intention_refund_time"].isna() | (df_presale["intention_refund_time"] > window_end_excl)
+        retained = df_presale.loc[m_retained, ["order_number", "lock_time"]].copy()
+        retained_cnt = int(retained["order_number"].nunique())
+
+        m_lock_30d = (
+            retained["lock_time"].notna()
+            & (retained["lock_time"] >= listing_day)
+            & (retained["lock_time"] < lock_30d_end_excl)
+        )
+        retained_lock_30d_cnt = int(retained.loc[m_lock_30d, "order_number"].nunique()) if retained_cnt > 0 else 0
+
+        rate = retained_lock_30d_cnt / float(retained_cnt) if retained_cnt > 0 else 0.0
+        retained_lock_share = (
+            retained_lock_30d_cnt / float(total_lock_30d_cnt) if total_lock_30d_cnt > 0 else 0.0
+        )
+        rows.append(
+            {
+                "series_group_logic": g,
+                "预售期": f"{start_day.date().isoformat()} ~ {presale_end_day.date().isoformat()}",
+                "预售周期（日）": presale_days,
+                "留存小订数": retained_cnt,
+                "上市后30日锁单数": total_lock_30d_cnt,
+                "上市后30日留存小订转化数": retained_lock_30d_cnt,
+                "留存小订转化占比": f"{retained_lock_share:.1%}",
+                "转化率": f"{rate:.1%}",
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        ordered_cols = [
+            "series_group_logic",
+            "预售期",
+            "预售周期（日）",
+            "留存小订数",
+            "上市后30日锁单数",
+            "上市后30日留存小订转化数",
+            "留存小订转化占比",
+            "转化率",
+        ]
+        out = out.loc[:, [c for c in ordered_cols if c in out.columns]].copy()
+        group_order = {g: i for i, g in enumerate(target_groups)}
+        out["__group_order"] = out["series_group_logic"].map(group_order).fillna(len(group_order))
+        out = out.sort_values(["__group_order"]).drop(columns="__group_order").reset_index(drop=True)
+    return out
+
+
+def build_presale_phase_conversion_and_ls8_projection(
+    df: pd.DataFrame,
+    business_def: dict,
+    history_groups: List[str],
+    target_group: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
+    required_cols = ["series_group_logic", "order_number", "intention_payment_time", "intention_refund_time", "lock_time"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"数据缺少列: {', '.join(missing)}")
+    if not pd.api.types.is_datetime64_any_dtype(df["intention_payment_time"]):
+        df["intention_payment_time"] = pd.to_datetime(df["intention_payment_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["intention_refund_time"]):
+        df["intention_refund_time"] = pd.to_datetime(df["intention_refund_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["lock_time"]):
+        df["lock_time"] = pd.to_datetime(df["lock_time"], errors="coerce")
+
+    time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
+
+    conv_rows: List[Dict[str, object]] = []
+    retained_dist: Dict[str, Dict[str, int]] = {}
+
+    for g in history_groups:
+        tp = time_periods.get(g, {}) or {}
+        start_str = tp.get("start")
+        end_str = tp.get("end")
+        finish_str = tp.get("finish")
+        if not start_str or not end_str:
+            continue
+
+        start_day = pd.Timestamp(start_str)
+        presale_end_day = pd.Timestamp(end_str)
+        listing_day = presale_end_day + pd.Timedelta(days=1) if g == "CM0" else presale_end_day
+        finish_day = pd.Timestamp(finish_str) if finish_str else listing_day
+
+        window_end_excl = presale_end_day + pd.Timedelta(days=1)
+
+        df_g = df.loc[df["series_group_logic"].eq(g)].copy()
+        m_presale = (
+            df_g["intention_payment_time"].notna()
+            & (df_g["intention_payment_time"] >= start_day)
+            & (df_g["intention_payment_time"] < window_end_excl)
+        )
+        m_retained = df_g["intention_refund_time"].isna() | (df_g["intention_refund_time"] > window_end_excl)
+        retained_df = (
+            df_g.loc[m_presale & m_retained, ["order_number", "intention_payment_time"]]
+            .dropna(subset=["order_number"])
+            .drop_duplicates(subset=["order_number"])
+            .copy()
+        )
+        if retained_df.empty:
+            continue
+
+        retained_df["intention_days_from_start"] = (
+            retained_df["intention_payment_time"].dt.normalize() - start_day.normalize()
+        ).dt.days
+        retained_df["intention_days_to_end"] = (
+            presale_end_day.normalize() - retained_df["intention_payment_time"].dt.normalize()
+        ).dt.days
+
+        retained_count = int(retained_df["order_number"].nunique())
+
+        base_day1 = int((retained_df["intention_days_from_start"] == 0).sum())
+        base_top3 = int((retained_df["intention_days_from_start"] < 3).sum())
+        base_last_day3 = int((retained_df["intention_days_to_end"] == 2).sum())
+        base_last_day2 = int((retained_df["intention_days_to_end"] == 1).sum())
+        base_last_day1 = int((retained_df["intention_days_to_end"] == 0).sum())
+        base_middle = int(
+            retained_count - base_top3 - base_last_day3 - base_last_day2 - base_last_day1
+        )
+
+        finish_limit_excl = finish_day + pd.Timedelta(days=1)
+        lock_30d_end_excl = min(listing_day + pd.Timedelta(days=31), finish_limit_excl)
+        m_lock = (
+            df_g["lock_time"].notna()
+            & (df_g["lock_time"] >= listing_day)
+            & (df_g["lock_time"] < lock_30d_end_excl)
+        )
+        locked_orders = (
+            df_g.loc[m_lock, ["order_number", "lock_time"]]
+            .dropna(subset=["order_number"])
+            .drop_duplicates(subset=["order_number"])
+            .copy()
+        )
+        if locked_orders.empty:
+            conv_rows.append(
+                {
+                    "车型": g,
+                    "Day1留存小订": base_day1,
+                    "Day1转化率": "0.0%",
+                    "前3日留存小订": base_top3,
+                    "前3日转化率": "0.0%",
+                    "中间期留存小订": base_middle,
+                    "中间期转化率": "0.0%",
+                    "倒数Day2留存小订": base_last_day3,
+                    "倒数Day2转化率": "0.0%",
+                    "倒数Day1留存小订": base_last_day2,
+                    "倒数Day1转化率": "0.0%",
+                    "倒数Day0(上市当天)留存小订": base_last_day1,
+                    "倒数Day0转化率": "0.0%",
+                }
+            )
+            retained_dist[g] = {
+                "total": retained_count,
+                "top3": base_top3,
+                "middle": base_middle,
+                "last_day3": base_last_day3,
+                "last_day2": base_last_day2,
+                "last_day1": base_last_day1,
+            }
+            continue
+
+        locked_retained_df = locked_orders.loc[
+            locked_orders["order_number"].isin(retained_df["order_number"])
+        ].copy()
+        if locked_retained_df.empty:
+            conv_rows.append(
+                {
+                    "车型": g,
+                    "Day1留存小订": base_day1,
+                    "Day1转化率": "0.0%",
+                    "前3日留存小订": base_top3,
+                    "前3日转化率": "0.0%",
+                    "中间期留存小订": base_middle,
+                    "中间期转化率": "0.0%",
+                    "倒数Day2留存小订": base_last_day3,
+                    "倒数Day2转化率": "0.0%",
+                    "倒数Day1留存小订": base_last_day2,
+                    "倒数Day1转化率": "0.0%",
+                    "倒数Day0(上市当天)留存小订": base_last_day1,
+                    "倒数Day0转化率": "0.0%",
+                }
+            )
+            retained_dist[g] = {
+                "total": retained_count,
+                "top3": base_top3,
+                "middle": base_middle,
+                "last_day3": base_last_day3,
+                "last_day2": base_last_day2,
+                "last_day1": base_last_day1,
+            }
+            continue
+
+        locked_retained_df = locked_retained_df.merge(
+            retained_df[
+                ["order_number", "intention_days_from_start", "intention_days_to_end"]
+            ],
+            on="order_number",
+            how="left",
+        )
+
+        locked_total = int(locked_retained_df["order_number"].nunique())
+        lock_day1 = int((locked_retained_df["intention_days_from_start"] == 0).sum())
+        lock_top3 = int((locked_retained_df["intention_days_from_start"] < 3).sum())
+        lock_last_day3 = int((locked_retained_df["intention_days_to_end"] == 2).sum())
+        lock_last_day2 = int((locked_retained_df["intention_days_to_end"] == 1).sum())
+        lock_last_day1 = int((locked_retained_df["intention_days_to_end"] == 0).sum())
+        lock_middle = int(
+            locked_total - lock_top3 - lock_last_day3 - lock_last_day2 - lock_last_day1
+        )
+
+        def conv_ratio(lock_c: int, base_c: int) -> str:
+            return f"{(lock_c / float(base_c)):.1%}" if base_c > 0 else "0.0%"
+
+        conv_rows.append(
+            {
+                "车型": g,
+                "Day1留存小订": base_day1,
+                "Day1转化率": conv_ratio(lock_day1, base_day1),
+                "前3日留存小订": base_top3,
+                "前3日转化率": conv_ratio(lock_top3, base_top3),
+                "中间期留存小订": base_middle,
+                "中间期转化率": conv_ratio(lock_middle, base_middle),
+                "倒数Day2留存小订": base_last_day3,
+                "倒数Day2转化率": conv_ratio(lock_last_day3, base_last_day3),
+                "倒数Day1留存小订": base_last_day2,
+                "倒数Day1转化率": conv_ratio(lock_last_day2, base_last_day2),
+                "倒数Day0(上市当天)留存小订": base_last_day1,
+                "倒数Day0转化率": conv_ratio(lock_last_day1, base_last_day1),
+            }
+        )
+        retained_dist[g] = {
+            "total": retained_count,
+            "top3": base_top3,
+            "middle": base_middle,
+            "last_day3": base_last_day3,
+            "last_day2": base_last_day2,
+            "last_day1": base_last_day1,
+        }
+
+    conv_df = pd.DataFrame(conv_rows)
+    if not conv_df.empty:
+        group_order = {g: i for i, g in enumerate(history_groups)}
+        conv_df["__group_order"] = conv_df["车型"].map(group_order).fillna(len(group_order))
+        conv_df = conv_df.sort_values(["__group_order"]).drop(columns="__group_order").reset_index(drop=True)
+
+    if target_group not in time_periods:
+        return conv_df, pd.DataFrame(), ""
+
+    tp_t = time_periods.get(target_group, {}) or {}
+    start_str_t = tp_t.get("start")
+    end_str_t = tp_t.get("end")
+    finish_str_t = tp_t.get("finish")
+    if not start_str_t or not end_str_t:
+        return conv_df, pd.DataFrame(), ""
+
+    start_day_t = pd.Timestamp(start_str_t)
+    presale_end_day_t = pd.Timestamp(end_str_t)
+    listing_day_t = (
+        presale_end_day_t + pd.Timedelta(days=1) if target_group == "CM0" else presale_end_day_t
+    )
+    finish_day_t = pd.Timestamp(finish_str_t) if finish_str_t else listing_day_t
+    window_end_excl_t = presale_end_day_t + pd.Timedelta(days=1)
+
+    df_t = df.loc[df["series_group_logic"].eq(target_group)].copy()
+    m_presale_t = (
+        df_t["intention_payment_time"].notna()
+        & (df_t["intention_payment_time"] >= start_day_t)
+        & (df_t["intention_payment_time"] < window_end_excl_t)
+    )
+    m_retained_t = df_t["intention_refund_time"].isna() | (
+        df_t["intention_refund_time"] > window_end_excl_t
+    )
+    retained_t = (
+        df_t.loc[m_presale_t & m_retained_t, ["order_number", "intention_payment_time"]]
+        .dropna(subset=["order_number"])
+        .drop_duplicates(subset=["order_number"])
+        .copy()
+    )
+    if retained_t.empty:
+        return conv_df, pd.DataFrame(), ""
+
+    retained_t["intention_days_from_start"] = (
+        retained_t["intention_payment_time"].dt.normalize() - start_day_t.normalize()
+    ).dt.days
+    retained_t["intention_days_to_end"] = (
+        presale_end_day_t.normalize() - retained_t["intention_payment_time"].dt.normalize()
+    ).dt.days
+
+    retained_total_t = int(retained_t["order_number"].nunique())
+    ls8_top3_cnt = int((retained_t["intention_days_from_start"] < 3).sum())
+    actual_last_day3 = int((retained_t["intention_days_to_end"] == 2).sum())
+    actual_last_day2 = int((retained_t["intention_days_to_end"] == 1).sum())
+    actual_last_day1 = int((retained_t["intention_days_to_end"] == 0).sum())
+
+    ls8_max_day = retained_t["intention_days_from_start"].max()
+    total_presale_days = int((presale_end_day_t - start_day_t).days + 1)
+    is_presale_complete = (
+        pd.notna(ls8_max_day) and int(ls8_max_day) >= int(total_presale_days - 1)
+    )
+    ls8_effective_max_day = (
+        int(ls8_max_day) if is_presale_complete else int(max(0, int(ls8_max_day) - 1))
+    ) if pd.notna(ls8_max_day) else 0
+    middle_period_days = int(max(0, total_presale_days - 3 - 3))
+    max_middle_day_idx = int(total_presale_days - 1 - 3)
+    effective_middle_max = int(min(ls8_effective_max_day, max_middle_day_idx))
+    passed_middle_days = int(effective_middle_max - 3 + 1) if effective_middle_max >= 3 else 0
+
+    middle_actual_df = retained_t.loc[
+        (retained_t["intention_days_from_start"] >= 3)
+        & (retained_t["intention_days_from_start"] <= ls8_effective_max_day)
+        & (retained_t["intention_days_to_end"] >= 3)
+    ].copy()
+    ls8_middle_actual_cnt = int(len(middle_actual_df))
+    if is_presale_complete:
+        remaining_middle_days = 0
+        ls8_projected_middle = float(ls8_middle_actual_cnt)
+    else:
+        ls8_middle_avg = ls8_middle_actual_cnt / float(passed_middle_days) if passed_middle_days > 0 else 0.0
+        remaining_middle_days = int(max(0, middle_period_days - passed_middle_days))
+        ls8_projected_middle = float(ls8_middle_actual_cnt + ls8_middle_avg * remaining_middle_days)
+
+    last_day3_idx = int(total_presale_days - 3)
+    last_day2_idx = int(total_presale_days - 2)
+    last_day1_idx = int(total_presale_days - 1)
+    is_last_day3_complete = ls8_effective_max_day >= last_day3_idx
+    is_last_day2_complete = ls8_effective_max_day >= last_day2_idx
+    is_last_day1_complete = ls8_effective_max_day >= last_day1_idx
+
+    ls8_rows: List[Dict[str, object]] = []
+
+    def parse_pct(s: object) -> float:
+        if s is None:
+            return 0.0
+        if isinstance(s, (int, float)):
+            return float(s)
+        text = str(s).strip()
+        if not text:
+            return 0.0
+        if text.endswith("%"):
+            text = text[:-1]
+        try:
+            return float(text) / 100.0
+        except Exception:
+            return 0.0
+
+    conv_map = {str(r["车型"]): r for r in conv_rows if "车型" in r}
+    for hist, dist in retained_dist.items():
+        total = int(dist.get("total", 0))
+        if total <= 0:
+            continue
+        hist_top3_ratio = float(dist.get("top3", 0)) / float(total)
+        hist_middle_ratio = float(dist.get("middle", 0)) / float(total)
+        hist_last_day3_ratio = float(dist.get("last_day3", 0)) / float(total)
+        hist_last_day2_ratio = float(dist.get("last_day2", 0)) / float(total)
+        hist_last_day1_ratio = float(dist.get("last_day1", 0)) / float(total)
+
+        base_count = float(ls8_top3_cnt) + float(ls8_projected_middle)
+        base_ratio = float(hist_top3_ratio + hist_middle_ratio)
+        if is_last_day3_complete:
+            base_count += float(actual_last_day3)
+            base_ratio += float(hist_last_day3_ratio)
+        if is_last_day2_complete:
+            base_count += float(actual_last_day2)
+            base_ratio += float(hist_last_day2_ratio)
+        if is_last_day1_complete:
+            base_count += float(actual_last_day1)
+            base_ratio += float(hist_last_day1_ratio)
+
+        proj_total_base = base_count / base_ratio if base_ratio > 0 else 0.0
+
+        proj_last_day3 = float(actual_last_day3) if is_last_day3_complete else max(float(actual_last_day3), proj_total_base * hist_last_day3_ratio)
+        proj_last_day2 = float(actual_last_day2) if is_last_day2_complete else max(float(actual_last_day2), proj_total_base * hist_last_day2_ratio)
+        proj_last_day1 = float(actual_last_day1) if is_last_day1_complete else max(float(actual_last_day1), proj_total_base * hist_last_day1_ratio)
+        proj_last3_total = float(proj_last_day3 + proj_last_day2 + proj_last_day1)
+        proj_retained_total = float(ls8_top3_cnt) + float(ls8_projected_middle) + float(proj_last3_total)
+
+        conv = conv_map.get(hist, {})
+        top3_rate = parse_pct(conv.get("前3日转化率"))
+        middle_rate = parse_pct(conv.get("中间期转化率"))
+        last_day3_rate = parse_pct(conv.get("倒数Day2转化率"))
+        last_day2_rate = parse_pct(conv.get("倒数Day1转化率"))
+        last_day1_rate = parse_pct(conv.get("倒数Day0转化率"))
+
+        lock_top3 = float(ls8_top3_cnt) * top3_rate
+        lock_middle = float(ls8_projected_middle) * middle_rate
+        lock_last_day3 = float(proj_last_day3) * last_day3_rate
+        lock_last_day2 = float(proj_last_day2) * last_day2_rate
+        lock_last_day1 = float(proj_last_day1) * last_day1_rate
+        lock_last3 = float(lock_last_day3 + lock_last_day2 + lock_last_day1)
+        lock_total = float(lock_top3 + lock_middle + lock_last3)
+
+        rate_last3_overall = lock_last3 / float(proj_last3_total) if proj_last3_total > 0 else 0.0
+        rate_total = lock_total / float(proj_retained_total) if proj_retained_total > 0 else 0.0
+
+        ls8_rows.append(
+            {
+                "参考历史车型": hist,
+                "推演留存小订": int(round(proj_retained_total)),
+                "推演30日锁单": int(round(lock_total)),
+                "推演转化率": f"{rate_total:.1%}",
+                "历史前3日转化率": f"{top3_rate:.1%}",
+                "前3日推演锁单": int(round(lock_top3)),
+                "历史中间期转化率": f"{middle_rate:.1%}",
+                "中间期推演锁单": int(round(lock_middle)),
+                "综合末尾3日转化率": f"{rate_last3_overall:.1%}",
+                "末尾3日推演锁单": int(round(lock_last3)),
+            }
+        )
+
+    ls8_df = pd.DataFrame(ls8_rows)
+    if not ls8_df.empty:
+        group_order = {g: i for i, g in enumerate(history_groups)}
+        ls8_df["__group_order"] = ls8_df["参考历史车型"].map(group_order).fillna(len(group_order))
+        ls8_df = ls8_df.sort_values(["__group_order"]).drop(columns="__group_order").reset_index(drop=True)
+    last3_note = ""
+    if is_last_day3_complete and is_last_day2_complete and is_last_day1_complete:
+        last3_note = f", 末尾3日基数: {actual_last_day3 + actual_last_day2 + actual_last_day1}"
+    note = f"前3日已知基数: {ls8_top3_cnt}, 中间期推演基数: {int(round(ls8_projected_middle))}{last3_note}"
+    return conv_df, ls8_df, note
 
 
 def build_hourly_lock_counts(df: pd.DataFrame, business_def: dict, target_groups: List[str]) -> pd.DataFrame:
@@ -893,6 +1378,10 @@ def _render_age_share_line_figure(
 
 
 def render_launch_report(
+    presale_summary_df: pd.DataFrame,
+    phase_conv_df: pd.DataFrame,
+    ls8_projection_df: pd.DataFrame,
+    ls8_projection_note: str,
     listing_hourly_df: pd.DataFrame,
     listing_daily_df: pd.DataFrame,
     listing_summary_df: pd.DataFrame,
@@ -929,11 +1418,49 @@ def render_launch_report(
         "<body>",
         "<h1>上市期锁单分析报告</h1>",
         f"<div class='timestamp'>生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>",
-        "<h2>2. 上市期锁单数</h2>",
-        "<div class='summary-box'>",
-        "<p>口径：先用业务定义 series_group_logic 根据 product_name 对订单归类；然后对每个 series_group_logic 使用业务定义 time_periods 中的 end 日期（上市日期），统计上市日期每小时锁单数，并展示上市日起（至上市后30日或 finish）每天锁单数（lock_time 非空的 order_number 去重计数）。</p>",
-        "</div>",
     ]
+
+    html_content.append("<h2>1. 预售期小订回顾</h2>")
+    html_content.append("<div class='summary-box'>")
+    html_content.append(
+        "<p>口径：预售周期（日）= end_day - start_day + 1。对每个 series_group_logic，统计预售开始日起至第N天（含）的小订订单（intention_payment_time 落在窗口内，order_number 去重）；以“截至N日未退订”作为留存：intention_refund_time 为空，或 intention_refund_time &gt; 窗口结束时间（窗口结束时间=第N天结束时刻）。上市后30日锁单窗口为 listing_day ~ min(listing_day+30, finish)（CM0 特殊：listing_day=end_day+1）。转化率 = 上市后30日留存小订转化数 / 留存小订数；留存小订转化占比 = 上市后30日留存小订转化数 / 上市后30日锁单数。</p>"
+    )
+    html_content.append("</div>")
+    html_content.append("<h3>1.1 汇总表</h3>")
+    if presale_summary_df is None or presale_summary_df.empty:
+        html_content.append("<p>⚠️ 汇总表为空（可能缺少 time_periods 的 start/end 或分组无数据）。</p>")
+    else:
+        html_content.append(presale_summary_df.to_html(index=False, classes="table", escape=False))
+
+    html_content.append("<h3>1.2 LS8 上市后30日锁单数推演</h3>")
+    html_content.append("<div class='summary-box'>")
+    html_content.append(
+        "<p>步骤1：基于历史车型 CM0/DM0/CM1/DM1/CM2/LS9 的预售留存小订，按 Day1、前3日、中间期、倒数Day2/Day1/Day0 拆分各阶段留存小订基数，并计算对应的上市后30日锁单转化率。</p>"
+    )
+    html_content.append(
+        "<p>步骤2：对 LS8 的预售留存小订做相同阶段拆分，分别代入历史车型的阶段转化率，计算“前3日 + 中间期 + 末尾3日”的推演锁单数，得到 LS8 上市后30日推演锁单量及推演转化率。</p>"
+    )
+    html_content.append("</div>")
+    if phase_conv_df is None or phase_conv_df.empty:
+        html_content.append("<p>⚠️ 历史车型预售各阶段留存小订及转化率表为空（可能缺少预售相关字段或历史车型无数据）。</p>")
+    else:
+        html_content.append("<h4>1.2.1 历史车型预售各阶段留存小订及转化率</h4>")
+        html_content.append(phase_conv_df.to_html(index=False, classes="table", escape=False))
+    if ls8_projection_df is None or ls8_projection_df.empty:
+        html_content.append("<p>⚠️ LS8 推演结果为空（可能缺少 LS8 预售数据或预售留存小订）。</p>")
+    else:
+        html_content.append("<h4>1.2.2 LS8 上市后30日锁单数推演结果</h4>")
+        html_content.append("<pre>--- LS8 上市后30日锁单数推演 (前3日 + 中间期 + 末尾3日分别代入转化率) ---</pre>")
+        if ls8_projection_note:
+            html_content.append(f"<pre>{ls8_projection_note}</pre>")
+        html_content.append(ls8_projection_df.to_html(index=False, classes="table", escape=False))
+
+    html_content.append("<h2>2. 上市期锁单数</h2>")
+    html_content.append("<div class='summary-box'>")
+    html_content.append(
+        "<p>口径：先用业务定义 series_group_logic 根据 product_name 对订单归类；然后对每个 series_group_logic 使用业务定义 time_periods 中的 end 日期（上市日期），统计上市日期每小时锁单数，并展示上市日起（至上市后30日或 finish）每天锁单数（lock_time 非空的 order_number 去重计数）。</p>"
+    )
+    html_content.append("</div>")
 
     html_content.append("<h3>2.1 汇总</h3>")
     if listing_summary_df is None or listing_summary_df.empty:
@@ -1123,6 +1650,14 @@ def main() -> int:
             staff_orders = set(config_raw_df.loc[m_staff, order_col].dropna().astype("string"))
     else:
         print("⚠️ config_attribute.parquet 缺少 is_staff 列，将不做 isstaff=N 过滤。")
+    presale_groups = ["CM0", "DM0", "CM1", "DM1", "CM2", "LS9", "LS8"]
+    presale_summary_df = build_presale_retention_summary(df, business_def, presale_groups)
+    phase_conv_df, ls8_projection_df, ls8_projection_note = build_presale_phase_conversion_and_ls8_projection(
+        df,
+        business_def,
+        history_groups=["CM0", "DM0", "CM1", "DM1", "CM2", "LS9"],
+        target_group="LS8",
+    )
     listing_hourly_df = build_hourly_lock_counts(df, business_def, target_groups)
     listing_daily_df = build_daily_lock_counts(df, business_def, target_groups)
     listing_summary_df = build_listing_summary(df, business_def, target_groups)
@@ -1133,6 +1668,10 @@ def main() -> int:
     lock_totals_df = build_after30d_lock_totals(df, business_def, target_groups, staff_orders)
 
     html = render_launch_report(
+        presale_summary_df,
+        phase_conv_df,
+        ls8_projection_df,
+        ls8_projection_note,
         listing_hourly_df,
         listing_daily_df,
         listing_summary_df,
