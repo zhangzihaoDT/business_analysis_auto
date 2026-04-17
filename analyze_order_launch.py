@@ -225,7 +225,7 @@ def build_presale_retention_summary(df: pd.DataFrame, business_def: dict, target
         df_presale["order_number"] = df_presale["order_number"].astype("string")
         df_presale = df_presale.dropna(subset=["order_number"]).drop_duplicates(subset=["order_number"])
 
-        m_retained = df_presale["intention_refund_time"].isna() | (df_presale["intention_refund_time"] > window_end_excl)
+        m_retained = df_presale["intention_refund_time"].isna() | (df_presale["intention_refund_time"] >= window_end_excl)
         retained = df_presale.loc[m_retained, ["order_number", "lock_time"]].copy()
         retained_cnt = int(retained["order_number"].nunique())
 
@@ -315,7 +315,7 @@ def build_presale_phase_conversion_and_ls8_projection(
             & (df_g["intention_payment_time"] >= start_day)
             & (df_g["intention_payment_time"] < window_end_excl)
         )
-        m_retained = df_g["intention_refund_time"].isna() | (df_g["intention_refund_time"] > window_end_excl)
+        m_retained = df_g["intention_refund_time"].isna() | (df_g["intention_refund_time"] >= window_end_excl)
         retained_df = (
             df_g.loc[m_presale & m_retained, ["order_number", "intention_payment_time"]]
             .dropna(subset=["order_number"])
@@ -493,7 +493,7 @@ def build_presale_phase_conversion_and_ls8_projection(
         & (df_t["intention_payment_time"] < window_end_excl_t)
     )
     m_retained_t = df_t["intention_refund_time"].isna() | (
-        df_t["intention_refund_time"] > window_end_excl_t
+        df_t["intention_refund_time"] >= window_end_excl_t
     )
     retained_t = (
         df_t.loc[m_presale_t & m_retained_t, ["order_number", "intention_payment_time"]]
@@ -760,6 +760,194 @@ def build_daily_lock_counts(df: pd.DataFrame, business_def: dict, target_groups:
         group_order = {g: i for i, g in enumerate(target_groups)}
         out["__group_order"] = out["series_group_logic"].map(group_order).fillna(len(group_order))
         out = out.sort_values(["__group_order", "date"]).drop(columns="__group_order").reset_index(drop=True)
+    return out
+
+
+def build_retained_intention_conversion_curve(
+    df: pd.DataFrame, business_def: dict, target_groups: List[str]
+) -> pd.DataFrame:
+    required_cols = ["series_group_logic", "order_number", "intention_payment_time", "intention_refund_time", "lock_time"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"数据缺少列: {', '.join(missing)}")
+    if not pd.api.types.is_datetime64_any_dtype(df["intention_payment_time"]):
+        df["intention_payment_time"] = pd.to_datetime(df["intention_payment_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["intention_refund_time"]):
+        df["intention_refund_time"] = pd.to_datetime(df["intention_refund_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["lock_time"]):
+        df["lock_time"] = pd.to_datetime(df["lock_time"], errors="coerce")
+
+    time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
+    rows: List[Dict[str, object]] = []
+
+    for g in target_groups:
+        tp = time_periods.get(g, {}) or {}
+        start_str = tp.get("start")
+        end_str = tp.get("end")
+        finish_str = tp.get("finish")
+        if not start_str or not end_str:
+            continue
+
+        start_day = pd.Timestamp(start_str)
+        presale_end_day = pd.Timestamp(end_str)
+        listing_day = presale_end_day + pd.Timedelta(days=1) if g == "CM0" else presale_end_day
+        finish_day = pd.Timestamp(finish_str) if finish_str else listing_day
+
+        presale_end_excl = presale_end_day + pd.Timedelta(days=1)
+        finish_limit_excl = finish_day + pd.Timedelta(days=1)
+        after_30d_end_excl = min(listing_day + pd.Timedelta(days=31), finish_limit_excl)
+
+        m_presale = (
+            df["series_group_logic"].eq(g)
+            & df["intention_payment_time"].notna()
+            & (df["intention_payment_time"] >= start_day)
+            & (df["intention_payment_time"] < presale_end_excl)
+        )
+        df_presale = df.loc[m_presale, ["order_number", "intention_refund_time", "lock_time"]].copy()
+        df_presale["order_number"] = df_presale["order_number"].astype("string")
+        df_presale = df_presale.dropna(subset=["order_number"]).drop_duplicates(subset=["order_number"])
+
+        m_retained = df_presale["intention_refund_time"].isna() | (df_presale["intention_refund_time"] >= presale_end_excl)
+        retained = df_presale.loc[m_retained, ["order_number", "lock_time"]].copy()
+        retained_cnt = int(retained["order_number"].nunique())
+
+        date_index = pd.date_range(
+            start=listing_day.floor("D"),
+            end=(after_30d_end_excl - pd.Timedelta(days=1)).floor("D"),
+            freq="D",
+        )
+
+        if retained_cnt <= 0 or retained.empty:
+            daily_full = pd.Series([0] * len(date_index), index=date_index, dtype="int64")
+        else:
+            m_lock_window = (
+                retained["lock_time"].notna()
+                & (retained["lock_time"] >= listing_day)
+                & (retained["lock_time"] < after_30d_end_excl)
+            )
+            lock_slice = retained.loc[m_lock_window, ["order_number", "lock_time"]].copy()
+            if lock_slice.empty:
+                daily_full = pd.Series([0] * len(date_index), index=date_index, dtype="int64")
+            else:
+                lock_slice["date"] = lock_slice["lock_time"].dt.floor("D")
+                daily = lock_slice.groupby("date")["order_number"].nunique()
+                daily_full = daily.reindex(date_index, fill_value=0).astype("int64")
+
+        cum = daily_full.cumsum()
+        listing_day_floor = listing_day.floor("D")
+        for d, cum_cnt in cum.items():
+            day_n = int((d - listing_day_floor).days)
+            rate = float(cum_cnt) / float(retained_cnt) if retained_cnt > 0 else 0.0
+            rows.append(
+                {
+                    "series_group_logic": g,
+                    "end_date": listing_day.date().isoformat(),
+                    "day": day_n,
+                    "date": d.date().isoformat(),
+                    "retained_orders": retained_cnt,
+                    "converted_orders_cum": int(cum_cnt),
+                    "conversion_rate": rate,
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        group_order = {g: i for i, g in enumerate(target_groups)}
+        out["__group_order"] = out["series_group_logic"].map(group_order).fillna(len(group_order))
+        out = out.sort_values(["__group_order", "day"]).drop(columns="__group_order").reset_index(drop=True)
+    return out
+
+
+def build_retained_intention_refund_curve(df: pd.DataFrame, business_def: dict, target_groups: List[str]) -> pd.DataFrame:
+    required_cols = ["series_group_logic", "order_number", "intention_payment_time", "intention_refund_time"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"数据缺少列: {', '.join(missing)}")
+    if not pd.api.types.is_datetime64_any_dtype(df["intention_payment_time"]):
+        df["intention_payment_time"] = pd.to_datetime(df["intention_payment_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["intention_refund_time"]):
+        df["intention_refund_time"] = pd.to_datetime(df["intention_refund_time"], errors="coerce")
+
+    time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
+    rows: List[Dict[str, object]] = []
+
+    for g in target_groups:
+        tp = time_periods.get(g, {}) or {}
+        start_str = tp.get("start")
+        end_str = tp.get("end")
+        finish_str = tp.get("finish")
+        if not start_str or not end_str:
+            continue
+
+        start_day = pd.Timestamp(start_str)
+        presale_end_day = pd.Timestamp(end_str)
+        listing_day = presale_end_day + pd.Timedelta(days=1) if g == "CM0" else presale_end_day
+        finish_day = pd.Timestamp(finish_str) if finish_str else listing_day
+
+        presale_end_excl = presale_end_day + pd.Timedelta(days=1)
+        finish_limit_excl = finish_day + pd.Timedelta(days=1)
+        after_30d_end_excl = min(listing_day + pd.Timedelta(days=31), finish_limit_excl)
+
+        m_presale = (
+            df["series_group_logic"].eq(g)
+            & df["intention_payment_time"].notna()
+            & (df["intention_payment_time"] >= start_day)
+            & (df["intention_payment_time"] < presale_end_excl)
+        )
+        df_presale = df.loc[m_presale, ["order_number", "intention_refund_time"]].copy()
+        df_presale["order_number"] = df_presale["order_number"].astype("string")
+        df_presale = df_presale.dropna(subset=["order_number"]).drop_duplicates(subset=["order_number"])
+
+        m_retained = df_presale["intention_refund_time"].isna() | (df_presale["intention_refund_time"] >= presale_end_excl)
+        retained = df_presale.loc[m_retained, ["order_number", "intention_refund_time"]].copy()
+        retained_cnt = int(retained["order_number"].nunique())
+
+        date_index = pd.date_range(
+            start=listing_day.floor("D"),
+            end=(after_30d_end_excl - pd.Timedelta(days=1)).floor("D"),
+            freq="D",
+        )
+
+        if retained_cnt <= 0 or retained.empty:
+            daily_full = pd.Series([0] * len(date_index), index=date_index, dtype="int64")
+        else:
+            m_refund_window = (
+                retained["intention_refund_time"].notna()
+                & (retained["intention_refund_time"] >= listing_day)
+                & (retained["intention_refund_time"] < after_30d_end_excl)
+            )
+            refund_slice = retained.loc[m_refund_window, ["order_number", "intention_refund_time"]].copy()
+            if refund_slice.empty:
+                daily_full = pd.Series([0] * len(date_index), index=date_index, dtype="int64")
+            else:
+                refund_slice["date"] = refund_slice["intention_refund_time"].dt.floor("D")
+                daily = refund_slice.groupby("date")["order_number"].nunique()
+                daily_full = daily.reindex(date_index, fill_value=0).astype("int64")
+
+        cum = daily_full.cumsum()
+        listing_day_floor = listing_day.floor("D")
+        for d, cum_cnt in cum.items():
+            day_n = int((d - listing_day_floor).days)
+            rate = float(cum_cnt) / float(retained_cnt) if retained_cnt > 0 else 0.0
+            remaining = int(retained_cnt - int(cum_cnt))
+            rows.append(
+                {
+                    "series_group_logic": g,
+                    "end_date": listing_day.date().isoformat(),
+                    "day": day_n,
+                    "date": d.date().isoformat(),
+                    "retained_orders": retained_cnt,
+                    "refunded_orders_cum": int(cum_cnt),
+                    "remaining_orders": remaining,
+                    "refund_rate": rate,
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        group_order = {g: i for i, g in enumerate(target_groups)}
+        out["__group_order"] = out["series_group_logic"].map(group_order).fillna(len(group_order))
+        out = out.sort_values(["__group_order", "day"]).drop(columns="__group_order").reset_index(drop=True)
     return out
 
 
@@ -1321,6 +1509,100 @@ def _render_daily_line_figure(
     return fig
 
 
+def _render_retained_conversion_rate_line_figure(
+    curve_df: pd.DataFrame,
+    target_groups: List[str],
+    fig_title: str,
+) -> go.Figure:
+    fig = go.Figure()
+    for g in target_groups:
+        dfg = curve_df.loc[curve_df["series_group_logic"].eq(g)].copy()
+        if dfg.empty:
+            continue
+        dfg = dfg.sort_values("day")
+        customdata = np.stack(
+            [
+                dfg["date"].astype("string").fillna("").to_numpy(),
+                dfg["retained_orders"].astype("int64").to_numpy(),
+                dfg["converted_orders_cum"].astype("int64").to_numpy(),
+            ],
+            axis=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=dfg["day"].astype("int64"),
+                y=dfg["conversion_rate"].astype(float),
+                mode="lines+markers",
+                name=g,
+                customdata=customdata,
+                hovertemplate=(
+                    "series=%{fullData.name}<br>"
+                    "上市后Day=%{x}<br>"
+                    "date=%{customdata[0]}<br>"
+                    "累计转化=%{customdata[2]} / %{customdata[1]}<br>"
+                    "转化率=%{y:.1%}<extra></extra>"
+                ),
+            )
+        )
+    fig.update_layout(
+        title=fig_title,
+        xaxis=dict(title="上市后天数", tickmode="linear", dtick=2),
+        yaxis=dict(title="留存小订转化率", tickformat=".1%"),
+        hovermode="x unified",
+        margin=dict(l=40, r=20, t=60, b=60),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
+def _render_retained_refund_rate_line_figure(
+    curve_df: pd.DataFrame,
+    target_groups: List[str],
+    fig_title: str,
+) -> go.Figure:
+    fig = go.Figure()
+    for g in target_groups:
+        dfg = curve_df.loc[curve_df["series_group_logic"].eq(g)].copy()
+        if dfg.empty:
+            continue
+        dfg = dfg.sort_values("day")
+        customdata = np.stack(
+            [
+                dfg["date"].astype("string").fillna("").to_numpy(),
+                dfg["retained_orders"].astype("int64").to_numpy(),
+                dfg["refunded_orders_cum"].astype("int64").to_numpy(),
+                dfg["remaining_orders"].astype("int64").to_numpy(),
+            ],
+            axis=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=dfg["day"].astype("int64"),
+                y=dfg["refund_rate"].astype(float),
+                mode="lines+markers",
+                name=g,
+                customdata=customdata,
+                hovertemplate=(
+                    "series=%{fullData.name}<br>"
+                    "上市后Day=%{x}<br>"
+                    "date=%{customdata[0]}<br>"
+                    "累计退订=%{customdata[2]} / %{customdata[1]}<br>"
+                    "未退订=%{customdata[3]}<br>"
+                    "退订率=%{y:.1%}<extra></extra>"
+                ),
+            )
+        )
+    fig.update_layout(
+        title=fig_title,
+        xaxis=dict(title="上市后天数", tickmode="linear", dtick=2),
+        yaxis=dict(title="留存小订退订率", tickformat=".1%"),
+        hovermode="x unified",
+        margin=dict(l=40, r=20, t=60, b=60),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
 def _render_age_share_line_figure(
     age_df: pd.DataFrame,
     target_groups: List[str],
@@ -1384,6 +1666,8 @@ def render_launch_report(
     ls8_projection_note: str,
     listing_hourly_df: pd.DataFrame,
     listing_daily_df: pd.DataFrame,
+    retained_conv_curve_df: pd.DataFrame,
+    retained_refund_curve_df: pd.DataFrame,
     listing_summary_df: pd.DataFrame,
     model_mix_df: pd.DataFrame,
     config_version_df: pd.DataFrame,
@@ -1423,7 +1707,9 @@ def render_launch_report(
     html_content.append("<h2>1. 预售期小订回顾</h2>")
     html_content.append("<div class='summary-box'>")
     html_content.append(
-        "<p>口径：预售周期（日）= end_day - start_day + 1。对每个 series_group_logic，统计预售开始日起至第N天（含）的小订订单（intention_payment_time 落在窗口内，order_number 去重）；以“截至N日未退订”作为留存：intention_refund_time 为空，或 intention_refund_time &gt; 窗口结束时间（窗口结束时间=第N天结束时刻）。上市后30日锁单窗口为 listing_day ~ min(listing_day+30, finish)（CM0 特殊：listing_day=end_day+1）。转化率 = 上市后30日留存小订转化数 / 留存小订数；留存小订转化占比 = 上市后30日留存小订转化数 / 上市后30日锁单数。</p>"
+        "<p>口径：预售周期（日）= end_day - start_day + 1。对每个 series_group_logic，统计预售开始日起至预售结束日 endday 的小订订单（intention_payment_time 落在 start~endday 窗口内，order_number 去重）；"
+        "以“截至 endday 未退订”作为留存小订：intention_refund_time 为空，或 intention_refund_time &gt; endday（等价于 intention_refund_time &gt;= endday+1 的 00:00）。"
+        "上市后30日锁单窗口为 listing_day ~ min(listing_day+30, finish)（CM0 特殊：listing_day=end_day+1）。转化率 = 上市后30日留存小订转化数 / 留存小订数；留存小订转化占比 = 上市后30日留存小订转化数 / 上市后30日锁单数。</p>"
     )
     html_content.append("</div>")
     html_content.append("<h3>1.1 汇总表</h3>")
@@ -1449,7 +1735,7 @@ def render_launch_report(
     if ls8_projection_df is None or ls8_projection_df.empty:
         html_content.append("<p>⚠️ LS8 推演结果为空（可能缺少 LS8 预售数据或预售留存小订）。</p>")
     else:
-        html_content.append("<h4>1.2.2 LS8 上市后30日锁单数推演结果</h4>")
+        html_content.append("<h4>1.2.2 LS8 上市后30日锁单数推演</h4>")
         html_content.append("<pre>--- LS8 上市后30日锁单数推演 (前3日 + 中间期 + 末尾3日分别代入转化率) ---</pre>")
         if ls8_projection_note:
             html_content.append(f"<pre>{ls8_projection_note}</pre>")
@@ -1507,6 +1793,47 @@ def render_launch_report(
         y_title="Lock Orders",
     )
     html_content.append(pio.to_html(fig3, full_html=False, include_plotlyjs=False))
+
+    html_content.append("<h3>2.4 留存小订转化率（series_group_logic）</h3>")
+    html_content.append("<div class='summary-box'>")
+    html_content.append(
+        "<p>口径：对每个 series_group_logic，以预售期 start~end 内的小订订单（intention_payment_time 落在窗口内，order_number 去重）为基数；"
+        "以截至 endday 未退订的小订作为“留存小订”（intention_refund_time 为空，或 intention_refund_time &gt; endday）。"
+        "这里 endday 指预售结束日当天结束时刻（等价于 intention_refund_time &gt;= end+1 的 00:00）。"
+        "统计这些留存小订在上市后窗口 endday~min(endday+30, finish) 的锁单（lock_time 非空，order_number 去重），并按日期做累计，得到累计转化率曲线。"
+        "其中 CM0 上市日特殊处理：endday=end+1。</p>"
+    )
+    html_content.append("</div>")
+    if retained_conv_curve_df is None or retained_conv_curve_df.empty:
+        html_content.append("<p>⚠️ 留存小订转化率明细为空（可能缺少 time_periods.start/end 或无留存小订）。</p>")
+    else:
+        fig4 = _render_retained_conversion_rate_line_figure(
+            retained_conv_curve_df,
+            target_groups,
+            fig_title="留存小订转化率：上市后30日累计（series_group_logic）",
+        )
+        html_content.append(pio.to_html(fig4, full_html=False, include_plotlyjs=False))
+
+    html_content.append("<h3>2.5 留存小订退订率（series_group_logic）</h3>")
+    html_content.append("<div class='summary-box'>")
+    html_content.append(
+        "<p>口径：沿用 2.4 的“留存小订”定义作为基数（截至 endday 未退订的小订，"
+        "即 intention_refund_time 为空，或 intention_refund_time &gt; endday，"
+        "其中 endday 指预售结束日当天结束时刻）；"
+        "统计这些留存小订在上市后窗口 endday~min(endday+30, finish) 内发生退订（intention_refund_time 落在窗口内，order_number 去重）的累计数量，"
+        "累计退订率 = 累计退订数 / 留存小订数；未退订数 = 留存小订数 - 累计退订数。"
+        "其中 CM0 上市日特殊处理：endday=end+1。</p>"
+    )
+    html_content.append("</div>")
+    if retained_refund_curve_df is None or retained_refund_curve_df.empty:
+        html_content.append("<p>⚠️ 留存小订退订率明细为空（可能缺少 time_periods.start/end 或无留存小订）。</p>")
+    else:
+        fig5 = _render_retained_refund_rate_line_figure(
+            retained_refund_curve_df,
+            target_groups,
+            fig_title="留存小订退订率：上市后30日累计（series_group_logic）",
+        )
+        html_content.append(pio.to_html(fig5, full_html=False, include_plotlyjs=False))
 
     html_content.append("<h2>5. 订单结构</h2>")
     lock_lines: List[str] = []
@@ -1660,6 +1987,8 @@ def main() -> int:
     )
     listing_hourly_df = build_hourly_lock_counts(df, business_def, target_groups)
     listing_daily_df = build_daily_lock_counts(df, business_def, target_groups)
+    retained_conv_curve_df = build_retained_intention_conversion_curve(df, business_def, target_groups)
+    retained_refund_curve_df = build_retained_intention_refund_curve(df, business_def, target_groups)
     listing_summary_df = build_listing_summary(df, business_def, target_groups)
     model_mix_df = build_model_mix(df, business_def, target_groups, staff_orders)
     config_version_df = build_configuration_version_summary(df, business_def, target_groups, config_long_df, staff_orders)
@@ -1674,6 +2003,8 @@ def main() -> int:
         ls8_projection_note,
         listing_hourly_df,
         listing_daily_df,
+        retained_conv_curve_df,
+        retained_refund_curve_df,
         listing_summary_df,
         model_mix_df,
         config_version_df,
