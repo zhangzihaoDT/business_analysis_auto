@@ -5,6 +5,7 @@ import re
 import subprocess
 import os
 import sys
+import argparse
 from pathlib import Path
 
 def parse_sql_condition(df, condition_str):
@@ -115,7 +116,7 @@ def read_tableau_csv(csv_file, min_columns=2):
             continue
     return None
 
-def main():
+def main(force: bool = False):
     tableau_url = "https://tableau-hs.immotors.com/#/views/17/config_attribute"
     wheel_url = "https://tableau-hs.immotors.com/#/views/17/wheel"
     
@@ -135,13 +136,13 @@ def main():
     business_def_path = Path("/Users/zihao_/Documents/github/26W06_Tool_calls/schema/business_definition.json")
 
     # 1. Fetch raw data for 2026
-    if not config_csv_path_2026.exists():
+    if force or not config_csv_path_2026.exists():
         success = fetch_tableau_data(tableau_url, str(config_csv_path_2026))
         if not success:
             print("❌ 无法获取 Tableau 数据，请检查权限或网络。")
             return
 
-    if not wheel_csv_path_2026.exists():
+    if force or not wheel_csv_path_2026.exists():
         success = fetch_tableau_data(wheel_url, str(wheel_csv_path_2026))
         if not success:
             print("⚠️ 无法获取 wheel 数据，将跳过轮毂补全。")
@@ -192,8 +193,51 @@ def main():
 
     if order_col_name and attr_col_name:
         print("正在解析 Attribute 列...")
-        # 仅保留订单号和属性列并去除空值
+        wheel_col_name = None
+        for c in ["Wheel", "[Wheel]", "wheel", "[wheel]"]:
+            if c in config_df.columns:
+                wheel_col_name = c
+                break
+        if wheel_col_name is None:
+            wheel_candidates = [
+                c
+                for c in config_df.columns
+                if ("wheel" in str(c).lower() or "轮毂" in str(c) or "轮辋" in str(c))
+                and c not in {attr_col_name, order_col_name}
+            ]
+            wheel_col_name = wheel_candidates[0] if wheel_candidates else None
+
+        is_staff_col_name = None
+        for c in config_df.columns:
+            if str(c).lower().replace(" ", "_") == "is_staff":
+                is_staff_col_name = c
+                break
+        staff_by_order = {}
+        if is_staff_col_name:
+            tmp_staff = config_df[[order_col_name, is_staff_col_name]].dropna(subset=[order_col_name]).copy()
+            s = tmp_staff[is_staff_col_name]
+            if pd.api.types.is_bool_dtype(s):
+                m_staff = s.fillna(False)
+            else:
+                s2 = s.astype("string").fillna("").str.strip().str.upper()
+                m_staff = s2.isin(["Y", "YES", "TRUE", "T", "1"])
+            tmp_staff["__is_staff_bool"] = m_staff
+            tmp_staff = tmp_staff.drop_duplicates(subset=[order_col_name], keep="last")
+            staff_by_order = tmp_staff.set_index(order_col_name)["__is_staff_bool"].to_dict()
+
         parsed_df = config_df[[order_col_name, attr_col_name]].dropna(subset=[attr_col_name, order_col_name]).copy()
+        orders_with_wheel = set()
+        wheel_long_df = pd.DataFrame()
+        if wheel_col_name:
+            wheel_src = config_df[[order_col_name, wheel_col_name]].dropna(subset=[order_col_name, wheel_col_name]).copy()
+            wheel_src[wheel_col_name] = wheel_src[wheel_col_name].astype(str).str.strip()
+            wheel_src = wheel_src[wheel_src[wheel_col_name].astype(str).str.len().gt(0)]
+            orders_with_wheel = set(wheel_src[order_col_name].dropna().astype(str))
+            wheel_long_df = wheel_src.rename(
+                columns={order_col_name: "Order Number", wheel_col_name: "value"}
+            ).copy()
+            wheel_long_df["Attribute"] = "轮毂"
+            wheel_long_df = wheel_long_df.loc[:, ["Order Number", "Attribute", "value"]]
         
         # 定义一个函数，使用正则精确提取键值对
         # 匹配模式：(非冒号逗号的字符) : (非逗号的字符)
@@ -221,8 +265,20 @@ def main():
             parsed_df = parsed_df.drop(columns=[attr_col_name])
         parsed_df = parsed_df.drop(columns=['kv_pairs'])
             
+        wheel_keys = {"轮毂", "轮辋", "轮圈"}
+        if orders_with_wheel:
+            m_drop_wheel = (
+                parsed_df["parsed_Attribute"].astype(str).str.strip().isin(wheel_keys)
+                & parsed_df[order_col_name].astype(str).isin(orders_with_wheel)
+            )
+            parsed_df = parsed_df.loc[~m_drop_wheel].copy()
+
         parsed_df = parsed_df.rename(columns={order_col_name: 'Order Number', 'parsed_Attribute': 'Attribute'})
-        config_df = parsed_df
+        config_df = parsed_df.loc[:, ["Order Number", "Attribute", "value"]].copy()
+        if not wheel_long_df.empty:
+            config_df = pd.concat([config_df, wheel_long_df], ignore_index=True)
+        if staff_by_order:
+            config_df["is_staff"] = config_df["Order Number"].astype(str).map(staff_by_order).astype("boolean")
         order_col_name = 'Order Number'
         print(f"✅ 解析完成，长表格式总行数: {len(config_df)}")
 
@@ -232,7 +288,13 @@ def main():
             wheel_cols = [c for c in wheel_df.columns if any(k in c.lower() for k in ["wheel", "rim", "轮毂", "轮辋"])]
             series_cols = [c for c in wheel_df.columns if "series" in c.lower()]
             
-            wheel_col = wheel_cols[0] if wheel_cols else None
+            wheel_col = None
+            for c in ["[Wheel]", "Wheel", "[wheel]", "wheel"]:
+                if c in wheel_df.columns:
+                    wheel_col = c
+                    break
+            if wheel_col is None:
+                wheel_col = wheel_cols[0] if wheel_cols else None
             series_col = series_cols[0] if series_cols else None
 
             if wheel_col:
@@ -243,6 +305,24 @@ def main():
                         wheel_candidates_by_series[series_name] = group[wheel_col].dropna().astype(str).str.strip().tolist()
                 
                 all_wheels = wheel_df[wheel_col].dropna().astype(str).str.strip().tolist()
+
+                def normalize_wheel_name(text: str) -> str:
+                    t = str(text).strip()
+                    t = t.replace("轮辋", "轮毂").replace("轮圈", "轮毂")
+                    t = t.replace("英寸", "")
+                    t = re.sub(r"[\"'′″“”‘’\s]", "", t)
+                    return t
+
+                def build_norm_best(cands):
+                    out = {}
+                    for x in cands:
+                        nx = normalize_wheel_name(x)
+                        if nx not in out or len(str(x)) > len(str(out[nx])):
+                            out[nx] = x
+                    return out
+
+                wheel_norm_best_by_series = {k: build_norm_best(v) for k, v in wheel_candidates_by_series.items()}
+                all_wheels_norm_best = build_norm_best(all_wheels)
                 
                 # 提前加载订单数据，用于获取每辆车的 series
                 print("正在加载业务定义和订单数据用于轮毂补全...")
@@ -277,9 +357,14 @@ def main():
                     
                     # 确定当前订单适用的候选集
                     candidates = wheel_candidates_by_series.get(s, all_wheels)
+                    norm_best = wheel_norm_best_by_series.get(s, all_wheels_norm_best)
                     
                     if v in candidates:
                         return v
+
+                    nv = normalize_wheel_name(v)
+                    if nv in norm_best:
+                        return norm_best[nv]
                         
                     # 尝试前缀匹配
                     matched = [x for x in candidates if x.startswith(v)]
@@ -287,6 +372,12 @@ def main():
                         return matched[0]
                     elif len(matched) > 1:
                         return max(matched, key=len)
+
+                    matched_norm = [x for x in candidates if normalize_wheel_name(x).startswith(nv) or nv.startswith(normalize_wheel_name(x))]
+                    if len(matched_norm) == 1:
+                        return matched_norm[0]
+                    elif len(matched_norm) > 1:
+                        return max(matched_norm, key=len)
                         
                     # 如果没有找到匹配，回退到全局匹配
                     if s in wheel_candidates_by_series:
@@ -295,6 +386,18 @@ def main():
                             return matched_global[0]
                         elif len(matched_global) > 1:
                             return max(matched_global, key=len)
+
+                        if nv in all_wheels_norm_best:
+                            return all_wheels_norm_best[nv]
+                        matched_global_norm = [
+                            x
+                            for x in all_wheels
+                            if normalize_wheel_name(x).startswith(nv) or nv.startswith(normalize_wheel_name(x))
+                        ]
+                        if len(matched_global_norm) == 1:
+                            return matched_global_norm[0]
+                        elif len(matched_global_norm) > 1:
+                            return max(matched_global_norm, key=len)
                             
                     return v
 
@@ -332,12 +435,16 @@ def main():
         order_df["intention_payment_time"] = pd.to_datetime(order_df["intention_payment_time"], errors="coerce")
     if not pd.api.types.is_datetime64_any_dtype(order_df["intention_refund_time"]):
         order_df["intention_refund_time"] = pd.to_datetime(order_df["intention_refund_time"], errors="coerce")
+    if "lock_time" in order_df.columns and not pd.api.types.is_datetime64_any_dtype(order_df["lock_time"]):
+        order_df["lock_time"] = pd.to_datetime(order_df["lock_time"], errors="coerce")
 
     target_models = ["CM0", "DM0", "CM1", "DM1", "CM2", "LS9", "LS8"]
     
-    print("\n" + "="*75)
-    print(f"{'车型':<8} | {'订单数':<10} | {'选配数':<10} | {'小订数':<10} | {'留存小订数':<12} | {'小订留存选配数':<12}")
-    print("-" * 75)
+    print("\n" + "=" * 100)
+    print(
+        f"{'车型':<8} | {'订单数':<10} | {'选配数':<10} | {'小订数':<10} | {'留存小订数':<12} | {'小订留存选配数':<14} | {'锁单选配数':<12}"
+    )
+    print("-" * 100)
 
     time_periods = business_def.get("time_periods", {})
 
@@ -388,14 +495,33 @@ def main():
         # 选配数 (总选配数) & 小订留存选配数
         if configured_orders:
             configured_count = df_model.loc[df_model["order_number"].astype(str).isin(configured_orders), "order_number"].nunique()
-            retained_configured_count = retention_orders.loc[retention_orders["order_number"].astype(str).isin(configured_orders), "order_number"].nunique()
+            retention_config_base = retention_orders
+            if "lock_time" in retention_config_base.columns:
+                retention_config_base = retention_config_base[retention_config_base["lock_time"].isna()]
+            retained_configured_count = retention_config_base.loc[
+                retention_config_base["order_number"].astype(str).isin(configured_orders),
+                "order_number",
+            ].nunique()
+            if "lock_time" in df_model.columns:
+                locked_configured_count = df_model.loc[
+                    df_model["lock_time"].notna() & df_model["order_number"].astype(str).isin(configured_orders),
+                    "order_number",
+                ].nunique()
+            else:
+                locked_configured_count = 0
         else:
             configured_count = 0
             retained_configured_count = 0
+            locked_configured_count = 0
             
-        print(f"{model:<10} | {total_orders:<13} | {configured_count:<10} | {small_orders_count:<13} | {retained_small_orders_count:<15} | {retained_configured_count:<15}")
+        print(
+            f"{model:<10} | {total_orders:<13} | {configured_count:<10} | {small_orders_count:<13} | {retained_small_orders_count:<15} | {retained_configured_count:<17} | {locked_configured_count:<14}"
+        )
     
-    print("="*75 + "\n")
+    print("=" * 100 + "\n")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true", help="强制从 Tableau 导出最新配置数据并覆盖本地文件")
+    args = parser.parse_args()
+    main(force=args.force)

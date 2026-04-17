@@ -160,11 +160,13 @@ def compute_launch_lock_metrics(df: pd.DataFrame, business_def: dict, today: pd.
     cm2_n_day_retention = 0
     ls9_n_day_retention = 0
     path_intention = 0
-    path_retained_deposit_conv = 0
     path_today_deposit_conv = 0
     path_today_deposit_unlocked = 0
     today_lock_count = 0
     today_user_car_lock_count = 0
+    today_order_type_empty_lock_count = 0
+    today_hq_store_lock_count = 0
+    presale_retained_intention_count = 0
 
     if target_launch is not None:
         today_excl = today + pd.Timedelta(days=1)
@@ -232,17 +234,31 @@ def compute_launch_lock_metrics(df: pd.DataFrame, business_def: dict, today: pd.
     end = start + pd.Timedelta(days=1)
     df_model = df[df["series_group_logic"].eq(target_model)].copy()
     if not df_model.empty:
+        time_periods = business_def.get("time_periods", {}) or {}
+        tp_target = time_periods.get(target_model, {}) or {}
+        presale_start = pd.to_datetime(tp_target.get("start"), errors="coerce")
+        presale_end = pd.to_datetime(tp_target.get("end"), errors="coerce")
+        presale_end_excl = presale_end + pd.Timedelta(days=1) if pd.notna(presale_end) else pd.NaT
+
         lock_mask = df_model["lock_time"].notna() & (df_model["lock_time"] >= start) & (df_model["lock_time"] < end)
         user_car_mask = df_model["order_type"] == "用户车"
         hq_mask = (df_model["store_city"].astype("string") == "拉萨市") & (
             df_model["store_name"].astype("string") == "总部主理店"
         )
         hq_mask = hq_mask.fillna(False)
-        user_lock_mask = lock_mask & user_car_mask & (~hq_mask)
         today_lock_count = int(df_model.loc[lock_mask, "order_number"].nunique())
-        today_user_car_lock_count = int(df_model.loc[user_lock_mask, "order_number"].nunique())
-        locked_user_car = df_model.loc[
-            user_lock_mask,
+        today_user_car_lock_count = int(df_model.loc[lock_mask & user_car_mask, "order_number"].nunique())
+
+        order_type_str = df_model["order_type"].astype("string")
+        empty_order_type_mask = df_model["order_type"].isna() | (order_type_str.str.strip() == "")
+        empty_order_type_mask = empty_order_type_mask.fillna(False)
+        today_order_type_empty_lock_count = int(df_model.loc[lock_mask & empty_order_type_mask, "order_number"].nunique())
+
+        hq_store_mask = (df_model["store_name"].astype("string") == "总部主理店").fillna(False)
+        today_hq_store_lock_count = int(df_model.loc[lock_mask & hq_store_mask, "order_number"].nunique())
+
+        locked_today = df_model.loc[
+            lock_mask,
             [
                 "order_number",
                 "intention_payment_time",
@@ -251,18 +267,26 @@ def compute_launch_lock_metrics(df: pd.DataFrame, business_def: dict, today: pd.
                 "lock_time",
             ],
         ]
-        if not locked_user_car.empty:
-            cond_intention = locked_user_car["intention_payment_time"].notna() & (
-                locked_user_car["intention_refund_time"].isna()
-                | (locked_user_car["intention_refund_time"] > locked_user_car["lock_time"])
+        if pd.notna(presale_start) and pd.notna(presale_end_excl):
+            retained_intention = (
+                df_model["intention_payment_time"].notna()
+                & (df_model["intention_payment_time"] >= presale_start)
+                & (df_model["intention_payment_time"] < presale_end_excl)
+                & (df_model["intention_refund_time"].isna())
+                & (df_model["deposit_refund_time"].isna())
+                & (df_model["lock_time"].isna())
+                & (df_model["deposit_payment_time"].isna())
             )
-            cond_deposit = (~cond_intention) & locked_user_car["deposit_payment_time"].notna()
-            locked_deposit = locked_user_car[cond_deposit]
+            presale_retained_intention_count = int(df_model.loc[retained_intention, "order_number"].nunique())
+        if not locked_today.empty:
+            cond_intention = locked_today["intention_payment_time"].notna() & (
+                locked_today["intention_refund_time"].isna()
+                | (locked_today["intention_refund_time"] > locked_today["lock_time"])
+            )
+            cond_deposit = (~cond_intention) & locked_today["deposit_payment_time"].notna()
+            locked_deposit = locked_today[cond_deposit]
 
-            path_intention = int(locked_user_car.loc[cond_intention, "order_number"].nunique())
-            path_retained_deposit_conv = int(
-                locked_deposit.loc[locked_deposit["deposit_payment_time"] < start, "order_number"].nunique()
-            )
+            path_intention = int(locked_today.loc[cond_intention, "order_number"].nunique())
             path_today_deposit_conv = int(
                 locked_deposit.loc[
                     (locked_deposit["deposit_payment_time"] >= start) & (locked_deposit["deposit_payment_time"] < end),
@@ -271,9 +295,7 @@ def compute_launch_lock_metrics(df: pd.DataFrame, business_def: dict, today: pd.
             )
 
         historic_deposit = (
-            user_car_mask
-            & (~hq_mask)
-            & df_model["deposit_payment_time"].notna()
+            df_model["deposit_payment_time"].notna()
             & (df_model["deposit_payment_time"] >= start)
             & (df_model["deposit_payment_time"] < end)
         )
@@ -309,8 +331,10 @@ def compute_launch_lock_metrics(df: pd.DataFrame, business_def: dict, today: pd.
         ),
         "today_lock_count": today_lock_count,
         "today_user_car_lock_count": today_user_car_lock_count,
+        "today_order_type_empty_lock_count": today_order_type_empty_lock_count,
+        "today_hq_store_lock_count": today_hq_store_lock_count,
+        "presale_retained_intention_count": presale_retained_intention_count,
         "path_intention": path_intention,
-        "path_retained_deposit_conv": path_retained_deposit_conv,
         "path_today_deposit_conv": path_today_deposit_conv,
         "path_today_deposit_unlocked": path_today_deposit_unlocked,
     }
@@ -327,14 +351,16 @@ def build_feishu_card(metrics: dict) -> dict:
 
     lines.append("")
     lines.append(f"**锁单数：** {metrics['today_lock_count']}")
-    lines.append(f"**锁单数（order_type =用户车&非总部）：** {metrics['today_user_car_lock_count']}")
+    lines.append(f"- 锁单数（order_type =用户车）： {metrics['today_user_car_lock_count']}")
+    lines.append(f"- 锁单数（order_type 为空）： {metrics['today_order_type_empty_lock_count']}")
+    lines.append(f"- 锁单数（storename=总部主理店）： {metrics['today_hq_store_lock_count']}")
 
     lines.append("")
     lines.append("**锁单路径盘点：**")
     lines.append(f"- 留存小订转化：{metrics['path_intention']}")
-    lines.append(f"- 留存大定转化：{metrics['path_retained_deposit_conv']}")
     lines.append(f"- 当日大定转化：{metrics['path_today_deposit_conv']}")
     lines.append(f"- 当日大定留存：{metrics['path_today_deposit_unlocked']}")
+    lines.append(f"- 留存小订数：{metrics['presale_retained_intention_count']}")
 
     lines.append("")
     lines.append(f"**{target_model} 当前累计锁单数：** {metrics['target_cum']}")
@@ -361,7 +387,7 @@ def build_feishu_card(metrics: dict) -> dict:
         "msg_type": "interactive",
         "card": {
             "header": {
-                "title": {"tag": "plain_text", "content": f"📈 {target_model} 上市锁单监控（{display_date}）"},
+                "title": {"tag": "plain_text", "content": f"📈 {target_model} 上市锁单监控（{metrics['today']}）"},
                 "template": "blue",
             },
             "elements": [

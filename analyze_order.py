@@ -4,8 +4,7 @@
 
 功能：
 1. 分析各车型预售期小订数据（每小时小订数、预售周期日小订数）
-2. 分析各车型上市期锁单数据（每小时锁单数）
-3. 生成HTML可视化报告
+2. 生成HTML可视化报告
 
 使用规则：
 1. 基本用法（分析所有车型）：
@@ -40,9 +39,7 @@
    1.7 可视化（series_group_logic × buyer_age：年龄占比折线图）
    1.8 IMADS 配置分布（Attribute Name × Value Dispaly Name × parent_region_name）
 
-2. 上市期分析
-   2.1 汇总表（上市日期锁单数统计）
-   2.2 可视化（上市日期每小时锁单数）
+2. 上市期分析已拆分至独立脚本：scripts/analyze_order_launch.py
 
 输出：
 - 默认：scripts/reports/analyze_order.html
@@ -1866,8 +1863,6 @@ def render_report(
     presale_retention_buyer_age_df: pd.DataFrame,
     imads_dist_df: pd.DataFrame,
     config_option_df: pd.DataFrame,
-    listing_hourly_df: pd.DataFrame,
-    listing_summary_df: pd.DataFrame,
     target_groups: List[str],
 ) -> str:
     css = """
@@ -2160,50 +2155,6 @@ def render_report(
                         float_format=lambda x: "{:,.0f}".format(x) if isinstance(x, (int, float)) else x,
                     )
                 )
-
-    html_content.append("<h2>2. 上市期每小时锁单数（按 series_group_logic）</h2>")
-    html_content.append("<div class='summary-box'>")
-    html_content.append(
-        "<p>口径：先用业务定义 series_group_logic 根据 product_name 对订单归类；然后对每个 series_group_logic 使用业务定义 time_periods 中的 end 日期（上市日期），统计该日期内每小时锁单数（lock_time 非空的 order_number 去重计数）。</p>"
-    )
-    html_content.append("</div>")
-
-    html_content.append("<h3>2.1 汇总</h3>")
-    if listing_summary_df is None or listing_summary_df.empty:
-        html_content.append("<p>⚠️ 汇总表为空（可能缺少 time_periods 的 end/finish 或分组无数据）。</p>")
-    else:
-        html_content.append(
-            listing_summary_df.to_html(
-                index=False,
-                classes="table",
-                escape=False,
-                float_format=lambda x: "{:,.0f}".format(x) if isinstance(x, (int, float)) else x,
-            )
-        )
-        html_content.append(
-            "<div class='summary-box'>"
-            "<p><b>备注</b></p>"
-            "<ul>"
-            "<li>上市日期：业务定义 time_periods 中的 end_date；其中 CM0 特殊处理：上市日期取 end_date + 1（事故）</li>"
-            "<li>峰值小时锁单数：取上市当日每小时锁单数的峰值小时</li>"
-            "<li>峰值后第二小时锁单数：取峰值小时后的第二个小时（peak_hour + 1）</li>"
-            "<li>第一个周末锁单数：取 endday 后第一个双休日（周六+周日）两日求和（不超过 finish day）</li>"
-            "<li>上市后30日累计锁单数：endday ~ endday+30 的累计求和，且不超过 finish day</li>"
-            "</ul>"
-            "</div>"
-        )
-
-    html_content.append("<h3>2.2 可视化</h3>")
-    fig2 = _render_hourly_bar_figure(
-        listing_hourly_df,
-        target_groups,
-        date_col="end_date",
-        value_col="lock_orders",
-        fig_title="上市日期每小时锁单数（series_group_logic）",
-        y_title="Lock Orders",
-        subplot_date_label="上市日期",
-    )
-    html_content.append(pio.to_html(fig2, full_html=False, include_plotlyjs="cdn"))
     html_content.append("</body></html>")
     return "\n".join(html_content)
 import subprocess
@@ -2227,7 +2178,7 @@ def run_configuration_workflow(update_data: bool):
         sys.exit(1)
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="生成车型预售/上市分析报告")
+    parser = argparse.ArgumentParser(description="生成车型预售分析报告")
     parser.add_argument(
         "--models",
         type=str,
@@ -2286,8 +2237,6 @@ def main() -> int:
     imads_dist_df = build_imads_op_steer_region_summary(df, business_def, target_groups, df_imads)
     df_transposed = load_transposed_configuration_data(CONFIG_ATTRIBUTE_FILE)
     config_option_df = build_transposed_configuration_option_summary(df, business_def, target_groups, df_transposed)
-    listing_hourly_df = build_hourly_lock_counts(df, business_def, target_groups)
-    listing_summary_df = build_listing_summary(df, business_def, target_groups)
 
     html = render_report(
         presale_hourly_df,
@@ -2301,8 +2250,6 @@ def main() -> int:
         presale_retention_buyer_age_df,
         imads_dist_df,
         config_option_df,
-        listing_hourly_df,
-        listing_summary_df,
         target_groups,
     )
 
