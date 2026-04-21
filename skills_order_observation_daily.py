@@ -6,7 +6,7 @@
 功能：
 1. 读取 order_data.parquet 数据
 2. 计算昨日（T-1）的锁单数
-3. 统计指定车型（CM2, DM1, LS9）的锁单情况
+3. 统计指定车型（CM2, DM1, LS8, LS9）的锁单情况
 4. 发送飞书通知
 """
 
@@ -28,7 +28,7 @@ load_dotenv()
 PARQUET_FILE = "/Users/zihao_/Documents/coding/dataset/formatted/order_data.parquet"
 BUSINESS_DEF_FILE = Path("/Users/zihao_/Documents/github/26W06_Tool_calls/schema/business_definition.json")
 # 适配新数据集的 series 值：CM2->LS6, DM1->L6
-TARGET_MODELS = ["LS6", "L6", "LS9"]
+TARGET_MODELS = ["LS6", "L6", "LS8", "LS9"]
 WEBHOOK_URL = os.getenv("FS_WEBHOOK_URL")
 
 def parse_arguments():
@@ -37,6 +37,7 @@ def parse_arguments():
     parser.add_argument('--start', type=str, help='开始日期 (YYYY-MM-DD)')
     parser.add_argument('--end', type=str, help='结束日期 (YYYY-MM-DD)')
     parser.add_argument('--mtd', action='store_true', help='当月1日累计至今')
+    parser.add_argument('--dry-run', action='store_true', help='仅输出统计结果，不发送飞书通知')
     
     # 预处理 sys.argv 以支持 -N 这种非标准参数
     days_back = 1  # 默认昨天
@@ -73,7 +74,7 @@ def parse_arguments():
         start_date = datetime.now().date() - timedelta(days=days_back)
         end_date = datetime.now().date() - timedelta(days=1)
     
-    return start_date, end_date
+    return start_date, end_date, args.dry_run
 
 def load_business_definition(file_path):
     """加载业务定义文件"""
@@ -360,7 +361,7 @@ def send_feishu_notification(lock_stats, invoice_stats):
 
 def main():
     # 0. 解析参数
-    start_date, end_date = parse_arguments()
+    start_date, end_date, dry_run = parse_arguments()
     
     # 1. 加载数据
     df = load_data(PARQUET_FILE)
@@ -404,7 +405,9 @@ def main():
             print(f"   - {model}: {info['count']} ({info['user_car_count']}) 台｜平均开票价格：{price_display}")
         print("="*30 + "\n")
 
-        # 3. 发送飞书通知
+        if dry_run:
+            print("🧪 dry-run: 已跳过飞书通知发送")
+            return
         send_feishu_notification(lock_stats, invoice_stats)
 
 if __name__ == "__main__":

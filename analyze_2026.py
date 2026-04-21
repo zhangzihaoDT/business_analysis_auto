@@ -6,13 +6,25 @@ import json
 import re
 import plotly.graph_objects as go
 import plotly.io as pio
-import statsmodels.api as sm
+try:
+    import statsmodels.api as sm
+except ModuleNotFoundError:
+    sm = None
 
-PARQUET_FILE = Path("/Users/zihao_/Documents/coding/dataset/formatted/order_full_data.parquet")
+PARQUET_FILE = Path("/Users/zihao_/Documents/coding/dataset/formatted/order_data.parquet")
 BUSINESS_DEF_FILE = Path("/Users/zihao_/Documents/github/W52_reasoning/world/business_definition.json")
 # Use script directory to determine output path
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_OUTPUT = SCRIPT_DIR / "reports/review_2026.html"
+
+def safe_lowess(y, x, frac=0.2):
+    if sm is not None:
+        return sm.nonparametric.lowess(y, x, frac=frac)
+    window = max(3, int(len(y) * frac))
+    if window % 2 == 0:
+        window += 1
+    y_smooth = pd.Series(y).rolling(window=window, center=True, min_periods=1).mean().to_numpy()
+    return np.column_stack([x, y_smooth])
 
 def load_business_definition(file_path: Path) -> dict:
     """加载业务定义文件"""
@@ -979,21 +991,22 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
     # 17. 用户画像 (User Profile) - Module 7.1
     # ==========================================
     try:
+        target_series = ["L6", "LS6", "LS9"]
+
         # 7.1 Age Structure
         # Filter valid age (18-100) and Lock Orders
-        if 'age' in df.columns:
-            valid_age_mask = (df['age'] >= 18) & (df['age'] <= 100)
+        if 'owner_age' in df.columns:
+            valid_age_mask = (df['owner_age'] >= 18) & (df['owner_age'] <= 100)
             
             # Helper to calculate mean age
             def calc_mean_age(mask):
                 valid_data = df[mask & valid_age_mask]
                 if valid_data.empty:
                     return 0.0
-                return valid_data['age'].mean()
+                return valid_data['owner_age'].mean()
 
             # 7.1.1 By Series
             age_series_stats = []
-            target_series = ["L6", "LS6", "LS9"]
             
             for s in target_series:
                 series_mask = df['series'] == s
@@ -1083,7 +1096,7 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
                     mask = series_mask & get_metric_mask("留存锁单数", year)
                     
                     # Also need valid age
-                    valid_age_mask = (df['age'] >= 18) & (df['age'] <= 100)
+                    valid_age_mask = (df['owner_age'] >= 18) & (df['owner_age'] <= 100)
                     final_mask = mask & valid_age_mask
                     
                     data = df[final_mask].copy()
@@ -1099,7 +1112,7 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
                     data['doy'] = data['lock_time'].dt.dayofyear
                     
                     # Calculate mean age per day
-                    daily_avg = data.groupby('doy')['age'].mean()
+                    daily_avg = data.groupby('doy')['owner_age'].mean()
                     
                     age_trends[s][year] = daily_avg
             
@@ -1112,6 +1125,13 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
             # 1. By Series (LS6, L6, LS9)
             # 2. By Region (parent_region_name)
             
+        gender_col = None
+        if 'owner_gender' in df.columns:
+            gender_col = 'owner_gender'
+        elif 'ownergender' in df.columns:
+            gender_col = 'ownergender'
+
+        if gender_col is not None:
             gender_stats = {'series': {}, 'region': {}}
             
             # Helper to standardize gender and filter Unknown
@@ -1135,8 +1155,8 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
                 data_2025 = df[mask_2025].copy()
                 data_2026 = df[mask_2026].copy()
                 
-                data_2025['std_gender'] = data_2025['gender'].apply(standardize_gender)
-                data_2026['std_gender'] = data_2026['gender'].apply(standardize_gender)
+                data_2025['std_gender'] = data_2025[gender_col].apply(standardize_gender)
+                data_2026['std_gender'] = data_2026[gender_col].apply(standardize_gender)
                 
                 # Filter out Unknown/None
                 data_2025 = data_2025.dropna(subset=['std_gender'])
@@ -1192,8 +1212,8 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
                     data_2025 = df[mask_2025].copy()
                     data_2026 = df[mask_2026].copy()
                     
-                    data_2025['std_gender'] = data_2025['gender'].apply(standardize_gender)
-                    data_2026['std_gender'] = data_2026['gender'].apply(standardize_gender)
+                    data_2025['std_gender'] = data_2025[gender_col].apply(standardize_gender)
+                    data_2026['std_gender'] = data_2026[gender_col].apply(standardize_gender)
                     
                     # Filter out Unknown/None
                     data_2025 = data_2025.dropna(subset=['std_gender'])
@@ -2009,7 +2029,7 @@ def generate_html(metrics: dict, output_file: Path):
             def calculate_lowess(y_values, frac=0.2):
                 # statsmodels lowess returns (x, y) sorted by x
                 # We need to map it back or just use the returned y since our x is sorted
-                smoothed = sm.nonparametric.lowess(y_values, x_numeric, frac=frac)
+                smoothed = safe_lowess(y_values, x_numeric, frac=frac)
                 return smoothed[:, 1] # Return Y values
             
             # Calculate smoothed lines
@@ -2023,7 +2043,7 @@ def generate_html(metrics: dict, output_file: Path):
                 # Re-calculate x for valid points
                 x_valid = x_numeric[mask_30d]
                 y_valid = df_trend['rate_30d'][mask_30d].values
-                y_smooth_30d = sm.nonparametric.lowess(y_valid, x_valid, frac=0.2)[:, 1]
+                y_smooth_30d = safe_lowess(y_valid, x_valid, frac=0.2)[:, 1]
                 x_smooth_30d = df_trend.index[mask_30d]
             else:
                 y_smooth_30d = []
@@ -2034,7 +2054,7 @@ def generate_html(metrics: dict, output_file: Path):
             if mask_98d.sum() > 10:
                 x_valid = x_numeric[mask_98d]
                 y_valid = df_trend['rate_98d'][mask_98d].values
-                y_smooth_98d = sm.nonparametric.lowess(y_valid, x_valid, frac=0.2)[:, 1]
+                y_smooth_98d = safe_lowess(y_valid, x_valid, frac=0.2)[:, 1]
                 x_smooth_98d = df_trend.index[mask_98d]
             else:
                 y_smooth_98d = []
@@ -2446,7 +2466,7 @@ def generate_html(metrics: dict, output_file: Path):
             # Filter NaNs for smoothing
             mask = ~np.isnan(avg_per_store)
             if mask.sum() > 10:
-                y_smooth = sm.nonparametric.lowess(avg_per_store[mask], x_numeric[mask], frac=0.1)[:, 1]
+                y_smooth = safe_lowess(avg_per_store[mask], x_numeric[mask], frac=0.1)[:, 1]
                 x_smooth = s_active_year.index[mask]
             else:
                 y_smooth = []
@@ -2537,7 +2557,7 @@ def generate_html(metrics: dict, output_file: Path):
                 mask = ~np.isnan(avg_per_store)
                 
                 if mask.sum() > 10:
-                    y_smooth = sm.nonparametric.lowess(avg_per_store[mask], x_numeric[mask], frac=0.1)[:, 1]
+                    y_smooth = safe_lowess(avg_per_store[mask], x_numeric[mask], frac=0.1)[:, 1]
                     x_smooth = s_active_year.index[mask]
                 else:
                     y_smooth = []
@@ -2617,7 +2637,7 @@ def generate_html(metrics: dict, output_file: Path):
             mask = ~np.isnan(avg_per_store)
             
             if mask.sum() > 10:
-                y_smooth = sm.nonparametric.lowess(avg_per_store[mask], x_numeric[mask], frac=0.1)[:, 1]
+                y_smooth = safe_lowess(avg_per_store[mask], x_numeric[mask], frac=0.1)[:, 1]
                 x_smooth = s_active_year.index[mask]
             else:
                 y_smooth = []
@@ -2979,128 +2999,111 @@ def generate_html(metrics: dict, output_file: Path):
     # ==========================================
     # 7. 用户画像 (User Profile)
     # ==========================================
-    if 'age_series_stats' in metrics or 'age_region_stats' in metrics:
+    if 'age_series_stats' in metrics or 'age_region_stats' in metrics or 'age_trends' in metrics or 'gender_stats' in metrics:
         html_content.append("<h2>7. 用户画像 (User Profile)</h2>")
         
-        # 7.1 Age Structure
-        html_content.append("<h3>7.1 年龄结构 (Age Structure)</h3>")
-        html_content.append("<p>统计口径：基于留存锁单数据 (Retained Lock Orders，即不包含任何已退订订单)，年龄范围过滤 [18, 100]。</p>")
-        
-        # 7.1.1 By Series
-        if 'age_series_stats' in metrics:
-            html_content.append("<h4>7.1.1 分车型平均年龄 (Average Age by Series)</h4>")
-            df_table = metrics['age_series_stats']
-            html_content.append(df_table.to_html(index=False, classes='table', escape=False, float_format=lambda x: '{:,.1f}'.format(x) if isinstance(x, (int, float)) else x))
+        if 'age_series_stats' in metrics or 'age_region_stats' in metrics or 'age_trends' in metrics:
+            html_content.append("<h3>7.1 年龄结构 (Age Structure)</h3>")
+            html_content.append("<p>统计口径：基于留存锁单数据 (Retained Lock Orders，即不包含任何已退订订单)，年龄范围过滤 [18, 100]。</p>")
             
-        # 7.1.2 By Parent Region
-        if 'age_region_stats' in metrics:
-            html_content.append("<h4>7.1.2 分大区平均年龄 (Average Age by Region)</h4>")
-            df_table = metrics['age_region_stats']
-            html_content.append(df_table.to_html(index=False, classes='table', escape=False, float_format=lambda x: '{:,.1f}'.format(x) if isinstance(x, (int, float)) else x))
-
-        # 7.2 Age Trends
-        if 'age_trends' in metrics:
-            html_content.append("<h3>7.2 年龄趋势 (Age Trends)</h3>")
-            html_content.append("<p>展示每日平均年龄走势 (Day of Year 对齐)。包含：<br>1. 每日散点 (Daily)<br>2. 7日移动平均 (MA7)<br>3. LOWESS 平滑趋势线</p>")
-            
-            age_trends = metrics['age_trends']
-            # Series: LS6, L6, LS9
-            target_series = ["L6", "LS6", "LS9"] # Align order with previous sections if possible, or just iterate dict
-            
-            for s in target_series:
-                if s not in age_trends:
-                    continue
-                    
-                fig = go.Figure()
+            if 'age_series_stats' in metrics:
+                html_content.append("<h4>7.1.1 分车型平均年龄 (Average Age by Series)</h4>")
+                df_table = metrics['age_series_stats']
+                html_content.append(df_table.to_html(index=False, classes='table', escape=False, float_format=lambda x: '{:,.1f}'.format(x) if isinstance(x, (int, float)) else x))
                 
-                # Colors
-                color_2025 = '#95a5a6' # Gray
-                color_2026 = '#3498db' # Blue
-                
-                # 2025
-                data_2025 = age_trends[s][2025]
-                if not data_2025.empty:
-                    # Sort by index (doy)
-                    data_2025 = data_2025.sort_index()
-                    x_2025 = data_2025.index
-                    y_2025 = data_2025.values
-                    
-                    # 1. Scatter (Raw)
-                    fig.add_trace(go.Scatter(
-                        x=x_2025, y=y_2025,
-                        mode='markers',
-                        name='2025 Daily',
-                        marker=dict(color=color_2025, size=4, opacity=0.3),
-                        showlegend=False
-                    ))
-                    
-                    # 2. MA7
-                    ma7_2025 = data_2025.rolling(window=7, min_periods=1).mean()
-                    fig.add_trace(go.Scatter(
-                        x=ma7_2025.index, y=ma7_2025.values,
-                        mode='lines',
-                        name='2025 MA7',
-                        line=dict(color=color_2025, width=2),
-                        opacity=0.8
-                    ))
-                    
-                    # 3. LOWESS
-                    # frac=0.2 means using 20% of data for smoothing window
-                    lowess_2025 = sm.nonparametric.lowess(y_2025, x_2025, frac=0.2)
-                    fig.add_trace(go.Scatter(
-                        x=lowess_2025[:, 0], y=lowess_2025[:, 1],
-                        mode='lines',
-                        name='2025 LOWESS',
-                        line=dict(color=color_2025, width=3, dash='dash'),
-                    ))
+            if 'age_region_stats' in metrics:
+                html_content.append("<h4>7.1.2 分大区平均年龄 (Average Age by Region)</h4>")
+                df_table = metrics['age_region_stats']
+                html_content.append(df_table.to_html(index=False, classes='table', escape=False, float_format=lambda x: '{:,.1f}'.format(x) if isinstance(x, (int, float)) else x))
 
-                # 2026
-                data_2026 = age_trends[s][2026]
-                if not data_2026.empty:
-                    # Sort by index
-                    data_2026 = data_2026.sort_index()
-                    x_2026 = data_2026.index
-                    y_2026 = data_2026.values
-                    
-                    # 1. Scatter (Raw)
-                    fig.add_trace(go.Scatter(
-                        x=x_2026, y=y_2026,
-                        mode='markers',
-                        name='2026 Daily',
-                        marker=dict(color=color_2026, size=4, opacity=0.3),
-                        showlegend=False
-                    ))
-                    
-                    # 2. MA7
-                    ma7_2026 = data_2026.rolling(window=7, min_periods=1).mean()
-                    fig.add_trace(go.Scatter(
-                        x=ma7_2026.index, y=ma7_2026.values,
-                        mode='lines',
-                        name='2026 MA7',
-                        line=dict(color=color_2026, width=2),
-                        opacity=0.8
-                    ))
-                    
-                    # 3. LOWESS
-                    lowess_2026 = sm.nonparametric.lowess(y_2026, x_2026, frac=0.2)
-                    fig.add_trace(go.Scatter(
-                        x=lowess_2026[:, 0], y=lowess_2026[:, 1],
-                        mode='lines',
-                        name='2026 LOWESS',
-                        line=dict(color=color_2026, width=3, dash='dash'),
-                    ))
-
-                layout = get_common_layout(
-                    title=f"7.2 {s} 平均年龄趋势 (Average Age Trend)",
-                    xaxis_title="Day of Year",
-                    yaxis_title="Average Age"
-                )
-                layout['xaxis']['range'] = [1, 366]
-                # Auto Y-axis should be fine, or strictly [20, 50]? Auto is better for detail.
-                fig.update_layout(layout)
+            if 'age_trends' in metrics:
+                html_content.append("<h3>7.2 年龄趋势 (Age Trends)</h3>")
+                html_content.append("<p>展示每日平均年龄走势 (Day of Year 对齐)。包含：<br>1. 每日散点 (Daily)<br>2. 7日移动平均 (MA7)<br>3. LOWESS 平滑趋势线</p>")
                 
-                chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
-                html_content.append(chart_html)
+                age_trends = metrics['age_trends']
+                target_series = ["L6", "LS6", "LS9"]
+                
+                for s in target_series:
+                    if s not in age_trends:
+                        continue
+                        
+                    fig = go.Figure()
+                    
+                    color_2025 = '#95a5a6'
+                    color_2026 = '#3498db'
+                    
+                    data_2025 = age_trends[s][2025]
+                    if not data_2025.empty:
+                        data_2025 = data_2025.sort_index()
+                        x_2025 = data_2025.index
+                        y_2025 = data_2025.values
+                        
+                        fig.add_trace(go.Scatter(
+                            x=x_2025, y=y_2025,
+                            mode='markers',
+                            name='2025 Daily',
+                            marker=dict(color=color_2025, size=4, opacity=0.3),
+                            showlegend=False
+                        ))
+                        
+                        ma7_2025 = data_2025.rolling(window=7, min_periods=1).mean()
+                        fig.add_trace(go.Scatter(
+                            x=ma7_2025.index, y=ma7_2025.values,
+                            mode='lines',
+                            name='2025 MA7',
+                            line=dict(color=color_2025, width=2),
+                            opacity=0.8
+                        ))
+                        
+                        lowess_2025 = safe_lowess(y_2025, x_2025, frac=0.2)
+                        fig.add_trace(go.Scatter(
+                            x=lowess_2025[:, 0], y=lowess_2025[:, 1],
+                            mode='lines',
+                            name='2025 LOWESS',
+                            line=dict(color=color_2025, width=3, dash='dash'),
+                        ))
+
+                    data_2026 = age_trends[s][2026]
+                    if not data_2026.empty:
+                        data_2026 = data_2026.sort_index()
+                        x_2026 = data_2026.index
+                        y_2026 = data_2026.values
+                        
+                        fig.add_trace(go.Scatter(
+                            x=x_2026, y=y_2026,
+                            mode='markers',
+                            name='2026 Daily',
+                            marker=dict(color=color_2026, size=4, opacity=0.3),
+                            showlegend=False
+                        ))
+                        
+                        ma7_2026 = data_2026.rolling(window=7, min_periods=1).mean()
+                        fig.add_trace(go.Scatter(
+                            x=ma7_2026.index, y=ma7_2026.values,
+                            mode='lines',
+                            name='2026 MA7',
+                            line=dict(color=color_2026, width=2),
+                            opacity=0.8
+                        ))
+                        
+                        lowess_2026 = safe_lowess(y_2026, x_2026, frac=0.2)
+                        fig.add_trace(go.Scatter(
+                            x=lowess_2026[:, 0], y=lowess_2026[:, 1],
+                            mode='lines',
+                            name='2026 LOWESS',
+                            line=dict(color=color_2026, width=3, dash='dash'),
+                        ))
+
+                    layout = get_common_layout(
+                        title=f"7.2 {s} 平均年龄趋势 (Average Age Trend)",
+                        xaxis_title="Day of Year",
+                        yaxis_title="Average Age"
+                    )
+                    layout['xaxis']['range'] = [1, 366]
+                    fig.update_layout(layout)
+                    
+                    chart_html = pio.to_html(fig, full_html=False, include_plotlyjs='cdn')
+                    html_content.append(chart_html)
 
         # 7.3 Gender Structure
         if 'gender_stats' in metrics:

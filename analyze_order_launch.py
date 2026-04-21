@@ -174,6 +174,20 @@ def build_presale_retention_summary(df: pd.DataFrame, business_def: dict, target
     time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
     rows: List[Dict[str, object]] = []
 
+    today_ts = pd.Timestamp(datetime.now().date())
+    today_excl = today_ts + pd.Timedelta(days=1)
+    listing_days: List[pd.Timestamp] = []
+    for g in target_groups:
+        end_str = (time_periods.get(g, {}) or {}).get("end")
+        if not end_str:
+            continue
+        presale_end_day = pd.Timestamp(end_str)
+        listing_day = presale_end_day + pd.Timedelta(days=1) if g == "CM0" else presale_end_day
+        listing_days.append(listing_day)
+    max_listing_day = max(listing_days) if listing_days else pd.NaT
+    n_raw = int((today_ts.normalize() - max_listing_day.normalize()).days + 1) if pd.notna(max_listing_day) else 1
+    n = max(1, n_raw)
+
     for g in target_groups:
         tp = time_periods.get(g, {}) or {}
         start_str = tp.get("start")
@@ -191,6 +205,15 @@ def build_presale_retention_summary(df: pd.DataFrame, business_def: dict, target
         window_end_excl = presale_end_day + pd.Timedelta(days=1)
 
         finish_limit_excl = finish_day + pd.Timedelta(days=1)
+        lock_same_period_end_excl = min(listing_day + pd.Timedelta(days=n), finish_limit_excl, today_excl)
+        m_lock_same_period_total = (
+            df["series_group_logic"].eq(g)
+            & df["lock_time"].notna()
+            & (df["lock_time"] >= listing_day)
+            & (df["lock_time"] < lock_same_period_end_excl)
+        )
+        total_lock_same_period_cnt = int(df.loc[m_lock_same_period_total, "order_number"].dropna().nunique())
+
         lock_30d_end_excl = min(listing_day + pd.Timedelta(days=31), finish_limit_excl)
         m_lock_total = (
             df["series_group_logic"].eq(g)
@@ -214,6 +237,8 @@ def build_presale_retention_summary(df: pd.DataFrame, business_def: dict, target
                     "预售期": f"{start_day.date().isoformat()} ~ {presale_end_day.date().isoformat()}",
                     "预售周期（日）": presale_days,
                     "留存小订数": 0,
+                    "上市同期累计锁单数": total_lock_same_period_cnt,
+                    "上市同期累计留存小订转化数": 0,
                     "上市后30日锁单数": total_lock_30d_cnt,
                     "上市后30日留存小订转化数": 0,
                     "留存小订转化占比": "0.0%",
@@ -236,6 +261,15 @@ def build_presale_retention_summary(df: pd.DataFrame, business_def: dict, target
         )
         retained_lock_30d_cnt = int(retained.loc[m_lock_30d, "order_number"].nunique()) if retained_cnt > 0 else 0
 
+        m_lock_same_period = (
+            retained["lock_time"].notna()
+            & (retained["lock_time"] >= listing_day)
+            & (retained["lock_time"] < lock_same_period_end_excl)
+        )
+        retained_lock_same_period_cnt = (
+            int(retained.loc[m_lock_same_period, "order_number"].nunique()) if retained_cnt > 0 else 0
+        )
+
         rate = retained_lock_30d_cnt / float(retained_cnt) if retained_cnt > 0 else 0.0
         retained_lock_share = (
             retained_lock_30d_cnt / float(total_lock_30d_cnt) if total_lock_30d_cnt > 0 else 0.0
@@ -246,6 +280,8 @@ def build_presale_retention_summary(df: pd.DataFrame, business_def: dict, target
                 "预售期": f"{start_day.date().isoformat()} ~ {presale_end_day.date().isoformat()}",
                 "预售周期（日）": presale_days,
                 "留存小订数": retained_cnt,
+                "上市同期累计锁单数": total_lock_same_period_cnt,
+                "上市同期累计留存小订转化数": retained_lock_same_period_cnt,
                 "上市后30日锁单数": total_lock_30d_cnt,
                 "上市后30日留存小订转化数": retained_lock_30d_cnt,
                 "留存小订转化占比": f"{retained_lock_share:.1%}",
@@ -260,6 +296,8 @@ def build_presale_retention_summary(df: pd.DataFrame, business_def: dict, target
             "预售期",
             "预售周期（日）",
             "留存小订数",
+            "上市同期累计锁单数",
+            "上市同期累计留存小订转化数",
             "上市后30日锁单数",
             "上市后30日留存小订转化数",
             "留存小订转化占比",
@@ -951,6 +989,117 @@ def build_retained_intention_refund_curve(df: pd.DataFrame, business_def: dict, 
     return out
 
 
+def build_listing_daily_retained_intention_counts(
+    df: pd.DataFrame, business_def: dict, target_groups: List[str]
+) -> pd.DataFrame:
+    required_cols = [
+        "series_group_logic",
+        "order_number",
+        "intention_payment_time",
+        "intention_refund_time",
+        "deposit_payment_time",
+        "deposit_refund_time",
+        "lock_time",
+    ]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"数据缺少列: {', '.join(missing)}")
+
+    if not pd.api.types.is_datetime64_any_dtype(df["intention_payment_time"]):
+        df["intention_payment_time"] = pd.to_datetime(df["intention_payment_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["intention_refund_time"]):
+        df["intention_refund_time"] = pd.to_datetime(df["intention_refund_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["deposit_payment_time"]):
+        df["deposit_payment_time"] = pd.to_datetime(df["deposit_payment_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["deposit_refund_time"]):
+        df["deposit_refund_time"] = pd.to_datetime(df["deposit_refund_time"], errors="coerce")
+    if not pd.api.types.is_datetime64_any_dtype(df["lock_time"]):
+        df["lock_time"] = pd.to_datetime(df["lock_time"], errors="coerce")
+
+    time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
+    rows: List[Dict[str, object]] = []
+
+    for g in target_groups:
+        tp = time_periods.get(g, {}) or {}
+        start_str = tp.get("start")
+        end_str = tp.get("end")
+        finish_str = tp.get("finish")
+        if not start_str or not end_str:
+            continue
+
+        start_day = pd.Timestamp(start_str)
+        presale_end_day = pd.Timestamp(end_str)
+        listing_day = presale_end_day + pd.Timedelta(days=1) if g == "CM0" else presale_end_day
+        finish_day = pd.Timestamp(finish_str) if finish_str else listing_day
+
+        presale_end_excl = presale_end_day + pd.Timedelta(days=1)
+        finish_limit_excl = finish_day + pd.Timedelta(days=1)
+        after_30d_end_excl = min(listing_day + pd.Timedelta(days=31), finish_limit_excl)
+
+        date_index = pd.date_range(
+            start=listing_day.floor("D"),
+            end=(after_30d_end_excl - pd.Timedelta(days=1)).floor("D"),
+            freq="D",
+        )
+
+        m_presale = (
+            df["series_group_logic"].eq(g)
+            & df["intention_payment_time"].notna()
+            & (df["intention_payment_time"] >= start_day)
+            & (df["intention_payment_time"] < presale_end_excl)
+        )
+        df_presale = df.loc[
+            m_presale,
+            ["order_number", "intention_refund_time", "deposit_payment_time", "deposit_refund_time", "lock_time"],
+        ].copy()
+        df_presale["order_number"] = df_presale["order_number"].astype("string")
+        df_presale = df_presale.dropna(subset=["order_number"]).drop_duplicates(subset=["order_number"])
+
+        if df_presale.empty:
+            for d in date_index:
+                day_n = int((d.floor("D") - listing_day.floor("D")).days)
+                rows.append(
+                    {
+                        "series_group_logic": g,
+                        "end_date": listing_day.date().isoformat(),
+                        "day": day_n,
+                        "date": d.date().isoformat(),
+                        "retained_intention_orders": 0,
+                    }
+                )
+            continue
+
+        exit_time = (
+            df_presale.loc[
+                :,
+                ["intention_refund_time", "deposit_payment_time", "deposit_refund_time", "lock_time"],
+            ]
+            .min(axis=1, skipna=True)
+            .copy()
+        )
+
+        for d in date_index:
+            as_of_excl = d + pd.Timedelta(days=1)
+            cnt = int((exit_time.isna() | (exit_time >= as_of_excl)).sum())
+            day_n = int((d.floor("D") - listing_day.floor("D")).days)
+            rows.append(
+                {
+                    "series_group_logic": g,
+                    "end_date": listing_day.date().isoformat(),
+                    "day": day_n,
+                    "date": d.date().isoformat(),
+                    "retained_intention_orders": cnt,
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        group_order = {g: i for i, g in enumerate(target_groups)}
+        out["__group_order"] = out["series_group_logic"].map(group_order).fillna(len(group_order))
+        out = out.sort_values(["__group_order", "date"]).drop(columns="__group_order").reset_index(drop=True)
+    return out
+
+
 def build_model_mix(
     df: pd.DataFrame, business_def: dict, target_groups: List[str], staff_orders: set
 ) -> pd.DataFrame:
@@ -1086,6 +1235,8 @@ def build_configuration_version_summary(
         matched_lock["Attribute"] = matched_lock["Attribute"].astype("string").str.strip()
         matched_lock["Value Dispaly Name"] = matched_lock["Value Dispaly Name"].astype("string").fillna("").str.strip()
         matched_lock = matched_lock[matched_lock["Value Dispaly Name"].ne("") & matched_lock["Attribute"].ne("Is Staff")]
+        m_excluded = matched_lock["Attribute"].astype("string").str.contains("内饰|外饰", na=False, regex=True)
+        matched_lock = matched_lock.loc[~m_excluded].copy()
 
         lock_agg = (
             matched_lock.groupby(["Attribute", "Value Dispaly Name"], as_index=False)
@@ -1158,6 +1309,407 @@ def build_after30d_lock_totals(df: pd.DataFrame, business_def: dict, target_grou
     group_order = {g: i for i, g in enumerate(target_groups)}
     out["__group_order"] = out["series_group_logic"].map(group_order).fillna(len(group_order))
     out = out.sort_values(["__group_order"]).drop(columns="__group_order").reset_index(drop=True)
+    return out
+
+
+def _compute_same_period_n(business_def: dict, target_groups: List[str], today_ts: pd.Timestamp) -> int:
+    time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
+    end_days: List[pd.Timestamp] = []
+    for g in target_groups:
+        end_str = (time_periods.get(g, {}) or {}).get("end")
+        if not end_str:
+            continue
+        end_day = pd.Timestamp(end_str)
+        if g == "CM0":
+            end_day = end_day + pd.Timedelta(days=1)
+        end_days.append(end_day)
+    max_end_day = max(end_days) if end_days else pd.NaT
+    n_raw = int((today_ts.normalize() - max_end_day.normalize()).days + 1) if pd.notna(max_end_day) else 1
+    return max(1, n_raw)
+
+
+def build_same_period_lock_totals(
+    df: pd.DataFrame, business_def: dict, target_groups: List[str], staff_orders: set
+) -> pd.DataFrame:
+    if "lock_time" not in df.columns:
+        raise KeyError("数据缺少列: lock_time")
+    if "order_number" not in df.columns:
+        raise KeyError("数据缺少列: order_number")
+    if "series_group_logic" not in df.columns:
+        raise KeyError("数据缺少列: series_group_logic")
+    if not pd.api.types.is_datetime64_any_dtype(df["lock_time"]):
+        df["lock_time"] = pd.to_datetime(df["lock_time"], errors="coerce")
+
+    today_ts = pd.Timestamp(datetime.now().date())
+    today_excl = today_ts + pd.Timedelta(days=1)
+    n = _compute_same_period_n(business_def, target_groups, today_ts)
+
+    time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
+    rows: List[Dict[str, object]] = []
+
+    for g in target_groups:
+        tp = time_periods.get(g, {}) or {}
+        end_str = tp.get("end")
+        finish_str = tp.get("finish")
+        if not end_str:
+            rows.append({"series_group_logic": g, "锁单数": 0})
+            continue
+
+        end_day = pd.Timestamp(end_str)
+        if g == "CM0":
+            end_day = end_day + pd.Timedelta(days=1)
+        finish_day = pd.Timestamp(finish_str) if finish_str else end_day
+
+        finish_limit_excl = finish_day + pd.Timedelta(days=1)
+        same_period_end_excl = min(end_day + pd.Timedelta(days=n), finish_limit_excl, today_excl)
+
+        m = (
+            df["series_group_logic"].eq(g)
+            & df["lock_time"].notna()
+            & (df["lock_time"] >= end_day)
+            & (df["lock_time"] < same_period_end_excl)
+        )
+        if staff_orders:
+            m = m & ~df["order_number"].astype("string").isin(staff_orders)
+        cnt = int(df.loc[m, "order_number"].nunique())
+        rows.append({"series_group_logic": g, "锁单数": cnt})
+
+    out = pd.DataFrame(rows)
+    group_order = {g: i for i, g in enumerate(target_groups)}
+    out["__group_order"] = out["series_group_logic"].map(group_order).fillna(len(group_order))
+    out = out.sort_values(["__group_order"]).drop(columns="__group_order").reset_index(drop=True)
+    return out
+
+
+def build_same_period_model_mix(
+    df: pd.DataFrame, business_def: dict, target_groups: List[str], staff_orders: set
+) -> pd.DataFrame:
+    if "order_number" not in df.columns:
+        raise KeyError("数据缺少列: order_number")
+    if "series_group_logic" not in df.columns:
+        raise KeyError("数据缺少列: series_group_logic")
+    if "product_name" not in df.columns:
+        raise KeyError("数据缺少列: product_name")
+    if "lock_time" not in df.columns:
+        raise KeyError("数据缺少列: lock_time")
+
+    if not pd.api.types.is_datetime64_any_dtype(df["lock_time"]):
+        df["lock_time"] = pd.to_datetime(df["lock_time"], errors="coerce")
+
+    today_ts = pd.Timestamp(datetime.now().date())
+    today_excl = today_ts + pd.Timedelta(days=1)
+    n = _compute_same_period_n(business_def, target_groups, today_ts)
+
+    time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
+    rows: List[Dict[str, object]] = []
+
+    for g in target_groups:
+        tp = time_periods.get(g, {}) or {}
+        end_str = tp.get("end")
+        finish_str = tp.get("finish")
+        if not end_str:
+            continue
+
+        end_day = pd.Timestamp(end_str)
+        if g == "CM0":
+            end_day = end_day + pd.Timedelta(days=1)
+        finish_day = pd.Timestamp(finish_str) if finish_str else end_day
+
+        finish_limit_excl = finish_day + pd.Timedelta(days=1)
+        same_period_end_excl = min(end_day + pd.Timedelta(days=n), finish_limit_excl, today_excl)
+
+        window = df.loc[
+            df["series_group_logic"].eq(g)
+            & df["lock_time"].notna()
+            & (df["lock_time"] >= end_day)
+            & (df["lock_time"] < same_period_end_excl),
+            ["order_number", "product_name"],
+        ].copy()
+        if staff_orders:
+            window = window.loc[~window["order_number"].astype("string").isin(staff_orders)].copy()
+        if window.empty:
+            continue
+
+        window["product_name"] = window["product_name"].fillna("").astype("string")
+        agg_g = (
+            window.groupby(["product_name"], as_index=False)["order_number"]
+            .nunique()
+            .rename(columns={"order_number": "锁单数"})
+        )
+        total = int(agg_g["锁单数"].sum())
+        if total <= 0:
+            continue
+        agg_g["series_group_logic"] = g
+        agg_g["占比"] = (agg_g["锁单数"] / total).fillna(0.0).map(lambda x: f"{x:.1%}")
+        rows.extend(agg_g[["series_group_logic", "product_name", "锁单数", "占比"]].to_dict("records"))
+
+    if not rows:
+        return pd.DataFrame(columns=["series_group_logic", "product_name", "锁单数", "占比"])
+
+    agg = pd.DataFrame(rows)
+
+    group_order = {g: i for i, g in enumerate(target_groups)}
+    agg["__group_order"] = agg["series_group_logic"].map(group_order).fillna(len(group_order))
+    agg = (
+        agg.sort_values(["__group_order", "锁单数", "product_name"], ascending=[True, False, True])
+        .drop(columns="__group_order")
+        .reset_index(drop=True)
+    )
+    return agg
+
+
+def build_same_period_configuration_version_summary(
+    df_orders: pd.DataFrame,
+    business_def: dict,
+    target_groups: List[str],
+    config_long_df: pd.DataFrame,
+    staff_orders: set,
+) -> pd.DataFrame:
+    if config_long_df is None or config_long_df.empty:
+        return pd.DataFrame()
+    if "order_number" not in df_orders.columns:
+        raise KeyError("数据缺少列: order_number")
+    if "series_group_logic" not in df_orders.columns:
+        raise KeyError("数据缺少列: series_group_logic")
+    if "lock_time" not in df_orders.columns:
+        raise KeyError("数据缺少列: lock_time")
+    if not pd.api.types.is_datetime64_any_dtype(df_orders["lock_time"]):
+        df_orders["lock_time"] = pd.to_datetime(df_orders["lock_time"], errors="coerce")
+
+    today_ts = pd.Timestamp(datetime.now().date())
+    today_excl = today_ts + pd.Timedelta(days=1)
+    n = _compute_same_period_n(business_def, target_groups, today_ts)
+
+    time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
+
+    rows: List[pd.DataFrame] = []
+    for g in target_groups:
+        tp = time_periods.get(g, {}) or {}
+        end_str = tp.get("end")
+        finish_str = tp.get("finish")
+        if not end_str:
+            continue
+
+        end_day = pd.Timestamp(end_str)
+        if g == "CM0":
+            end_day = end_day + pd.Timedelta(days=1)
+        finish_day = pd.Timestamp(finish_str) if finish_str else end_day
+
+        finish_limit_excl = finish_day + pd.Timedelta(days=1)
+        same_period_end_excl = min(end_day + pd.Timedelta(days=n), finish_limit_excl, today_excl)
+
+        m_lock_window = (
+            df_orders["series_group_logic"].eq(g)
+            & df_orders["lock_time"].notna()
+            & (df_orders["lock_time"] >= end_day)
+            & (df_orders["lock_time"] < same_period_end_excl)
+        )
+        if staff_orders:
+            m_lock_window = m_lock_window & ~df_orders["order_number"].astype("string").isin(staff_orders)
+        lock_orders = (
+            df_orders.loc[m_lock_window, ["order_number"]]
+            .dropna(subset=["order_number"])
+            .drop_duplicates(subset=["order_number"])
+            .copy()
+        )
+        lock_orders["order_number"] = lock_orders["order_number"].astype("string")
+        if lock_orders.empty:
+            continue
+        series_total = int(lock_orders["order_number"].nunique())
+
+        matched_lock = config_long_df.merge(lock_orders, left_on="order_number", right_on="order_number", how="inner")
+        if matched_lock.empty:
+            continue
+        matched_lock = matched_lock.loc[:, ["order_number", "Attribute", "Value Dispaly Name"]].copy()
+        matched_lock["Attribute"] = matched_lock["Attribute"].astype("string").str.strip()
+        matched_lock["Value Dispaly Name"] = matched_lock["Value Dispaly Name"].astype("string").fillna("").str.strip()
+        matched_lock = matched_lock[matched_lock["Value Dispaly Name"].ne("") & matched_lock["Attribute"].ne("Is Staff")]
+        m_excluded = matched_lock["Attribute"].astype("string").str.contains("内饰|外饰", na=False, regex=True)
+        matched_lock = matched_lock.loc[~m_excluded].copy()
+
+        lock_agg = (
+            matched_lock.groupby(["Attribute", "Value Dispaly Name"], as_index=False)
+            .agg(锁单数=("order_number", "nunique"))
+            .reset_index(drop=True)
+        )
+
+        attr_totals = lock_agg.groupby("Attribute")["锁单数"].transform("sum")
+        ratio = (lock_agg["锁单数"] / attr_totals).fillna(0.0)
+        lock_agg["比例"] = ratio.map(lambda x: f"{x:.1%}")
+        lock_agg["选装率"] = (lock_agg["锁单数"] / float(series_total) if series_total > 0 else 0.0).fillna(0.0).map(
+            lambda x: f"{x:.1%}"
+        )
+
+        out_g = lock_agg.copy()
+        out_g.insert(0, "series_group_logic", g)
+        out_g = out_g.sort_values(["Attribute", "锁单数"], ascending=[True, False]).reset_index(drop=True)
+        rows.append(out_g)
+
+    if not rows:
+        return pd.DataFrame()
+    group_order = {g: i for i, g in enumerate(target_groups)}
+    out = pd.concat(rows, ignore_index=True)
+    out["__group_order"] = out["series_group_logic"].map(group_order).fillna(len(group_order))
+    out = out.sort_values(["__group_order", "Attribute", "锁单数"], ascending=[True, True, False]).drop(columns="__group_order")
+    return out
+
+
+def build_same_period_gender_detail(
+    df: pd.DataFrame, business_def: dict, target_groups: List[str], staff_orders: set
+) -> pd.DataFrame:
+    required_cols = ["lock_time", "order_number", "series_group_logic", "order_gender"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"数据缺少列: {', '.join(missing)}")
+    if not pd.api.types.is_datetime64_any_dtype(df["lock_time"]):
+        df["lock_time"] = pd.to_datetime(df["lock_time"], errors="coerce")
+
+    today_ts = pd.Timestamp(datetime.now().date())
+    today_excl = today_ts + pd.Timedelta(days=1)
+    n = _compute_same_period_n(business_def, target_groups, today_ts)
+
+    time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
+    rows: List[Dict[str, object]] = []
+    raw_gender = df["order_gender"].astype("string").fillna("").str.strip()
+    raw_gender_u = raw_gender.str.upper()
+    gender_series = pd.Series("未知", index=df.index, dtype="string")
+    gender_series = gender_series.where(~raw_gender.isin(["男", "男性"]), "男")
+    gender_series = gender_series.where(~raw_gender.isin(["女", "女性"]), "女")
+    gender_series = gender_series.where(~raw_gender_u.isin(["M", "MALE", "1"]), "男")
+    gender_series = gender_series.where(~raw_gender_u.isin(["F", "FEMALE", "2"]), "女")
+
+    for g in target_groups:
+        tp = time_periods.get(g, {}) or {}
+        end_str = tp.get("end")
+        finish_str = tp.get("finish")
+        if not end_str:
+            continue
+
+        end_day = pd.Timestamp(end_str)
+        if g == "CM0":
+            end_day = end_day + pd.Timedelta(days=1)
+        finish_day = pd.Timestamp(finish_str) if finish_str else end_day
+
+        finish_limit_excl = finish_day + pd.Timedelta(days=1)
+        same_period_end_excl = min(end_day + pd.Timedelta(days=n), finish_limit_excl, today_excl)
+
+        m = (
+            df["series_group_logic"].eq(g)
+            & df["lock_time"].notna()
+            & (df["lock_time"] >= end_day)
+            & (df["lock_time"] < same_period_end_excl)
+        )
+        if staff_orders:
+            m = m & ~df["order_number"].astype("string").isin(staff_orders)
+        locked = df.loc[m, ["order_number"]].dropna(subset=["order_number"]).copy()
+        if locked.empty:
+            continue
+        locked = locked.drop_duplicates(subset=["order_number"])
+        locked["order_gender"] = gender_series.loc[locked.index]
+
+        total_all = int(locked["order_number"].nunique())
+
+        locked_known = locked.loc[locked["order_gender"].isin(["男", "女"])].copy()
+        total_known = int(locked_known["order_number"].nunique())
+        by_gender = (
+            locked_known.groupby("order_gender")["order_number"]
+            .nunique()
+            .reindex(["男", "女"])
+            .dropna()
+            .astype("int64")
+        )
+
+        for gender_val, cnt in by_gender.items():
+            share_known = round(cnt / total_known * 100, 1) if total_known > 0 else 0.0
+            share_total = round(cnt / total_all * 100, 1) if total_all > 0 else 0.0
+            rows.append(
+                {
+                    "series_group_logic": g,
+                    "order_gender": str(gender_val),
+                    "锁单数": int(cnt),
+                    "占比": share_known,
+                    "合计百分比": share_total,
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        group_order = {g: i for i, g in enumerate(target_groups)}
+        out["__group_order"] = out["series_group_logic"].map(group_order).fillna(len(group_order))
+        out = out.sort_values(["__group_order", "锁单数"], ascending=[True, False]).drop(columns="__group_order")
+    return out.reset_index(drop=True)
+
+
+def build_same_period_age_detail(
+    df: pd.DataFrame, business_def: dict, target_groups: List[str], staff_orders: set, age_col: str, age_label: str
+) -> pd.DataFrame:
+    required_cols = ["lock_time", "order_number", "series_group_logic", age_col]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"数据缺少列: {', '.join(missing)}")
+    if not pd.api.types.is_datetime64_any_dtype(df["lock_time"]):
+        df["lock_time"] = pd.to_datetime(df["lock_time"], errors="coerce")
+
+    today_ts = pd.Timestamp(datetime.now().date())
+    today_excl = today_ts + pd.Timedelta(days=1)
+    n = _compute_same_period_n(business_def, target_groups, today_ts)
+
+    time_periods: Dict[str, Dict[str, str]] = business_def.get("time_periods", {})
+    rows: List[Dict[str, object]] = []
+
+    age_num = pd.to_numeric(df[age_col], errors="coerce")
+    age_int = age_num.round().astype("Int64")
+
+    for g in target_groups:
+        tp = time_periods.get(g, {}) or {}
+        end_str = tp.get("end")
+        finish_str = tp.get("finish")
+        if not end_str:
+            continue
+
+        end_day = pd.Timestamp(end_str)
+        if g == "CM0":
+            end_day = end_day + pd.Timedelta(days=1)
+        finish_day = pd.Timestamp(finish_str) if finish_str else end_day
+
+        finish_limit_excl = finish_day + pd.Timedelta(days=1)
+        same_period_end_excl = min(end_day + pd.Timedelta(days=n), finish_limit_excl, today_excl)
+
+        m = (
+            df["series_group_logic"].eq(g)
+            & df["lock_time"].notna()
+            & (df["lock_time"] >= end_day)
+            & (df["lock_time"] < same_period_end_excl)
+        )
+        if staff_orders:
+            m = m & ~df["order_number"].astype("string").isin(staff_orders)
+
+        locked = df.loc[m, ["order_number"]].dropna(subset=["order_number"]).copy()
+        if locked.empty:
+            continue
+        locked = locked.drop_duplicates(subset=["order_number"])
+        locked[age_label] = age_int.loc[locked.index]
+
+        by_age = locked.dropna(subset=[age_label]).groupby(age_label)["order_number"].nunique().sort_index()
+        total_valid = int(by_age.sum())
+        if total_valid <= 0:
+            continue
+        for age_val, cnt in by_age.items():
+            share = cnt / float(total_valid) * 100.0
+            rows.append(
+                {
+                    "series_group_logic": g,
+                    age_label: int(age_val) if pd.notna(age_val) else None,
+                    "锁单数": int(cnt),
+                    "占比": share,
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        group_order = {g: i for i, g in enumerate(target_groups)}
+        out["__group_order"] = out["series_group_logic"].map(group_order).fillna(len(group_order))
+        out = out.sort_values(["__group_order", age_label]).drop(columns="__group_order").reset_index(drop=True)
     return out
 
 
@@ -1289,10 +1841,12 @@ def build_after30d_age_detail(
         locked = locked.drop_duplicates(subset=["order_number"])
         locked[age_label] = age_int.loc[locked.index]
 
-        total = int(locked["order_number"].nunique())
         by_age = locked.dropna(subset=[age_label]).groupby(age_label)["order_number"].nunique().sort_index()
+        total_valid = int(by_age.sum())
+        if total_valid <= 0:
+            continue
         for age_val, cnt in by_age.items():
-            share = round(cnt / total * 100, 1) if total > 0 else 0.0
+            share = cnt / float(total_valid) * 100.0
             rows.append(
                 {
                     "series_group_logic": g,
@@ -1310,7 +1864,9 @@ def build_after30d_age_detail(
     return out
 
 
-def build_listing_summary(df: pd.DataFrame, business_def: dict, target_groups: List[str]) -> pd.DataFrame:
+def build_listing_summary(
+    df: pd.DataFrame, business_def: dict, target_groups: List[str], today: pd.Timestamp | None = None
+) -> pd.DataFrame:
     if "lock_time" not in df.columns:
         raise KeyError("数据缺少列: lock_time")
     if "order_number" not in df.columns:
@@ -1324,6 +1880,22 @@ def build_listing_summary(df: pd.DataFrame, business_def: dict, target_groups: L
     rows: List[Dict[str, object]] = []
 
     base = df.loc[df["lock_time"].notna(), ["order_number", "lock_time", "series_group_logic"]].copy()
+
+    today_ts = today.normalize() if isinstance(today, pd.Timestamp) else pd.Timestamp(datetime.now().date())
+    today_excl = today_ts + pd.Timedelta(days=1)
+
+    end_days: List[pd.Timestamp] = []
+    for g in target_groups:
+        end_str = (time_periods.get(g, {}) or {}).get("end")
+        if not end_str:
+            continue
+        end_day = pd.Timestamp(end_str)
+        if g == "CM0":
+            end_day = end_day + pd.Timedelta(days=1)
+        end_days.append(end_day)
+    max_end_day = max(end_days) if end_days else pd.NaT
+    n_raw = int((today_ts.normalize() - max_end_day.normalize()).days + 1) if pd.notna(max_end_day) else 1
+    n = max(1, n_raw)
 
     for g in target_groups:
         tp = time_periods.get(g, {}) or {}
@@ -1357,17 +1929,17 @@ def build_listing_summary(df: pd.DataFrame, business_def: dict, target_groups: L
         end_day_total = int(hourly_full.sum())
 
         finish_limit_excl = finish_day + pd.Timedelta(days=1)
-        after_30d_end_excl = min(end_day + pd.Timedelta(days=31), finish_limit_excl)
+        same_period_end_excl = min(end_day + pd.Timedelta(days=n), finish_limit_excl, today_excl)
         window_slice = base_g.loc[
-            (base_g["lock_time"] >= end_day) & (base_g["lock_time"] < after_30d_end_excl),
+            (base_g["lock_time"] >= end_day) & (base_g["lock_time"] < same_period_end_excl),
             ["order_number", "lock_time"],
         ].copy()
         if window_slice.empty:
-            after_30d_total = 0
+            same_period_total = 0
         else:
             window_slice["date"] = window_slice["lock_time"].dt.floor("D")
             daily = window_slice.groupby("date")["order_number"].nunique()
-            after_30d_total = int(daily.sum())
+            same_period_total = int(daily.sum())
 
         delta_to_sat = (5 - end_day.weekday()) % 7
         if delta_to_sat == 0:
@@ -1390,7 +1962,7 @@ def build_listing_summary(df: pd.DataFrame, business_def: dict, target_groups: L
                 "峰值后第二小时锁单数": next_hour_count,
                 "上市当日累计锁单数": end_day_total,
                 "第一个周末锁单数": weekend_total,
-                "上市后30日累计锁单数": after_30d_total,
+                "上市同期累计锁单数": same_period_total,
             }
         )
 
@@ -1603,6 +2175,103 @@ def _render_retained_refund_rate_line_figure(
     return fig
 
 
+def _render_retained_intention_daily_line_figure(
+    daily_df: pd.DataFrame,
+    target_groups: List[str],
+    fig_title: str,
+    y_title: str,
+) -> go.Figure:
+    end_dates = (
+        daily_df.groupby(["series_group_logic"], as_index=False)["end_date"]
+        .first()
+        .rename(columns={"end_date": "end_date_first"})
+    )
+
+    n_groups = len(target_groups)
+    n_cols = 3
+    n_rows = (n_groups + n_cols - 1) // n_cols
+
+    fig = make_subplots(
+        rows=n_rows,
+        cols=n_cols,
+        subplot_titles=[
+            f"{g} (上市日期: {end_dates.loc[end_dates['series_group_logic'].eq(g), 'end_date_first'].iloc[0] if (end_dates['series_group_logic'].eq(g).any()) else ''})"
+            for g in target_groups
+        ],
+    )
+
+    positions = [(r + 1, c + 1) for r in range(n_rows) for c in range(n_cols)]
+    for g, (r, c) in zip(target_groups, positions):
+        dfg = daily_df[daily_df["series_group_logic"].eq(g)]
+        x = dfg["date"].tolist()
+        y = dfg["retained_intention_orders"].tolist()
+        fig.add_trace(go.Scatter(x=x, y=y, mode="lines+markers", name=g, showlegend=False), row=r, col=c)
+        if y:
+            peak_i = int(np.argmax(y))
+            peak_x = x[peak_i]
+            peak_y = int(y[peak_i])
+            fig.add_annotation(
+                x=peak_x,
+                y=peak_y,
+                text=str(peak_y),
+                showarrow=False,
+                yshift=10,
+                bgcolor="rgba(255,255,255,0.7)",
+                row=r,
+                col=c,
+            )
+        fig.update_xaxes(title_text="Date", tickangle=-45, row=r, col=c)
+        fig.update_yaxes(title_text=y_title, row=r, col=c)
+
+    fig.update_layout(height=400 * n_rows, title=fig_title, margin=dict(l=40, r=20, t=60, b=80))
+    return fig
+
+
+def _render_retained_intention_compare_line_figure(
+    daily_df: pd.DataFrame,
+    target_groups: List[str],
+    fig_title: str,
+    y_title: str,
+) -> go.Figure:
+    fig = go.Figure()
+    for g in target_groups:
+        dfg = daily_df.loc[daily_df["series_group_logic"].eq(g)].copy()
+        if dfg.empty:
+            continue
+        dfg = dfg.sort_values("day")
+        customdata = np.stack(
+            [
+                dfg["date"].astype("string").fillna("").to_numpy(),
+                dfg["retained_intention_orders"].astype("int64").to_numpy(),
+            ],
+            axis=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=dfg["day"].astype("int64"),
+                y=dfg["retained_intention_orders"].astype("int64"),
+                mode="lines+markers",
+                name=g,
+                customdata=customdata,
+                hovertemplate=(
+                    "series=%{fullData.name}<br>"
+                    "上市后Day=%{x}<br>"
+                    "date=%{customdata[0]}<br>"
+                    "留存小订数=%{customdata[1]}<extra></extra>"
+                ),
+            )
+        )
+    fig.update_layout(
+        title=fig_title,
+        xaxis=dict(title="上市后天数", tickmode="linear", dtick=2),
+        yaxis=dict(title=y_title),
+        hovermode="x unified",
+        margin=dict(l=40, r=20, t=60, b=60),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
 def _render_age_share_line_figure(
     age_df: pd.DataFrame,
     target_groups: List[str],
@@ -1668,12 +2337,18 @@ def render_launch_report(
     listing_daily_df: pd.DataFrame,
     retained_conv_curve_df: pd.DataFrame,
     retained_refund_curve_df: pd.DataFrame,
+    retained_intention_daily_df: pd.DataFrame,
     listing_summary_df: pd.DataFrame,
     model_mix_df: pd.DataFrame,
     config_version_df: pd.DataFrame,
     gender_df: pd.DataFrame,
     age_df: pd.DataFrame,
     lock_totals_df: pd.DataFrame,
+    model_mix_same_period_df: pd.DataFrame,
+    config_version_same_period_df: pd.DataFrame,
+    gender_same_period_df: pd.DataFrame,
+    age_same_period_df: pd.DataFrame,
+    lock_totals_same_period_df: pd.DataFrame,
     target_groups: List[str],
 ) -> str:
     css = """
@@ -1768,7 +2443,7 @@ def render_launch_report(
             "<li>峰值小时锁单数：取上市当日每小时锁单数的峰值小时</li>"
             "<li>峰值后第二小时锁单数：取峰值小时后的第二个小时（peak_hour + 1）</li>"
             "<li>第一个周末锁单数：取 endday 后第一个双休日（周六+周日）两日求和（不超过 finish day）</li>"
-            "<li>上市后30日累计锁单数：endday ~ endday+30 的累计求和，且不超过 finish day</li>"
+            "<li>上市同期累计锁单数：以 N（日）= 当前日期 - max(上市日) + 1 为窗口长度，统计 endday ~ min(endday+N-1, finish, 当前日期) 的累计锁单数</li>"
             "</ul>"
             "</div>"
         )
@@ -1835,20 +2510,56 @@ def render_launch_report(
         )
         html_content.append(pio.to_html(fig5, full_html=False, include_plotlyjs=False))
 
+    html_content.append("<h3>2.6 上市周期每日留存小订数（series_group_logic）</h3>")
+    html_content.append("<div class='summary-box'>")
+    html_content.append(
+        "<p>口径：对每个 series_group_logic，按业务定义 time_periods 的 start~end（预售期）筛选小订订单（intention_payment_time 落在窗口内，order_number 去重）；"
+        "在上市周期的每个自然日（上市日 endday 起至 min(endday+30, finish)），按“截至当日结束仍处于小订状态”计数："
+        "intention_refund_time 为空或 &gt;= 当日+1 00:00，且 deposit_payment_time 为空或 &gt;= 当日+1 00:00，且 lock_time 为空或 &gt;= 当日+1 00:00。"
+        "该口径与 scripts/launch_lock_metrics_to_feishu.py 中 presale_retained_intention_count 一致（在日粒度上展开）。"
+        "其中 CM0 上市日特殊处理：endday=end+1。</p>"
+    )
+    html_content.append("</div>")
+    if retained_intention_daily_df is None or retained_intention_daily_df.empty:
+        html_content.append("<p>⚠️ 上市周期每日留存小订数明细为空（可能缺少 time_periods.start/end 或无数据）。</p>")
+    else:
+        fig6 = _render_retained_intention_compare_line_figure(
+            retained_intention_daily_df,
+            target_groups,
+            fig_title="上市周期每日留存小订数（series_group_logic）",
+            y_title="留存小订数（仍为小订）",
+        )
+        html_content.append(pio.to_html(fig6, full_html=False, include_plotlyjs=False))
+
     html_content.append("<h2>5. 订单结构</h2>")
-    lock_lines: List[str] = []
+    lock_lines_30d: List[str] = []
     if lock_totals_df is not None and not lock_totals_df.empty and {"series_group_logic", "锁单数"}.issubset(set(lock_totals_df.columns)):
         m = lock_totals_df.set_index("series_group_logic")["锁单数"].to_dict()
-        lock_lines = [f"{g}：{int(m.get(g, 0))}" for g in target_groups]
+        lock_lines_30d = [f"{g}：{int(m.get(g, 0))}" for g in target_groups]
+
+    lock_lines_same: List[str] = []
+    if (
+        lock_totals_same_period_df is not None
+        and not lock_totals_same_period_df.empty
+        and {"series_group_logic", "锁单数"}.issubset(set(lock_totals_same_period_df.columns))
+    ):
+        m2 = lock_totals_same_period_df.set_index("series_group_logic")["锁单数"].to_dict()
+        lock_lines_same = [f"{g}：{int(m2.get(g, 0))}" for g in target_groups]
     html_content.append("<div class='summary-box'>")
     html_content.append(
         "<p>口径：基于各 series_group_logic 的上市日期 end_day（见业务定义 time_periods），统计上市后30日累计窗口 "
         "end_day ~ min(end_day+30, finish) 的锁单订单（lock_time 非空的 order_number 去重计数）；"
         "并在此基础上剔除 is_staff=True 的订单（即仅保留 is_staff=False）。</p>"
     )
-    if lock_lines:
-        html_content.append("<p><b>本口径锁单数</b></p>")
-        html_content.append("<pre>" + "\n".join(lock_lines) + "</pre>")
+    html_content.append(
+        "<p>上市同期累计口径：以 N（日）= 当前日期 - max(上市日) + 1 为窗口长度，统计 endday ~ min(endday+N-1, finish, 当前日期) 的累计锁单数；同样剔除 is_staff=True。</p>"
+    )
+    if lock_lines_30d:
+        html_content.append("<p><b>上市后30日累计口径锁单数</b></p>")
+        html_content.append("<pre>" + "\n".join(lock_lines_30d) + "</pre>")
+    if lock_lines_same:
+        html_content.append("<p><b>上市同期累计口径锁单数</b></p>")
+        html_content.append("<pre>" + "\n".join(lock_lines_same) + "</pre>")
     html_content.append("</div>")
     html_content.append("<h3>5.1 车型Mix（按 series_group_logic × product_name）</h3>")
     if model_mix_df is None or model_mix_df.empty:
@@ -1931,6 +2642,88 @@ def render_launch_report(
             fig_title="上市后30日锁单：Buyer Age 占比（series_group_logic）",
         )
         html_content.append(pio.to_html(fig_age, full_html=False, include_plotlyjs=False))
+
+    html_content.append("<h3>5.5 车型Mix（上市同期累计，按 series_group_logic × product_name）</h3>")
+    if model_mix_same_period_df is None or model_mix_same_period_df.empty:
+        html_content.append("<p>⚠️ 车型Mix表为空（可能无锁单数据或缺少必要字段）。</p>")
+    else:
+        for g in target_groups:
+            html_content.append(f"<h4>{g}</h4>")
+            if "series_group_logic" not in model_mix_same_period_df.columns:
+                html_content.append("<p>⚠️ 车型Mix表缺少 series_group_logic 列。</p>")
+                break
+            dfg = model_mix_same_period_df.loc[model_mix_same_period_df["series_group_logic"].eq(g)].copy()
+            if dfg.empty:
+                html_content.append("<p>⚠️ 无数据</p>")
+                continue
+            dfg = dfg.drop(columns=["series_group_logic"])
+            html_content.append(dfg.to_html(index=False, classes="table", escape=False))
+
+    html_content.append("<h3>5.6 配置版本（上市同期累计，按 series_group_logic × Attribute）</h3>")
+    if config_version_same_period_df is None or config_version_same_period_df.empty:
+        html_content.append("<p>⚠️ 配置版本表为空（可能无配置数据或缺少必要字段）。</p>")
+    else:
+        cols = ["Attribute", "Value Dispaly Name", "锁单数", "比例", "选装率"]
+        for g in target_groups:
+            html_content.append(f"<h4>{g}</h4>")
+            if "series_group_logic" not in config_version_same_period_df.columns:
+                html_content.append("<p>⚠️ 配置版本表缺少 series_group_logic 列。</p>")
+                break
+            dfg = config_version_same_period_df.loc[config_version_same_period_df["series_group_logic"].eq(g)].copy()
+            if dfg.empty:
+                html_content.append("<p>⚠️ 无数据</p>")
+                continue
+            for c in cols:
+                if c not in dfg.columns:
+                    html_content.append(f"<p>⚠️ 配置版本表缺少列: {c}</p>")
+                    dfg = None
+                    break
+            if dfg is None:
+                break
+            dfg = dfg.loc[:, cols].copy()
+            html_content.append(dfg.to_html(index=False, classes="table", escape=False))
+
+    html_content.append("<h3>5.7 性别（上市同期累计，series_group_logic × order_gender）</h3>")
+    html_content.append("<div class='summary-box'>")
+    html_content.append(
+        "<p>口径：使用“上市同期累计口径锁单数”的订单集合（same_period 窗口 + is_staff=False）。性别仅保留 男/女；占比按（男+女）计算，剔除未知。合计百分比按（男/女）各自锁单数 / 该车系整体锁单数计算。</p>"
+    )
+    html_content.append("</div>")
+    if gender_same_period_df is None or gender_same_period_df.empty:
+        html_content.append("<p>⚠️ 无数据（可能缺少 order_gender 或无数据）。</p>")
+    else:
+        cols = ["order_gender", "锁单数", "占比", "合计百分比"]
+        for g in target_groups:
+            html_content.append(f"<h4>{g}</h4>")
+            if "series_group_logic" not in gender_same_period_df.columns:
+                html_content.append("<p>⚠️ 性别明细表缺少 series_group_logic 列。</p>")
+                break
+            dfg = gender_same_period_df.loc[gender_same_period_df["series_group_logic"].eq(g)].copy()
+            if dfg.empty:
+                html_content.append("<p>⚠️ 无数据</p>")
+                continue
+            dfg["占比"] = dfg["占比"].apply(lambda x: f"{float(x):.1f}%")
+            if "合计百分比" in dfg.columns:
+                dfg["合计百分比"] = dfg["合计百分比"].apply(lambda x: f"{float(x):.1f}%")
+            dfg = dfg.loc[:, [c for c in cols if c in dfg.columns]].copy()
+            html_content.append(dfg.to_html(index=False, classes="table", escape=False))
+
+    html_content.append("<h3>5.8 年龄（上市同期累计，series_group_logic × buyer_age）</h3>")
+    html_content.append("<div class='summary-box'>")
+    html_content.append(
+        "<p>口径：使用“上市同期累计口径锁单数”的订单集合（same_period 窗口 + is_staff=False），按 buyer_age 计算占比；横轴为年龄，纵轴为占比（%）。</p>"
+    )
+    html_content.append("</div>")
+    if age_same_period_df is None or age_same_period_df.empty:
+        html_content.append("<p>⚠️ 无数据（可能缺少 buyer_age 或无数据）。</p>")
+    else:
+        fig_age_same = _render_age_share_line_figure(
+            age_same_period_df,
+            target_groups,
+            age_label="buyer_age",
+            fig_title="上市同期累计锁单：Buyer Age 占比（series_group_logic）",
+        )
+        html_content.append(pio.to_html(fig_age_same, full_html=False, include_plotlyjs=False))
     html_content.append("</body></html>")
     return "\n".join(html_content)
 
@@ -1989,12 +2782,22 @@ def main() -> int:
     listing_daily_df = build_daily_lock_counts(df, business_def, target_groups)
     retained_conv_curve_df = build_retained_intention_conversion_curve(df, business_def, target_groups)
     retained_refund_curve_df = build_retained_intention_refund_curve(df, business_def, target_groups)
+    retained_intention_daily_df = build_listing_daily_retained_intention_counts(df, business_def, target_groups)
     listing_summary_df = build_listing_summary(df, business_def, target_groups)
     model_mix_df = build_model_mix(df, business_def, target_groups, staff_orders)
     config_version_df = build_configuration_version_summary(df, business_def, target_groups, config_long_df, staff_orders)
     gender_df = build_after30d_gender_detail(df, business_def, target_groups, staff_orders)
     age_df = build_after30d_age_detail(df, business_def, target_groups, staff_orders, age_col="buyer_age", age_label="buyer_age")
     lock_totals_df = build_after30d_lock_totals(df, business_def, target_groups, staff_orders)
+    model_mix_same_period_df = build_same_period_model_mix(df, business_def, target_groups, staff_orders)
+    config_version_same_period_df = build_same_period_configuration_version_summary(
+        df, business_def, target_groups, config_long_df, staff_orders
+    )
+    gender_same_period_df = build_same_period_gender_detail(df, business_def, target_groups, staff_orders)
+    age_same_period_df = build_same_period_age_detail(
+        df, business_def, target_groups, staff_orders, age_col="buyer_age", age_label="buyer_age"
+    )
+    lock_totals_same_period_df = build_same_period_lock_totals(df, business_def, target_groups, staff_orders)
 
     html = render_launch_report(
         presale_summary_df,
@@ -2005,12 +2808,18 @@ def main() -> int:
         listing_daily_df,
         retained_conv_curve_df,
         retained_refund_curve_df,
+        retained_intention_daily_df,
         listing_summary_df,
         model_mix_df,
         config_version_df,
         gender_df,
         age_df,
         lock_totals_df,
+        model_mix_same_period_df,
+        config_version_same_period_df,
+        gender_same_period_df,
+        age_same_period_df,
+        lock_totals_same_period_df,
         target_groups,
     )
 
